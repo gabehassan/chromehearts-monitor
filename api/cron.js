@@ -1,0 +1,656 @@
+import * as cheerio from "cheerio";
+import {
+  BlobNotFoundError,
+  BlobPreconditionFailedError,
+  del as blobDel,
+  get as blobGet,
+  head as blobHead,
+  put as blobPut
+} from "@vercel/blob";
+import crypto from "node:crypto";
+
+export const config = {
+  maxDuration: 30
+};
+
+const BASE_URL = "https://www.chromehearts.com";
+const PRODUCT_GRID_BASE_URL =
+  "https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Search-UpdateGrid";
+const DEFAULT_STATE_KEY = "chrome-hearts:new-items:state";
+const DEFAULT_LOCK_KEY = "chrome-hearts:new-items:lock";
+const DEFAULT_BLOB_STATE_PATH = "chrome-hearts-monitor/state.json";
+const DEFAULT_BLOB_LOCK_PATH = "chrome-hearts-monitor/lock.json";
+
+class MonitorError extends Error {
+  constructor(message, statusCode = 500, details = {}) {
+    super(message);
+    this.name = "MonitorError";
+    this.statusCode = statusCode;
+    this.details = details;
+  }
+}
+
+class HttpStatusError extends MonitorError {
+  constructor(message, status, retryAfterSeconds = null) {
+    super(message, status >= 500 ? 502 : 500, { status, retryAfterSeconds });
+    this.name = "HttpStatusError";
+    this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+function intEnv(name, fallback, min = 0) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value < min) {
+    throw new MonitorError(`${name} must be an integer >= ${min}`, 500);
+  }
+  return value;
+}
+
+function boolEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
+}
+
+function getConfig() {
+  const redisUrl = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL || "";
+  const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN || "";
+  const hasRedis = Boolean(redisUrl && redisToken);
+  const hasBlob = Boolean(process.env.BLOB_READ_WRITE_TOKEN || process.env.BLOB_STORE_ID || process.env.VERCEL_OIDC_TOKEN);
+  const checkMinIntervalSeconds = intEnv("CHECK_MIN_INTERVAL_SECONDS", 50, 0);
+
+  if (!hasRedis && !hasBlob) {
+    throw new MonitorError(
+      "Missing durable storage env vars. Set Redis REST env vars or attach Vercel Blob.",
+      500
+    );
+  }
+  if (!process.env.DISCORD_WEBHOOK_URL) {
+    throw new MonitorError("Missing DISCORD_WEBHOOK_URL.", 500);
+  }
+
+  return {
+    redisUrl,
+    redisToken,
+    storageBackend: hasRedis ? "redis" : "blob",
+    discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
+    cronSecret: process.env.CRON_SECRET || "",
+    stateKey: process.env.STATE_KEY || DEFAULT_STATE_KEY,
+    lockKey: process.env.LOCK_KEY || DEFAULT_LOCK_KEY,
+    blobStatePath: process.env.BLOB_STATE_PATH || DEFAULT_BLOB_STATE_PATH,
+    blobLockPath: process.env.BLOB_LOCK_PATH || DEFAULT_BLOB_LOCK_PATH,
+    pageSize: intEnv("PAGE_SIZE", 200, 1),
+    maxPages: intEnv("MAX_PAGES", 10, 1),
+    minProducts: intEnv("MIN_PRODUCTS", 1, 0),
+    requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 12000, 1000),
+    webhookTimeoutMs: intEnv("WEBHOOK_TIMEOUT_MS", 8000, 1000),
+    checkMinIntervalSeconds,
+    lockSeconds: Math.max(15, Math.min(55, checkMinIntervalSeconds || 45)),
+    maxBackoffSeconds: intEnv("MAX_BACKOFF_SECONDS", 900, 1),
+    notifyInitial: boolEnv("NOTIFY_INITIAL", false),
+    userAgent: process.env.MONITOR_USER_AGENT || "ChromeHeartsMonitor/1.0"
+  };
+}
+
+function getCronSecret() {
+  return process.env.CRON_SECRET || "";
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function absoluteUrl(url) {
+  if (!url) return "";
+  return new URL(url, BASE_URL).toString();
+}
+
+function categoryFromUrl(url) {
+  try {
+    const path = new URL(url).pathname.replace(/^\/+|\/+$/g, "");
+    return path ? path.split("/")[0].replaceAll("-", " ").toUpperCase() : "";
+  } catch {
+    return "";
+  }
+}
+
+function truncate(value, limit) {
+  const text = String(value || "").trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 3))}...`;
+}
+
+function priceText(price) {
+  if (!price) return "";
+  const value = Number.parseFloat(price);
+  return Number.isFinite(value) ? `$${value.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : String(price);
+}
+
+function productGridUrl(start, pageSize) {
+  const url = new URL(PRODUCT_GRID_BASE_URL);
+  url.searchParams.set("cgid", "root");
+  url.searchParams.set("start", String(start));
+  url.searchParams.set("sz", String(pageSize));
+  return url.toString();
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseRetryAfter(headers) {
+  const value = headers.get("retry-after");
+  if (!value) return null;
+  const seconds = Number.parseFloat(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds);
+  const dateMs = Date.parse(value);
+  if (Number.isFinite(dateMs)) return Math.max(0, (dateMs - Date.now()) / 1000);
+  return null;
+}
+
+async function fetchHtml(url, cfg) {
+  const response = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        referer: `${BASE_URL}/`,
+        "user-agent": cfg.userAgent
+      },
+      cache: "no-store"
+    },
+    cfg.requestTimeoutMs
+  );
+
+  if (!response.ok) {
+    throw new HttpStatusError(
+      `Chrome Hearts returned HTTP ${response.status}`,
+      response.status,
+      parseRetryAfter(response.headers)
+    );
+  }
+
+  return response.text();
+}
+
+function parseProducts(html) {
+  const $ = cheerio.load(html);
+  const products = {};
+
+  $("div.product[data-pid]").each((_, el) => {
+    const root = $(el);
+    const classes = String(root.attr("class") || "").split(/\s+/);
+    const metadata = root.find("span.product-metadata").first();
+    const pid = String(metadata.attr("data-pid") || root.attr("data-pid") || "").trim();
+    const href =
+      root.find('a.link[href*=".html"]').first().attr("href") ||
+      root.find('a.pdp-link-image[href*=".html"]').first().attr("href") ||
+      "";
+    const url = absoluteUrl(href);
+
+    if (!pid || !url) return;
+
+    const productType = classes.find((value) => value.startsWith("productType-"))?.replace("productType-", "") || "";
+    const image = root.find("img.tile-image").first().attr("src") || "";
+
+    products[pid] = {
+      pid,
+      name: String(metadata.attr("data-name") || pid).trim(),
+      price: String(metadata.attr("data-price") || "").trim(),
+      brand: String(metadata.attr("data-brand") || "Chrome Hearts").trim(),
+      category: String(metadata.attr("data-category") || categoryFromUrl(url)).trim(),
+      productType,
+      url,
+      image: image ? absoluteUrl(image) : ""
+    };
+  });
+
+  return products;
+}
+
+async function fetchProducts(cfg) {
+  const allProducts = {};
+
+  for (let page = 0; page < cfg.maxPages; page += 1) {
+    const start = page * cfg.pageSize;
+    const pageProducts = parseProducts(await fetchHtml(productGridUrl(start, cfg.pageSize), cfg));
+    const pagePids = Object.keys(pageProducts);
+    let newOnPage = 0;
+
+    for (const [pid, product] of Object.entries(pageProducts)) {
+      if (!allProducts[pid]) newOnPage += 1;
+      allProducts[pid] = product;
+    }
+
+    if (pagePids.length < cfg.pageSize) break;
+    if (newOnPage === 0) {
+      throw new MonitorError(`Pagination did not advance at start=${start}; refusing duplicate full page.`);
+    }
+  }
+
+  const count = Object.keys(allProducts).length;
+  if (count < cfg.minProducts) {
+    throw new MonitorError(`Fetched only ${count} products; refusing to update state below MIN_PRODUCTS=${cfg.minProducts}.`);
+  }
+
+  return allProducts;
+}
+
+function createRedis(cfg) {
+  async function command(args) {
+    const response = await fetchWithTimeout(
+      cfg.redisUrl,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${cfg.redisToken}`,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(args),
+        cache: "no-store"
+      },
+      cfg.requestTimeoutMs
+    );
+
+    const bodyText = await response.text();
+    let body = {};
+    try {
+      body = bodyText ? JSON.parse(bodyText) : {};
+    } catch {
+      throw new MonitorError(`Redis returned non-JSON response (${response.status}).`);
+    }
+
+    if (!response.ok || body.error) {
+      throw new MonitorError(`Redis command failed: ${body.error || response.status}`);
+    }
+    return body.result;
+  }
+
+  return { command };
+}
+
+function defaultState() {
+  return { seen: {}, createdAt: nowIso(), updatedAt: nowIso(), errorStreak: 0, backoffUntil: null };
+}
+
+function parseState(raw) {
+  if (!raw) {
+    return defaultState();
+  }
+  try {
+    const state = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!state.seen || typeof state.seen !== "object" || Array.isArray(state.seen)) {
+      throw new Error("invalid seen map");
+    }
+    return {
+      ...state,
+      updatedAt: state.updatedAt || nowIso(),
+      errorStreak: Number.isFinite(state.errorStreak) ? state.errorStreak : 0,
+      backoffUntil: state.backoffUntil || null
+    };
+  } catch (error) {
+    throw new MonitorError(`Stored state is unreadable: ${error.message}`);
+  }
+}
+
+function createRedisStore(cfg) {
+  const redis = createRedis(cfg);
+
+  return {
+    backend: "redis",
+    async loadState() {
+      return parseState(await redis.command(["GET", cfg.stateKey]));
+    },
+    async saveState(state) {
+      await redis.command(["SET", cfg.stateKey, JSON.stringify({ ...state, updatedAt: nowIso() })]);
+    },
+    async acquireLock() {
+      const token = crypto.randomUUID();
+      const result = await redis.command(["SET", cfg.lockKey, token, "NX", "EX", String(cfg.lockSeconds)]);
+      return result === "OK" ? token : null;
+    },
+    async releaseLock(token) {
+      try {
+        const value = await redis.command(["GET", cfg.lockKey]);
+        if (value === token) await redis.command(["DEL", cfg.lockKey]);
+      } catch {
+      }
+    }
+  };
+}
+
+async function readBlobJson(pathname) {
+  try {
+    const result = await blobGet(pathname, { access: "private", useCache: false });
+    if (!result) return null;
+    const text =
+      result.blob && typeof result.blob.text === "function"
+        ? await result.blob.text()
+        : await new Response(result.stream).text();
+    return JSON.parse(text);
+  } catch (error) {
+    if (error instanceof BlobNotFoundError) return null;
+    throw error;
+  }
+}
+
+async function deleteBlobIfMatches(pathname, etag = undefined) {
+  try {
+    await blobDel(pathname, { access: "private", ...(etag ? { ifMatch: etag } : {}) });
+  } catch (error) {
+    if (error instanceof BlobNotFoundError || error instanceof BlobPreconditionFailedError) return;
+    throw error;
+  }
+}
+
+function createBlobStore(cfg) {
+  return {
+    backend: "blob",
+    async loadState() {
+      return parseState(await readBlobJson(cfg.blobStatePath));
+    },
+    async saveState(state) {
+      await blobPut(cfg.blobStatePath, JSON.stringify({ ...state, updatedAt: nowIso() }), {
+        access: "private",
+        allowOverwrite: true,
+        contentType: "application/json",
+        cacheControlMaxAge: 60
+      });
+    },
+    async acquireLock() {
+      const token = crypto.randomUUID();
+      const expiresAt = new Date(Date.now() + cfg.lockSeconds * 1000).toISOString();
+      const existing = await readBlobJson(cfg.blobLockPath);
+
+      if (existing?.expiresAt && Date.parse(existing.expiresAt) > Date.now()) {
+        return null;
+      }
+
+      if (existing) {
+        try {
+          const details = await blobHead(cfg.blobLockPath, { access: "private" });
+          await deleteBlobIfMatches(cfg.blobLockPath, details?.etag);
+        } catch (error) {
+          if (!(error instanceof BlobNotFoundError)) throw error;
+        }
+      }
+
+      try {
+        await blobPut(cfg.blobLockPath, JSON.stringify({ token, expiresAt }), {
+          access: "private",
+          allowOverwrite: false,
+          contentType: "application/json",
+          cacheControlMaxAge: 60
+        });
+        return token;
+      } catch {
+        return null;
+      }
+    },
+    async releaseLock(token) {
+      try {
+        const existing = await readBlobJson(cfg.blobLockPath);
+        if (existing?.token === token) {
+          const details = await blobHead(cfg.blobLockPath, { access: "private" });
+          await deleteBlobIfMatches(cfg.blobLockPath, details?.etag);
+        }
+      } catch {
+      }
+    }
+  };
+}
+
+function createStorage(cfg) {
+  return cfg.storageBackend === "redis" ? createRedisStore(cfg) : createBlobStore(cfg);
+}
+
+async function loadState(redis, cfg) {
+  const raw = await redis.command(["GET", cfg.stateKey]);
+  if (!raw) {
+    return { seen: {}, createdAt: nowIso(), updatedAt: nowIso(), errorStreak: 0, backoffUntil: null };
+  }
+  try {
+    const state = JSON.parse(raw);
+    if (!state.seen || typeof state.seen !== "object" || Array.isArray(state.seen)) {
+      throw new Error("invalid seen map");
+    }
+    return {
+      ...state,
+      updatedAt: state.updatedAt || nowIso(),
+      errorStreak: Number.isFinite(state.errorStreak) ? state.errorStreak : 0,
+      backoffUntil: state.backoffUntil || null
+    };
+  } catch (error) {
+    throw new MonitorError(`Stored state is unreadable: ${error.message}`);
+  }
+}
+
+async function saveState(redis, cfg, state) {
+  await redis.command(["SET", cfg.stateKey, JSON.stringify({ ...state, updatedAt: nowIso() })]);
+}
+
+async function acquireLock(redis, cfg) {
+  const token = crypto.randomUUID();
+  const result = await redis.command(["SET", cfg.lockKey, token, "NX", "EX", String(cfg.lockSeconds)]);
+  return result === "OK" ? token : null;
+}
+
+async function releaseLock(redis, cfg, token) {
+  try {
+    const value = await redis.command(["GET", cfg.lockKey]);
+    if (value === token) await redis.command(["DEL", cfg.lockKey]);
+  } catch {
+  }
+}
+
+function isAuthorized(req, cronSecret) {
+  if (!cronSecret) return true;
+  const header = req.headers.authorization || "";
+  return header === `Bearer ${cronSecret}`;
+}
+
+function buildEmbeds(products) {
+  return products.map((product) => {
+    const fields = [{ name: "PID", value: truncate(product.pid, 1024), inline: true }];
+    const price = priceText(product.price);
+    if (price) fields.push({ name: "Price", value: truncate(price, 1024), inline: true });
+    if (product.category) fields.push({ name: "Category", value: truncate(product.category, 1024), inline: true });
+    if (product.productType) fields.push({ name: "Type", value: truncate(product.productType, 1024), inline: true });
+
+    const embed = {
+      title: truncate(product.name, 256),
+      url: product.url,
+      color: 0x111111,
+      fields,
+      footer: { text: "Chrome Hearts new item monitor" },
+      timestamp: nowIso()
+    };
+
+    if (product.image) embed.thumbnail = { url: product.image };
+    return embed;
+  });
+}
+
+async function sendDiscord(cfg, products) {
+  for (let index = 0; index < products.length; index += 10) {
+    const chunk = products.slice(index, index + 10);
+    const payload = {
+      username: "Chrome Hearts Monitor",
+      content: `New Chrome Hearts item${chunk.length === 1 ? "" : "s"}: ${chunk.length}`,
+      embeds: buildEmbeds(chunk)
+    };
+
+    let attempt = 0;
+    while (true) {
+      const response = await fetchWithTimeout(
+        cfg.discordWebhookUrl,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
+          body: JSON.stringify(payload),
+          cache: "no-store"
+        },
+        cfg.webhookTimeoutMs
+      );
+
+      if (response.ok) break;
+
+      if (response.status === 429 && attempt < 3) {
+        let retryAfterSeconds = parseRetryAfter(response.headers) || 1;
+        try {
+          const body = await response.json();
+          if (Number.isFinite(body.retry_after)) retryAfterSeconds = body.retry_after;
+        } catch {
+          // Header/default retry-after is enough.
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryAfterSeconds * 1000));
+        attempt += 1;
+        continue;
+      }
+
+      throw new HttpStatusError(`Discord webhook returned HTTP ${response.status}`, response.status, parseRetryAfter(response.headers));
+    }
+  }
+}
+
+function computeBackoffUntil(state, cfg, error) {
+  const retryAfterSeconds = Number(error?.details?.retryAfterSeconds || error?.retryAfterSeconds || 0);
+  const streak = Math.max(1, Number(state.errorStreak || 0) + 1);
+  const exponential = Math.min(cfg.maxBackoffSeconds, Math.max(cfg.checkMinIntervalSeconds, 2 ** Math.min(streak - 1, 8)));
+  const baseSeconds = retryAfterSeconds || exponential;
+  const jitterSeconds = Math.random() * Math.min(10, baseSeconds * 0.1);
+  return {
+    errorStreak: streak,
+    backoffUntil: new Date(Date.now() + (baseSeconds + jitterSeconds) * 1000).toISOString()
+  };
+}
+
+function shouldSkipForInterval(state, cfg) {
+  if (!state.lastRunAt || cfg.checkMinIntervalSeconds === 0) return false;
+  const elapsed = Date.now() - Date.parse(state.lastRunAt);
+  return Number.isFinite(elapsed) && elapsed < cfg.checkMinIntervalSeconds * 1000;
+}
+
+function jsonResponse(res, statusCode, body) {
+  res.status(statusCode).json(body);
+}
+
+async function runMonitor(cfg, storage, deps = { fetchProducts, sendDiscord }) {
+  let state = await storage.loadState();
+  const now = Date.now();
+
+  if (state.backoffUntil && Date.parse(state.backoffUntil) > now) {
+    return { ok: true, skipped: "backoff", backoffUntil: state.backoffUntil };
+  }
+  if (shouldSkipForInterval(state, cfg)) {
+    return { ok: true, skipped: "min_interval", lastRunAt: state.lastRunAt };
+  }
+
+  const lockToken = await storage.acquireLock();
+  if (!lockToken) {
+    return { ok: true, skipped: "locked", storage: storage.backend };
+  }
+
+  try {
+    const products = await deps.fetchProducts(cfg);
+    state = await storage.loadState();
+    const firstRun = Object.keys(state.seen || {}).length === 0;
+    const newProducts = Object.values(products).filter((product) => !state.seen[product.pid]);
+
+    if (firstRun && !cfg.notifyInitial) {
+      await storage.saveState({
+        ...state,
+        seen: products,
+        lastRunAt: nowIso(),
+        errorStreak: 0,
+        backoffUntil: null
+      });
+      return { ok: true, baseline: true, productCount: Object.keys(products).length, alerted: 0, storage: storage.backend };
+    }
+
+    if (newProducts.length > 0) {
+      await deps.sendDiscord(cfg, newProducts);
+    }
+
+    await storage.saveState({
+      ...state,
+      seen: { ...state.seen, ...products },
+      lastRunAt: nowIso(),
+      errorStreak: 0,
+      backoffUntil: null
+    });
+
+    return {
+      ok: true,
+      productCount: Object.keys(products).length,
+      alerted: newProducts.length,
+      newPids: newProducts.map((product) => product.pid),
+      storage: storage.backend
+    };
+  } catch (error) {
+    const currentState = await storage.loadState().catch(() => state);
+    const backoff = computeBackoffUntil(currentState, cfg, error);
+    await storage.saveState({ ...currentState, ...backoff, lastError: error.message, lastErrorAt: nowIso() }).catch(() => {});
+    throw error;
+  } finally {
+    await storage.releaseLock(lockToken);
+  }
+}
+
+export default async function handler(req, res) {
+  if (!["GET", "POST"].includes(req.method || "GET")) {
+    res.setHeader("allow", "GET, POST");
+    return jsonResponse(res, 405, { ok: false, error: "Method not allowed" });
+  }
+
+  if (!isAuthorized(req, getCronSecret())) {
+    return jsonResponse(res, 401, { ok: false, error: "Unauthorized" });
+  }
+
+  let cfg;
+  try {
+    cfg = getConfig();
+  } catch (error) {
+    return jsonResponse(res, 500, { ok: false, error: error.message });
+  }
+
+  try {
+    const result = await runMonitor(cfg, createStorage(cfg));
+    return jsonResponse(res, 200, result);
+  } catch (error) {
+    const statusCode = error instanceof MonitorError ? error.statusCode : 500;
+    return jsonResponse(res, statusCode, { ok: false, error: error.message, details: error.details || {} });
+  }
+}
+
+export {
+  MonitorError,
+  absoluteUrl,
+  buildEmbeds,
+  categoryFromUrl,
+  computeBackoffUntil,
+  createBlobStore,
+  createRedis,
+  createRedisStore,
+  createStorage,
+  fetchProducts,
+  getConfig,
+  getCronSecret,
+  isAuthorized,
+  parseProducts,
+  priceText,
+  productGridUrl,
+  runMonitor,
+  sendDiscord,
+  shouldSkipForInterval,
+  truncate
+};
