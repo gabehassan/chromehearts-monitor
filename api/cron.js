@@ -8,6 +8,7 @@ import {
   put as blobPut
 } from "@vercel/blob";
 import crypto from "node:crypto";
+import { fetchStockSnapshot, stockDiff as calculateStockDiff } from "../scripts/stock-watch.js";
 
 export const config = {
   maxDuration: 30
@@ -85,12 +86,14 @@ function getConfig() {
     pageSize: intEnv("PAGE_SIZE", 200, 1),
     maxPages: intEnv("MAX_PAGES", 10, 1),
     minProducts: intEnv("MIN_PRODUCTS", 1, 0),
+    stockProductUrl: process.env.STOCK_PRODUCT_URL || "",
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 12000, 1000),
     webhookTimeoutMs: intEnv("WEBHOOK_TIMEOUT_MS", 8000, 1000),
     checkMinIntervalSeconds,
     lockSeconds: Math.max(15, Math.min(55, checkMinIntervalSeconds || 45)),
     maxBackoffSeconds: intEnv("MAX_BACKOFF_SECONDS", 900, 1),
     notifyInitial: boolEnv("NOTIFY_INITIAL", false),
+    notifyInitialStock: boolEnv("NOTIFY_INITIAL_STOCK", false),
     userAgent: process.env.MONITOR_USER_AGENT || "ChromeHeartsMonitor/1.0"
   };
 }
@@ -522,6 +525,68 @@ async function sendDiscord(cfg, products) {
   }
 }
 
+function buildStockEmbed(snapshot, diff) {
+  const inStockLabels = snapshot.sizes.filter((size) => size.inStock).map((size) => size.label || size.code);
+  const outOfStockLabels = snapshot.sizes.filter((size) => !size.inStock).map((size) => size.label || size.code);
+  const changes = diff.sizeChanges.length
+    ? diff.sizeChanges.map((change) => `${change.label || change.code}: ${change.from} -> ${change.to}`).join("\n")
+    : diff.firstRun
+      ? "Initial stock baseline"
+      : "No size-level changes";
+
+  return {
+    title: truncate(`${snapshot.name || snapshot.masterPid || "Product"} stock update`, 256),
+    url: snapshot.sourceUrl,
+    color: 0xc7c7c7,
+    fields: [
+      { name: "Master PID", value: truncate(snapshot.masterPid || "unknown", 1024), inline: true },
+      { name: "In-stock sizes", value: truncate(`${snapshot.inStockSizeCount}/${snapshot.sizes.length}`, 1024), inline: true },
+      {
+        name: "Capped orderable total",
+        value: truncate(snapshot.cappedOrderableTotal === null ? "unknown" : String(snapshot.cappedOrderableTotal), 1024),
+        inline: true
+      },
+      {
+        name: "Exact unit stock",
+        value: snapshot.exactStockKnown ? truncate(String(snapshot.totalStock), 1024) : "unknown",
+        inline: true
+      },
+      { name: "In", value: truncate(inStockLabels.join(", ") || "none", 1024), inline: false },
+      { name: "Out", value: truncate(outOfStockLabels.join(", ") || "none", 1024), inline: false },
+      { name: "Changes", value: truncate(changes, 1024), inline: false }
+    ],
+    footer: { text: "Chrome Hearts stock monitor" },
+    timestamp: snapshot.checkedAt
+  };
+}
+
+function shouldSendStockAlert(diff, cfg) {
+  if (!diff) return false;
+  if (diff.firstRun) return cfg.notifyInitialStock;
+  return diff.sizeChanges.length > 0 || diff.inStockSizeCountChange !== 0 || diff.cappedOrderableTotalChange !== 0;
+}
+
+async function sendStockDiscord(cfg, snapshot, diff) {
+  const response = await fetchWithTimeout(
+    cfg.discordWebhookUrl,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
+      body: JSON.stringify({
+        username: "Chrome Hearts Monitor",
+        content: `${snapshot.name || snapshot.masterPid || "Chrome Hearts product"} stock update`,
+        embeds: [buildStockEmbed(snapshot, diff)]
+      }),
+      cache: "no-store"
+    },
+    cfg.webhookTimeoutMs
+  );
+
+  if (!response.ok) {
+    throw new HttpStatusError(`Discord webhook returned HTTP ${response.status}`, response.status, parseRetryAfter(response.headers));
+  }
+}
+
 function computeBackoffUntil(state, cfg, error) {
   const retryAfterSeconds = Number(error?.details?.retryAfterSeconds || error?.retryAfterSeconds || 0);
   const streak = Math.max(1, Number(state.errorStreak || 0) + 1);
@@ -544,7 +609,11 @@ function jsonResponse(res, statusCode, body) {
   res.status(statusCode).json(body);
 }
 
-async function runMonitor(cfg, storage, deps = { fetchProducts, sendDiscord }) {
+async function runMonitor(
+  cfg,
+  storage,
+  deps = { fetchProducts, fetchStockSnapshot, stockDiff: calculateStockDiff, sendDiscord, sendStockDiscord }
+) {
   let state = await storage.loadState();
   const now = Date.now();
 
@@ -565,25 +634,33 @@ async function runMonitor(cfg, storage, deps = { fetchProducts, sendDiscord }) {
     state = await storage.loadState();
     const firstRun = Object.keys(state.seen || {}).length === 0;
     const newProducts = Object.values(products).filter((product) => !state.seen[product.pid]);
+    const productsToAlert = firstRun && !cfg.notifyInitial ? [] : newProducts;
 
-    if (firstRun && !cfg.notifyInitial) {
-      await storage.saveState({
-        ...state,
-        seen: products,
-        lastRunAt: nowIso(),
-        errorStreak: 0,
-        backoffUntil: null
+    let stockSnapshot = null;
+    let stockDelta = null;
+    let stockAlerted = false;
+
+    if (cfg.stockProductUrl) {
+      stockSnapshot = await deps.fetchStockSnapshot(cfg.stockProductUrl, {
+        timeoutMs: cfg.requestTimeoutMs,
+        userAgent: cfg.userAgent
       });
-      return { ok: true, baseline: true, productCount: Object.keys(products).length, alerted: 0, storage: storage.backend };
+      stockDelta = deps.stockDiff(state.stockSnapshot || null, stockSnapshot);
     }
 
-    if (newProducts.length > 0) {
-      await deps.sendDiscord(cfg, newProducts);
+    if (productsToAlert.length > 0) {
+      await deps.sendDiscord(cfg, productsToAlert);
+    }
+
+    if (shouldSendStockAlert(stockDelta, cfg)) {
+      await deps.sendStockDiscord(cfg, stockSnapshot, stockDelta);
+      stockAlerted = true;
     }
 
     await storage.saveState({
       ...state,
       seen: { ...state.seen, ...products },
+      ...(stockSnapshot ? { stockSnapshot } : {}),
       lastRunAt: nowIso(),
       errorStreak: 0,
       backoffUntil: null
@@ -591,9 +668,20 @@ async function runMonitor(cfg, storage, deps = { fetchProducts, sendDiscord }) {
 
     return {
       ok: true,
+      baseline: firstRun && !cfg.notifyInitial,
       productCount: Object.keys(products).length,
-      alerted: newProducts.length,
-      newPids: newProducts.map((product) => product.pid),
+      alerted: productsToAlert.length,
+      newPids: productsToAlert.map((product) => product.pid),
+      stock: stockSnapshot
+        ? {
+            product: stockSnapshot.masterPid,
+            inStockSizeCount: stockSnapshot.inStockSizeCount,
+            cappedOrderableTotal: stockSnapshot.cappedOrderableTotal,
+            exactStockKnown: stockSnapshot.exactStockKnown,
+            alerted: stockAlerted,
+            changes: stockDelta?.sizeChanges || []
+          }
+        : null,
       storage: storage.backend
     };
   } catch (error) {
@@ -651,6 +739,8 @@ export {
   productGridUrl,
   runMonitor,
   sendDiscord,
+  sendStockDiscord,
   shouldSkipForInterval,
+  shouldSendStockAlert,
   truncate
 };

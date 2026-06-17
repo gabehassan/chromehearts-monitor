@@ -11,6 +11,7 @@ import {
   shouldSkipForInterval,
   truncate
 } from "../api/cron.js";
+import { stockDiff } from "../scripts/stock-watch.js";
 
 function productHtml(pid, name, price = "255.00", href = `/socks/${pid}.html`) {
   return `
@@ -175,4 +176,95 @@ test("runMonitor does not mark a new product seen when Discord fails", async () 
   assert.equal(state.seen.PID2, undefined);
   assert.equal(state.errorStreak, 1);
   assert.ok(Date.parse(state.backoffUntil) > Date.now());
+});
+
+test("runMonitor baselines stock snapshot without initial stock alert", async () => {
+  const storage = fakeStore();
+  let stockAlertCount = 0;
+  const stockSnapshot = {
+    masterPid: "MASTER1",
+    name: "BLACK HOODIE",
+    inStockSizeCount: 1,
+    cappedOrderableTotal: 10,
+    exactStockKnown: false,
+    totalStock: null,
+    sizes: [{ code: "XSM", label: "XS", inStock: true }]
+  };
+
+  const result = await runMonitor({ ...baseCfg(), stockProductUrl: "https://example.com/product" }, storage, {
+    async fetchProducts() {
+      return { PID1: { pid: "PID1", name: "One", url: "https://example.com/1" } };
+    },
+    async fetchStockSnapshot() {
+      return stockSnapshot;
+    },
+    stockDiff,
+    async sendDiscord() {
+      throw new Error("new product alert should be suppressed on baseline");
+    },
+    async sendStockDiscord() {
+      stockAlertCount += 1;
+    }
+  });
+
+  assert.equal(result.baseline, true);
+  assert.equal(result.stock.alerted, false);
+  assert.equal(stockAlertCount, 0);
+  assert.deepEqual(storage.state.stockSnapshot, stockSnapshot);
+});
+
+test("runMonitor sends stock alert when size availability changes", async () => {
+  const storage = fakeStore({
+    seen: { PID1: { pid: "PID1", name: "One", url: "https://example.com/1" } },
+    stockSnapshot: {
+      masterPid: "MASTER1",
+      name: "BLACK HOODIE",
+      inStockSizeCount: 1,
+      cappedOrderableTotal: 10,
+      sizes: [
+        { code: "XSM", label: "XS", inStock: true },
+        { code: "LRG", label: "L", inStock: false }
+      ]
+    },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    errorStreak: 0,
+    backoffUntil: null
+  });
+  let stockAlert = null;
+
+  const nextSnapshot = {
+    masterPid: "MASTER1",
+    name: "BLACK HOODIE",
+    inStockSizeCount: 2,
+    cappedOrderableTotal: 20,
+    exactStockKnown: false,
+    totalStock: null,
+    sizes: [
+      { code: "XSM", label: "XS", inStock: true },
+      { code: "LRG", label: "L", inStock: true }
+    ]
+  };
+
+  const result = await runMonitor({ ...baseCfg(), stockProductUrl: "https://example.com/product" }, storage, {
+    async fetchProducts() {
+      return { PID1: { pid: "PID1", name: "One", url: "https://example.com/1" } };
+    },
+    async fetchStockSnapshot() {
+      return nextSnapshot;
+    },
+    stockDiff,
+    async sendDiscord() {
+      throw new Error("no new product alert expected");
+    },
+    async sendStockDiscord(_cfg, snapshot, diff) {
+      stockAlert = { snapshot, diff };
+    }
+  });
+
+  assert.equal(result.stock.alerted, true);
+  assert.deepEqual(result.stock.changes, [{ code: "LRG", label: "L", from: "out_of_stock", to: "in_stock" }]);
+  assert.equal(stockAlert.snapshot, nextSnapshot);
+  assert.equal(stockAlert.diff.inStockSizeCountChange, 1);
+  assert.deepEqual(storage.state.stockSnapshot, nextSnapshot);
 });
