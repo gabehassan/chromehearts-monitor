@@ -17,9 +17,14 @@ jobs:
       - name: Trigger Vercel monitor
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          MONITOR_URL: https://chrome-hearts-monitor-vercel.vercel.app/api/cron
+          MONITOR_URL: ${{ secrets.MONITOR_URL }}
         run: |
           set -euo pipefail
+
+          if [ -z "${CRON_SECRET:-}" ] || [ -z "${MONITOR_URL:-}" ]; then
+            echo "CRON_SECRET and MONITOR_URL secrets are required"
+            exit 1
+          fi
 
           response_file="$(mktemp)"
           status="$(
