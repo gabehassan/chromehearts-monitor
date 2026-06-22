@@ -487,16 +487,20 @@ function sizeLabels(product, inStock) {
 
 function stockSummary(product) {
   if (!product.sizes || product.sizes.length === 0) {
-    return product.detailError ? "PDP stock unavailable" : "No size data";
+    return product.detailError ? "✠ PDP STOCK UNAVAILABLE" : "✠ STOCK SIGNAL HIDDEN";
   }
 
-  return `${product.inStockSizeCount}/${product.sizes.length} sizes live`;
+  if (product.inStockSizeCount > 0) {
+    return `✠ LIVE // ${product.inStockSizeCount}/${product.sizes.length} sizes`;
+  }
+
+  return `✠ DARK // 0/${product.sizes.length} sizes`;
 }
 
 function stockTotalSummary(product) {
-  if (product.exactStockKnown) return String(product.totalStock ?? "unknown");
-  if (Number.isFinite(product.cappedOrderableTotal)) return `exact hidden / cap ${product.cappedOrderableTotal}`;
-  return "exact hidden";
+  if (product.exactStockKnown) return `† EXACT // ${product.totalStock ?? "unknown"}`;
+  if (Number.isFinite(product.cappedOrderableTotal)) return `† EXACT HIDDEN // CART CAP ${product.cappedOrderableTotal}`;
+  return "† EXACT HIDDEN BY SITE";
 }
 
 function mergeProductDetail(product, detail) {
@@ -557,34 +561,39 @@ function buildProductEmbed(product) {
   const price = priceText(product.price) || "unknown";
   const inStock = compactList(sizeLabels(product, true)) || "none";
   const outOfStock = compactList(sizeLabels(product, false)) || "none";
+  const live = product.inStockSizeCount > 0;
   const fields = [
-    { name: "Price", value: truncate(price, 1024), inline: true },
-    { name: "Stock", value: truncate(stockSummary(product), 1024), inline: true },
-    { name: "Inventory", value: truncate(stockTotalSummary(product), 1024), inline: true },
-    { name: "Sizes live", value: truncate(inStock, 1024), inline: false },
-    { name: "Sizes gone", value: truncate(outOfStock, 1024), inline: false },
-    { name: "Category", value: truncate(product.category || "unknown", 1024), inline: true },
-    { name: "PID", value: truncate(product.masterPid || product.pid, 1024), inline: true }
+    { name: "✠ Price", value: truncate(price, 1024), inline: true },
+    { name: "✠ Stock", value: truncate(stockSummary(product), 1024), inline: true },
+    { name: "† Inventory", value: truncate(stockTotalSummary(product), 1024), inline: true },
+    { name: "⛓ Sizes live", value: truncate(`「 ${inStock} 」`, 1024), inline: false },
+    { name: "⌁ Sizes gone", value: truncate(`「 ${outOfStock} 」`, 1024), inline: false },
+    { name: "◇ Category", value: truncate(product.category || "unknown", 1024), inline: true },
+    { name: "⟡ PID", value: truncate(product.masterPid || product.pid, 1024), inline: true }
   ];
 
   if (product.selectedVariantPid) {
-    fields.push({ name: "Variant", value: truncate(product.selectedVariantPid, 1024), inline: true });
+    fields.push({ name: "◇ Variant", value: truncate(product.selectedVariantPid, 1024), inline: true });
   }
   if (product.detailError) {
-    fields.push({ name: "PDP", value: truncate(`detail fetch failed: ${product.detailError}`, 1024), inline: false });
+    fields.push({ name: "⌁ PDP", value: truncate(`detail fetch failed: ${product.detailError}`, 1024), inline: false });
   }
 
   const embed = {
     author: {
-      name: "CHROME HEARTS // NEW LOAD",
+      name: "✠ CHROME HEARTS // DROP SIGNAL ✠",
       url: BASE_URL
     },
-    title: truncate(product.name || product.pid, 256),
+    title: truncate(`† ${product.name || product.pid}`, 256),
     url: product.url,
-    description: truncate(`${price} // ${product.brand || "Chrome Hearts"} // ${product.productType || "product"}`, 4096),
-    color: 0xc7c7c7,
+    description: truncate(
+      `> ${live ? "LIVE FROM THE GRID" : "GRID HIT // STOCK MUTED"}\n` +
+        `> ${price} // ${product.brand || "Chrome Hearts"} // ${product.productType || "product"}`,
+      4096
+    ),
+    color: live ? 0xd7d7d7 : 0x3a3a3a,
     fields,
-    footer: { text: "chrome hearts product monitor // low-noise grid signal" },
+    footer: { text: "† chrome hearts monitor // low-noise demandware signal †" },
     timestamp: nowIso()
   };
 
@@ -602,11 +611,11 @@ async function sendDiscord(cfg, products) {
   for (let index = 0; index < products.length; index += 10) {
     const chunk = products.slice(index, index + 10);
     const payload = {
-      username: "CHROME HEARTS // MONITOR",
+      username: "✠ CHROME HEARTS // MONITOR ✠",
       content:
         chunk.length === 1
-          ? "CHROME HEARTS // NEW ITEM LOADED"
-          : `CHROME HEARTS // ${chunk.length} NEW ITEMS LOADED`,
+          ? "✠ **CHROME HEARTS // NEW ITEM LOADED** ✠"
+          : `✠ **CHROME HEARTS // ${chunk.length} NEW ITEMS LOADED** ✠`,
       embeds: buildEmbeds(chunk)
     };
 
@@ -653,27 +662,29 @@ function buildStockEmbed(snapshot, diff) {
       : "No size-level changes";
 
   return {
-    title: truncate(`${snapshot.name || snapshot.masterPid || "Product"} stock update`, 256),
+    title: truncate(`† ${snapshot.name || snapshot.masterPid || "Product"} stock update`, 256),
     url: snapshot.sourceUrl,
-    color: 0xc7c7c7,
+    color: snapshot.inStockSizeCount > 0 ? 0xd7d7d7 : 0x3a3a3a,
     fields: [
-      { name: "Master PID", value: truncate(snapshot.masterPid || "unknown", 1024), inline: true },
-      { name: "In-stock sizes", value: truncate(`${snapshot.inStockSizeCount}/${snapshot.sizes.length}`, 1024), inline: true },
+      { name: "⟡ Master PID", value: truncate(snapshot.masterPid || "unknown", 1024), inline: true },
+      { name: "✠ Live sizes", value: truncate(`${snapshot.inStockSizeCount}/${snapshot.sizes.length}`, 1024), inline: true },
       {
-        name: "Capped orderable total",
-        value: truncate(snapshot.cappedOrderableTotal === null ? "unknown" : String(snapshot.cappedOrderableTotal), 1024),
+        name: "† Inventory",
+        value: truncate(
+          snapshot.cappedOrderableTotal === null ? "exact hidden by site" : `exact hidden // cart cap ${snapshot.cappedOrderableTotal}`,
+          1024
+        ),
         inline: true
       },
       {
-        name: "Exact unit stock",
-        value: snapshot.exactStockKnown ? truncate(String(snapshot.totalStock), 1024) : "unknown",
-        inline: true
+        name: "⛓ In",
+        value: truncate(`「 ${inStockLabels.join(", ") || "none"} 」`, 1024),
+        inline: false
       },
-      { name: "In", value: truncate(inStockLabels.join(", ") || "none", 1024), inline: false },
-      { name: "Out", value: truncate(outOfStockLabels.join(", ") || "none", 1024), inline: false },
-      { name: "Changes", value: truncate(changes, 1024), inline: false }
+      { name: "⌁ Out", value: truncate(`「 ${outOfStockLabels.join(", ") || "none"} 」`, 1024), inline: false },
+      { name: "◇ Changes", value: truncate(changes, 1024), inline: false }
     ],
-    footer: { text: "Chrome Hearts stock monitor" },
+    footer: { text: "† chrome hearts stock monitor †" },
     timestamp: snapshot.checkedAt
   };
 }
@@ -691,8 +702,8 @@ async function sendStockDiscord(cfg, snapshot, diff) {
       method: "POST",
       headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
       body: JSON.stringify({
-        username: "Chrome Hearts Monitor",
-        content: `${snapshot.name || snapshot.masterPid || "Chrome Hearts product"} stock update`,
+        username: "✠ CHROME HEARTS // MONITOR ✠",
+        content: `† **${snapshot.name || snapshot.masterPid || "Chrome Hearts product"} // STOCK SIGNAL** †`,
         embeds: [buildStockEmbed(snapshot, diff)]
       }),
       cache: "no-store"

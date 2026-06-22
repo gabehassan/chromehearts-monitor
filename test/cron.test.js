@@ -103,9 +103,9 @@ test("buildEmbeds limits Discord payload fields", () => {
 
   assert.equal(embeds.length, 1);
   assert.equal(embeds[0].title.length, 256);
-  assert.equal(embeds[0].fields.find((field) => field.name === "Price").value, "$1,000");
-  assert.equal(embeds[0].fields.find((field) => field.name === "Stock").value, "No size data");
-  assert.equal(embeds[0].author.name, "CHROME HEARTS // NEW LOAD");
+  assert.equal(embeds[0].fields.find((field) => field.name === "✠ Price").value, "$1,000");
+  assert.equal(embeds[0].fields.find((field) => field.name === "✠ Stock").value, "✠ STOCK SIGNAL HIDDEN");
+  assert.equal(embeds[0].author.name, "✠ CHROME HEARTS // DROP SIGNAL ✠");
 });
 
 test("buildProductEmbed includes price, image, stock, and size fields", () => {
@@ -131,13 +131,14 @@ test("buildProductEmbed includes price, image, stock, and size fields", () => {
     ]
   });
 
-  assert.equal(embed.title, "BLACK HOODIE");
+  assert.equal(embed.title, "† BLACK HOODIE");
   assert.equal(embed.image.url, "https://www.chromehearts.com/image.png");
-  assert.equal(embed.fields.find((field) => field.name === "Price").value, "$750");
-  assert.equal(embed.fields.find((field) => field.name === "Stock").value, "2/3 sizes live");
-  assert.equal(embed.fields.find((field) => field.name === "Inventory").value, "exact hidden / cap 20");
-  assert.equal(embed.fields.find((field) => field.name === "Sizes live").value, "XS, XXL");
-  assert.equal(embed.fields.find((field) => field.name === "Sizes gone").value, "L");
+  assert.equal(embed.fields.find((field) => field.name === "✠ Price").value, "$750");
+  assert.equal(embed.fields.find((field) => field.name === "✠ Stock").value, "✠ LIVE // 2/3 sizes");
+  assert.equal(embed.fields.find((field) => field.name === "† Inventory").value, "† EXACT HIDDEN // CART CAP 20");
+  assert.equal(embed.fields.find((field) => field.name === "⛓ Sizes live").value, "「 XS, XXL 」");
+  assert.equal(embed.fields.find((field) => field.name === "⌁ Sizes gone").value, "「 L 」");
+  assert.equal(embed.color, 0xd7d7d7);
 });
 
 test("enrichProduct falls back to grid data when PDP fetch fails", async () => {
