@@ -502,6 +502,17 @@ function stockTotalSummary(product) {
   return "";
 }
 
+function embedDescription(product, price) {
+  const description = truncate(product.description || "", 4096);
+  if (description) return description;
+
+  const fallback = [product.brand || "Chrome Hearts", product.category || product.productType || "product", price]
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .join(", ");
+  return truncate(fallback, 4096);
+}
+
 function mergeProductDetail(product, detail) {
   const sizes = detail?.sizes || [];
   return {
@@ -510,6 +521,7 @@ function mergeProductDetail(product, detail) {
     price: detail?.price || product.price,
     brand: detail?.brand || product.brand,
     category: detail?.category || product.category,
+    description: detail?.description || product.description || "",
     image: detail?.image || product.image,
     images: detail?.images || (product.image ? [product.image] : []),
     masterPid: detail?.masterPid || product.pid,
@@ -545,6 +557,7 @@ async function enrichProduct(product, cfg, deps = { fetchStockSnapshot }) {
       readyToOrder: null,
       availabilityMessages: [],
       stockSource: "",
+      description: product.description || "",
       exactStockKnown: false,
       totalStock: null,
       inStockSizeCount: 0,
@@ -569,44 +582,36 @@ function buildProductEmbed(product) {
   const inStock = compactList(sizeLabels(product, true)) || "none";
   const outOfStock = compactList(sizeLabels(product, false)) || "none";
   const live = product.inStockSizeCount > 0;
-  const productKind = product.productType || "product";
   const fields = [
-    { name: "✦ Price", value: truncate(price, 1024), inline: true },
-    { name: "✧ Availability", value: truncate(stockSummary(product), 1024), inline: true },
-    { name: "✹ Category", value: truncate(product.category || "unknown", 1024), inline: true },
-    { name: "✠ Available sizes", value: truncate(inStock, 1024), inline: false },
-    { name: "☾ Unavailable sizes", value: truncate(outOfStock, 1024), inline: false },
-    { name: "✣ Product ID", value: truncate(product.masterPid || product.pid, 1024), inline: true }
+    { name: "Price", value: truncate(price, 1024), inline: true },
+    { name: "Availability", value: truncate(stockSummary(product), 1024), inline: true },
+    { name: "Category", value: truncate(product.category || "unknown", 1024), inline: true },
+    { name: "Available sizes", value: truncate(inStock, 1024), inline: false },
+    { name: "Unavailable sizes", value: truncate(outOfStock, 1024), inline: false },
+    { name: "Product ID", value: truncate(product.masterPid || product.pid, 1024), inline: true }
   ];
 
   if (product.exactStockKnown) {
-    fields.splice(2, 0, { name: "✧ Exact stock", value: truncate(stockTotalSummary(product), 1024), inline: true });
+    fields.splice(2, 0, { name: "Exact stock", value: truncate(stockTotalSummary(product), 1024), inline: true });
   }
   if (product.selectedVariantPid) {
-    fields.push({ name: "✣ Variant", value: truncate(product.selectedVariantPid, 1024), inline: true });
+    fields.push({ name: "Variant", value: truncate(product.selectedVariantPid, 1024), inline: true });
   }
   if (product.detailError) {
-    fields.push({ name: "☾ Details", value: truncate(`Product page detail unavailable: ${product.detailError}`, 1024), inline: false });
+    fields.push({ name: "Details", value: truncate(`Product page detail unavailable: ${product.detailError}`, 1024), inline: false });
   }
 
   const embed = {
     author: {
-      name: "✦ Chrome Hearts Drop Monitor ✦",
+      name: "Chrome Hearts Drop Monitor",
       url: BASE_URL
     },
-    title: truncate(`✠ ${product.name || product.pid}`, 256),
+    title: truncate(product.name || product.pid, 256),
     url: product.url,
-    description: truncate(
-      [
-        live ? "◆ New piece loaded and available" : "◇ New piece loaded",
-        `${product.brand || "Chrome Hearts"} · ${productKind} · ${price}`,
-        live ? "Silver signal confirmed through live size availability." : "Availability is muted on the product page."
-      ].join("\n"),
-      4096
-    ),
+    description: embedDescription(product, price),
     color: live ? 0xb8f3d4 : 0xb7b2ff,
     fields,
-    footer: { text: "Chrome Hearts monitor · new item alert" },
+    footer: { text: "Chrome Hearts monitor - new item alert" },
     timestamp: nowIso()
   };
 
@@ -624,11 +629,11 @@ async function sendDiscord(cfg, products) {
   for (let index = 0; index < products.length; index += 10) {
     const chunk = products.slice(index, index + 10);
     const payload = {
-      username: "✦ Chrome Hearts Monitor ✦",
+      username: "Chrome Hearts Monitor",
       content:
         chunk.length === 1
-          ? "✠ **New Chrome Hearts item loaded**"
-          : `✠ **${chunk.length} new Chrome Hearts items loaded**`,
+          ? "New Chrome Hearts item loaded"
+          : `${chunk.length} new Chrome Hearts items loaded`,
       embeds: buildEmbeds(chunk)
     };
 
@@ -675,17 +680,17 @@ function buildStockEmbed(snapshot, diff) {
       : "No size-level changes";
 
   return {
-    title: truncate(`✠ ${snapshot.name || snapshot.masterPid || "Product"} stock update`, 256),
+    title: truncate(`${snapshot.name || snapshot.masterPid || "Product"} stock update`, 256),
     url: snapshot.sourceUrl,
     color: snapshot.inStockSizeCount > 0 ? 0xb8f3d4 : 0xb7b2ff,
     fields: [
-      { name: "✣ Product ID", value: truncate(snapshot.masterPid || "unknown", 1024), inline: true },
-      { name: "✧ Availability", value: truncate(`${snapshot.inStockSizeCount} of ${snapshot.sizes.length} sizes available`, 1024), inline: true },
-      { name: "✠ Available sizes", value: truncate(inStockLabels.join(", ") || "none", 1024), inline: false },
-      { name: "☾ Unavailable sizes", value: truncate(outOfStockLabels.join(", ") || "none", 1024), inline: false },
-      { name: "✹ Changes", value: truncate(changes, 1024), inline: false }
+      { name: "Product ID", value: truncate(snapshot.masterPid || "unknown", 1024), inline: true },
+      { name: "Availability", value: truncate(`${snapshot.inStockSizeCount} of ${snapshot.sizes.length} sizes available`, 1024), inline: true },
+      { name: "Available sizes", value: truncate(inStockLabels.join(", ") || "none", 1024), inline: false },
+      { name: "Unavailable sizes", value: truncate(outOfStockLabels.join(", ") || "none", 1024), inline: false },
+      { name: "Changes", value: truncate(changes, 1024), inline: false }
     ],
-    footer: { text: "Chrome Hearts monitor · stock update" },
+    footer: { text: "Chrome Hearts monitor - stock update" },
     timestamp: snapshot.checkedAt
   };
 }
@@ -703,8 +708,8 @@ async function sendStockDiscord(cfg, snapshot, diff) {
       method: "POST",
       headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
       body: JSON.stringify({
-        username: "✦ Chrome Hearts Monitor ✦",
-        content: `✠ **${snapshot.name || snapshot.masterPid || "Chrome Hearts product"} stock update**`,
+        username: "Chrome Hearts Monitor",
+        content: `${snapshot.name || snapshot.masterPid || "Chrome Hearts product"} stock update`,
         embeds: [buildStockEmbed(snapshot, diff)]
       }),
       cache: "no-store"

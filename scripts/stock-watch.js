@@ -36,6 +36,27 @@ function collectProductImages($) {
   ]).map(absoluteUrl);
 }
 
+function cleanDescriptionText(value) {
+  const raw = String(value || "");
+  const text = /<[a-z][\s\S]*>/i.test(raw) ? cheerio.load(raw).text() : raw;
+  return text
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t\r\f\v]+/g, " ")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function meaningfulDescription(value) {
+  const description = cleanDescriptionText(value);
+  const lower = description.toLowerCase();
+  if (!description) return "";
+  if (lower.includes("the official website of chrome hearts")) return "";
+  return description;
+}
+
 function intOption(value, name, min) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed < min) {
@@ -90,11 +111,68 @@ function findAvailability(value) {
   return Object.values(value).map(findAvailability).find(Boolean) || "";
 }
 
+function findProductDescription(value) {
+  if (!value || typeof value !== "object") return "";
+  if (Array.isArray(value)) {
+    return value.map(findProductDescription).find(Boolean) || "";
+  }
+
+  const type = Array.isArray(value["@type"]) ? value["@type"].join(" ") : String(value["@type"] || "");
+  if (type.toLowerCase().includes("product")) {
+    const description = meaningfulDescription(value.description);
+    if (description) return description;
+  }
+
+  return Object.values(value).map(findProductDescription).find(Boolean) || "";
+}
+
 function schemaAvailability($) {
   return $("script[type='application/ld+json']")
     .toArray()
     .map((script) => findAvailability(parseJsonLd($(script).text())))
     .find(Boolean) || "";
+}
+
+function schemaDescription($) {
+  return $("script[type='application/ld+json']")
+    .toArray()
+    .map((script) => findProductDescription(parseJsonLd($(script).text())))
+    .find(Boolean) || "";
+}
+
+function descriptionFromElement($, element) {
+  const root = $(element);
+  const listItems = root
+    .find("li")
+    .toArray()
+    .map((li) => meaningfulDescription($(li).text()))
+    .filter(Boolean);
+
+  if (listItems.length) return listItems.join("\n");
+  return meaningfulDescription(root.text());
+}
+
+function detailsDescription($) {
+  const detailBlocks = $("[id^='collapsible-details-']")
+    .toArray()
+    .filter((element) => !String($(element).attr("id") || "").toLowerCase().includes("returns"));
+  const otherBlocks = $("[itemprop='description'], .product-description, .long-description, .short-description").toArray();
+
+  for (const element of [...detailBlocks, ...otherBlocks]) {
+    const description = descriptionFromElement($, element);
+    if (description) return description;
+  }
+
+  return "";
+}
+
+function productDescription($) {
+  return (
+    detailsDescription($) ||
+    schemaDescription($) ||
+    meaningfulDescription($("meta[property='og:description']").attr("content")) ||
+    meaningfulDescription($("meta[name='description']").attr("content"))
+  );
 }
 
 function isSchemaInStock(availability) {
@@ -291,6 +369,7 @@ function parseProductStockPage(html, pageUrl = "") {
     price: String(metadata.attr("data-price") || "").trim(),
     brand: String(metadata.attr("data-brand") || "Chrome Hearts").trim(),
     category: String(metadata.attr("data-category") || "").trim(),
+    description: productDescription($),
     image: images[0] || "",
     images,
     maxOrderQuantity,

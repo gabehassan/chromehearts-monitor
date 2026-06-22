@@ -103,12 +103,13 @@ test("buildEmbeds limits Discord payload fields", () => {
 
   assert.equal(embeds.length, 1);
   assert.equal(embeds[0].title.length, 256);
-  assert.equal(embeds[0].fields.find((field) => field.name === "✦ Price").value, "$1,000");
-  assert.equal(embeds[0].fields.find((field) => field.name === "✧ Availability").value, "Awaiting size data");
-  assert.equal(embeds[0].author.name, "✦ Chrome Hearts Drop Monitor ✦");
+  assert.equal(embeds[0].fields.find((field) => field.name === "Price").value, "$1,000");
+  assert.equal(embeds[0].fields.find((field) => field.name === "Availability").value, "Awaiting size data");
+  assert.equal(embeds[0].author.name, "Chrome Hearts Drop Monitor");
+  assert.equal(/[✦✧✹✠☾✣◆◇†⌁]/.test(JSON.stringify(embeds[0])), false);
 });
 
-test("buildProductEmbed includes price, image, stock, and size fields", () => {
+test("buildProductEmbed includes PDP description, price, image, stock, and size fields", () => {
   const embed = buildProductEmbed({
     pid: "MASTER1",
     masterPid: "MASTER1",
@@ -117,6 +118,7 @@ test("buildProductEmbed includes price, image, stock, and size fields", () => {
     price: "750.00",
     brand: "Chrome Hearts",
     category: "Hoodie",
+    description: "Black cotton fleece hoodie with Chrome Hearts sleeve print.\nMade in USA.",
     productType: "master",
     url: "https://www.chromehearts.com/hoodie/black-hoodie/MASTER1.html",
     image: "https://www.chromehearts.com/image.png",
@@ -134,15 +136,20 @@ test("buildProductEmbed includes price, image, stock, and size fields", () => {
     ]
   });
 
-  assert.equal(embed.title, "✠ BLACK HOODIE");
+  assert.equal(embed.title, "BLACK HOODIE");
+  assert.equal(embed.description, "Black cotton fleece hoodie with Chrome Hearts sleeve print.\nMade in USA.");
   assert.equal(embed.image.url, "https://www.chromehearts.com/image.png");
-  assert.equal(embed.fields.find((field) => field.name === "✦ Price").value, "$750");
-  assert.equal(embed.fields.find((field) => field.name === "✧ Availability").value, "2 of 3 sizes available");
-  assert.equal(embed.fields.find((field) => field.name === "✠ Available sizes").value, "XS, XXL");
-  assert.equal(embed.fields.find((field) => field.name === "☾ Unavailable sizes").value, "L");
+  assert.equal(embed.fields.find((field) => field.name === "Price").value, "$750");
+  assert.equal(embed.fields.find((field) => field.name === "Availability").value, "2 of 3 sizes available");
+  assert.equal(embed.fields.find((field) => field.name === "Available sizes").value, "XS, XXL");
+  assert.equal(embed.fields.find((field) => field.name === "Unavailable sizes").value, "L");
   assert.equal(embed.fields.find((field) => field.name === "† Inventory"), undefined);
   assert.equal(embed.fields.find((field) => field.name === "⌁ SFCC signal"), undefined);
+  assert.equal(embed.fields.find((field) => field.name === "Inventory"), undefined);
+  assert.equal(embed.fields.find((field) => field.name === "SFCC signal"), undefined);
   assert.equal(embed.description.includes("//"), false);
+  assert.equal(embed.description.includes("Silver signal"), false);
+  assert.equal(/[✦✧✹✠☾✣◆◇†⌁]/.test(JSON.stringify(embed)), false);
   assert.equal(embed.color, 0xb8f3d4);
 });
 
@@ -158,7 +165,8 @@ test("buildProductEmbed only shows inventory when exact stock is known", () => {
     sizes: [{ code: "OSZ", label: "OS", inStock: true }]
   });
 
-  assert.equal(embed.fields.find((field) => field.name === "✧ Exact stock").value, "7 units");
+  assert.equal(embed.fields.find((field) => field.name === "Exact stock").value, "7 units");
+  assert.equal(embed.description, "Chrome Hearts, product, $100");
 });
 
 test("enrichProduct falls back to grid data when PDP fetch fails", async () => {

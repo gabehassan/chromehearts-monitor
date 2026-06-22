@@ -4,6 +4,19 @@ import { fetchStockSnapshot, parseProductStockPage, parseProductVariationJson, s
 
 function stockHtml() {
   return `
+    <meta name="description" content="The Official Website of Chrome Hearts Fine Jewelry, Accessories, Shoes, Fragrance &amp; Home Goods Made in the USA." />
+    <script type="application/ld+json">
+      {
+        "@context": "http://schema.org/",
+        "@type": "Product",
+        "name": "BLACK HOODIE",
+        "description": null,
+        "offers": {
+          "@type": "Offer",
+          "availability": "http://schema.org/InStock"
+        }
+      }
+    </script>
     <div class="container product-detail" data-pid="152701BLKXSM04K">
       <span class="product-metadata d-none"
         data-pid="152701BLKXXX04K"
@@ -36,6 +49,16 @@ function stockHtml() {
         <span data-attr-value="2XL" class="size-value swatch-box selectable">XXL</span>
       </button>
     </div>
+    <div class="collapse pdp-collapse show" id="collapseMenu">
+      <div class="row details">
+        <div class="col-sm-12 value content" id="collapsible-details-1">
+          <ul>
+            <li>BLACK COTTON FLEECE HOODIE WITH CHROME HEARTS SLEEVE PRINT</li>
+            <li>MADE IN USA</li>
+          </ul>
+        </div>
+      </div>
+    </div>
   `;
 }
 
@@ -46,6 +69,7 @@ function oneSizeHtml() {
         "@context": "http://schema.org/",
         "@type": "Product",
         "name": "TRUCKER HAT",
+        "description": "Mesh trucker hat with Chrome Hearts front patch.",
         "sku": "196451DAYOSZ262",
         "offers": {
           "@type": "Offer",
@@ -76,6 +100,7 @@ test("parseProductStockPage extracts size availability and capped totals", () =>
   assert.equal(snapshot.name, "BLACK HOODIE");
   assert.equal(snapshot.brand, "Chrome Hearts");
   assert.equal(snapshot.category, "Hoodie");
+  assert.equal(snapshot.description, "BLACK COTTON FLEECE HOODIE WITH CHROME HEARTS SLEEVE PRINT\nMADE IN USA");
   assert.equal(snapshot.image, "https://www.chromehearts.com/dw/image/v2/BFBV_PRD/example-large.png?sw=1600");
   assert.ok(snapshot.images.includes("https://www.chromehearts.com/dw/image/v2/BFBV_PRD/example.png?sw=540"));
   assert.equal(snapshot.maxOrderQuantity, 10);
@@ -212,6 +237,7 @@ test("parseProductStockPage creates an OS stock row for one-size products", () =
 
   assert.equal(snapshot.masterPid, "196451DAYOSZ262");
   assert.equal(snapshot.name, "TRUCKER HAT");
+  assert.equal(snapshot.description, "Mesh trucker hat with Chrome Hearts front patch.");
   assert.equal(snapshot.maxOrderQuantity, 10);
   assert.equal(snapshot.inStockSizeCount, 1);
   assert.equal(snapshot.cappedOrderableTotal, 10);
