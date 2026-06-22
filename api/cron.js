@@ -132,6 +132,23 @@ function priceText(price) {
   return Number.isFinite(value) ? `$${value.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : String(price);
 }
 
+function compactList(values, limit = 1024) {
+  const cleanValues = values.map((value) => String(value || "").trim()).filter(Boolean);
+  const text = cleanValues.join(", ");
+  if (text && text.length <= limit) return text;
+
+  const visible = [];
+  for (const value of cleanValues) {
+    const candidate = [...visible, value].join(", ");
+    if (candidate.length > Math.max(0, limit - 20)) break;
+    visible.push(value);
+  }
+
+  const remaining = cleanValues.length - visible.length;
+  if (visible.length === 0) return remaining > 0 ? `${remaining} more` : "";
+  return remaining > 0 ? `${visible.join(", ")} +${remaining} more` : visible.join(", ");
+}
+
 function productGridUrl(start, pageSize) {
   const url = new URL(PRODUCT_GRID_BASE_URL);
   url.searchParams.set("cgid", "root");
@@ -461,25 +478,123 @@ function isAuthorized(req, cronSecret) {
   return header === `Bearer ${cronSecret}`;
 }
 
+function sizeLabels(product, inStock) {
+  return (product.sizes || [])
+    .filter((size) => size.inStock === inStock)
+    .map((size) => size.label || size.code)
+    .filter(Boolean);
+}
+
+function stockSummary(product) {
+  if (!product.sizes || product.sizes.length === 0) {
+    return product.detailError ? "PDP stock unavailable" : "No size data";
+  }
+
+  return `${product.inStockSizeCount}/${product.sizes.length} sizes live`;
+}
+
+function stockTotalSummary(product) {
+  if (product.exactStockKnown) return String(product.totalStock ?? "unknown");
+  if (Number.isFinite(product.cappedOrderableTotal)) return `exact hidden / cap ${product.cappedOrderableTotal}`;
+  return "exact hidden";
+}
+
+function mergeProductDetail(product, detail) {
+  const sizes = detail?.sizes || [];
+  return {
+    ...product,
+    name: detail?.name || product.name,
+    price: detail?.price || product.price,
+    brand: detail?.brand || product.brand,
+    category: detail?.category || product.category,
+    image: detail?.image || product.image,
+    images: detail?.images || (product.image ? [product.image] : []),
+    masterPid: detail?.masterPid || product.pid,
+    selectedVariantPid: detail?.selectedVariantPid || "",
+    maxOrderQuantity: detail?.maxOrderQuantity ?? null,
+    exactStockKnown: Boolean(detail?.exactStockKnown),
+    totalStock: detail?.totalStock ?? null,
+    inStockSizeCount: detail?.inStockSizeCount ?? sizes.filter((size) => size.inStock).length,
+    cappedOrderableTotal: detail?.cappedOrderableTotal ?? null,
+    sizes,
+    enrichedAt: detail?.checkedAt || nowIso()
+  };
+}
+
+async function enrichProduct(product, cfg, deps = { fetchStockSnapshot }) {
+  try {
+    const detail = await deps.fetchStockSnapshot(product.url, {
+      timeoutMs: cfg.requestTimeoutMs,
+      userAgent: cfg.userAgent
+    });
+    return mergeProductDetail(product, detail);
+  } catch (error) {
+    return {
+      ...product,
+      masterPid: product.pid,
+      selectedVariantPid: "",
+      maxOrderQuantity: null,
+      exactStockKnown: false,
+      totalStock: null,
+      inStockSizeCount: 0,
+      cappedOrderableTotal: null,
+      sizes: [],
+      detailError: error.message,
+      enrichedAt: nowIso()
+    };
+  }
+}
+
+async function enrichProducts(products, cfg, deps = { fetchStockSnapshot }) {
+  const enriched = [];
+  for (const product of products) {
+    enriched.push(await enrichProduct(product, cfg, deps));
+  }
+  return enriched;
+}
+
+function buildProductEmbed(product) {
+  const price = priceText(product.price) || "unknown";
+  const inStock = compactList(sizeLabels(product, true)) || "none";
+  const outOfStock = compactList(sizeLabels(product, false)) || "none";
+  const fields = [
+    { name: "Price", value: truncate(price, 1024), inline: true },
+    { name: "Stock", value: truncate(stockSummary(product), 1024), inline: true },
+    { name: "Inventory", value: truncate(stockTotalSummary(product), 1024), inline: true },
+    { name: "Sizes live", value: truncate(inStock, 1024), inline: false },
+    { name: "Sizes gone", value: truncate(outOfStock, 1024), inline: false },
+    { name: "Category", value: truncate(product.category || "unknown", 1024), inline: true },
+    { name: "PID", value: truncate(product.masterPid || product.pid, 1024), inline: true }
+  ];
+
+  if (product.selectedVariantPid) {
+    fields.push({ name: "Variant", value: truncate(product.selectedVariantPid, 1024), inline: true });
+  }
+  if (product.detailError) {
+    fields.push({ name: "PDP", value: truncate(`detail fetch failed: ${product.detailError}`, 1024), inline: false });
+  }
+
+  const embed = {
+    author: {
+      name: "CHROME HEARTS // NEW LOAD",
+      url: BASE_URL
+    },
+    title: truncate(product.name || product.pid, 256),
+    url: product.url,
+    description: truncate(`${price} // ${product.brand || "Chrome Hearts"} // ${product.productType || "product"}`, 4096),
+    color: 0xc7c7c7,
+    fields,
+    footer: { text: "chrome hearts product monitor // low-noise grid signal" },
+    timestamp: nowIso()
+  };
+
+  if (product.image) embed.image = { url: product.image };
+  return embed;
+}
+
 function buildEmbeds(products) {
   return products.map((product) => {
-    const fields = [{ name: "PID", value: truncate(product.pid, 1024), inline: true }];
-    const price = priceText(product.price);
-    if (price) fields.push({ name: "Price", value: truncate(price, 1024), inline: true });
-    if (product.category) fields.push({ name: "Category", value: truncate(product.category, 1024), inline: true });
-    if (product.productType) fields.push({ name: "Type", value: truncate(product.productType, 1024), inline: true });
-
-    const embed = {
-      title: truncate(product.name, 256),
-      url: product.url,
-      color: 0x111111,
-      fields,
-      footer: { text: "Chrome Hearts new item monitor" },
-      timestamp: nowIso()
-    };
-
-    if (product.image) embed.thumbnail = { url: product.image };
-    return embed;
+    return buildProductEmbed(product);
   });
 }
 
@@ -487,8 +602,11 @@ async function sendDiscord(cfg, products) {
   for (let index = 0; index < products.length; index += 10) {
     const chunk = products.slice(index, index + 10);
     const payload = {
-      username: "Chrome Hearts Monitor",
-      content: `New Chrome Hearts item${chunk.length === 1 ? "" : "s"}: ${chunk.length}`,
+      username: "CHROME HEARTS // MONITOR",
+      content:
+        chunk.length === 1
+          ? "CHROME HEARTS // NEW ITEM LOADED"
+          : `CHROME HEARTS // ${chunk.length} NEW ITEMS LOADED`,
       embeds: buildEmbeds(chunk)
     };
 
@@ -612,8 +730,17 @@ function jsonResponse(res, statusCode, body) {
 async function runMonitor(
   cfg,
   storage,
-  deps = { fetchProducts, fetchStockSnapshot, stockDiff: calculateStockDiff, sendDiscord, sendStockDiscord }
+  deps = {}
 ) {
+  const services = {
+    fetchProducts,
+    fetchStockSnapshot,
+    stockDiff: calculateStockDiff,
+    enrichProducts,
+    sendDiscord,
+    sendStockDiscord,
+    ...deps
+  };
   let state = await storage.loadState();
   const now = Date.now();
 
@@ -630,30 +757,39 @@ async function runMonitor(
   }
 
   try {
-    const products = await deps.fetchProducts(cfg);
+    const products = await services.fetchProducts(cfg);
     state = await storage.loadState();
     const firstRun = Object.keys(state.seen || {}).length === 0;
     const newProducts = Object.values(products).filter((product) => !state.seen[product.pid]);
     const productsToAlert = firstRun && !cfg.notifyInitial ? [] : newProducts;
+    const enrichedProductsToAlert =
+      productsToAlert.length > 0
+        ? await services.enrichProducts(productsToAlert, cfg, { fetchStockSnapshot: services.fetchStockSnapshot })
+        : [];
 
     let stockSnapshot = null;
     let stockDelta = null;
     let stockAlerted = false;
+    let stockError = null;
 
     if (cfg.stockProductUrl) {
-      stockSnapshot = await deps.fetchStockSnapshot(cfg.stockProductUrl, {
-        timeoutMs: cfg.requestTimeoutMs,
-        userAgent: cfg.userAgent
-      });
-      stockDelta = deps.stockDiff(state.stockSnapshot || null, stockSnapshot);
+      try {
+        stockSnapshot = await services.fetchStockSnapshot(cfg.stockProductUrl, {
+          timeoutMs: cfg.requestTimeoutMs,
+          userAgent: cfg.userAgent
+        });
+        stockDelta = services.stockDiff(state.stockSnapshot || null, stockSnapshot);
+      } catch (error) {
+        stockError = error.message;
+      }
     }
 
-    if (productsToAlert.length > 0) {
-      await deps.sendDiscord(cfg, productsToAlert);
+    if (enrichedProductsToAlert.length > 0) {
+      await services.sendDiscord(cfg, enrichedProductsToAlert);
     }
 
     if (shouldSendStockAlert(stockDelta, cfg)) {
-      await deps.sendStockDiscord(cfg, stockSnapshot, stockDelta);
+      await services.sendStockDiscord(cfg, stockSnapshot, stockDelta);
       stockAlerted = true;
     }
 
@@ -670,8 +806,15 @@ async function runMonitor(
       ok: true,
       baseline: firstRun && !cfg.notifyInitial,
       productCount: Object.keys(products).length,
-      alerted: productsToAlert.length,
+      alerted: enrichedProductsToAlert.length,
       newPids: productsToAlert.map((product) => product.pid),
+      enriched: enrichedProductsToAlert.map((product) => ({
+        pid: product.pid,
+        inStockSizeCount: product.inStockSizeCount ?? null,
+        sizeCount: (product.sizes || []).length,
+        hasImage: Boolean(product.image),
+        detailError: product.detailError || null
+      })),
       stock: stockSnapshot
         ? {
             product: stockSnapshot.masterPid,
@@ -681,7 +824,9 @@ async function runMonitor(
             alerted: stockAlerted,
             changes: stockDelta?.sizeChanges || []
           }
-        : null,
+        : cfg.stockProductUrl
+          ? { product: cfg.stockProductUrl, alerted: false, error: stockError || "stock unavailable" }
+          : null,
       storage: storage.backend
     };
   } catch (error) {
@@ -724,12 +869,16 @@ export {
   MonitorError,
   absoluteUrl,
   buildEmbeds,
+  buildProductEmbed,
+  compactList,
   categoryFromUrl,
   computeBackoffUntil,
   createBlobStore,
   createRedis,
   createRedisStore,
   createStorage,
+  enrichProduct,
+  enrichProducts,
   fetchProducts,
   getConfig,
   getCronSecret,

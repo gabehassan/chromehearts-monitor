@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseProductStockPage, stockDiff } from "../scripts/stock-watch.js";
+import { fetchStockSnapshot, parseProductStockPage, stockDiff } from "../scripts/stock-watch.js";
 
 function stockHtml() {
   return `
@@ -9,7 +9,13 @@ function stockHtml() {
         data-pid="152701BLKXXX04K"
         data-name="BLACK HOODIE"
         data-price="750.00"
+        data-brand="Chrome Hearts"
+        data-category="Hoodie"
         data-defaultvariant-id="152701BLKXSM04K"></span>
+      <picture>
+        <source srcset="/dw/image/v2/BFBV_PRD/example-large.png?sw=1600 1600w">
+        <img data-large-img="/dw/image/v2/BFBV_PRD/example-large.png?sw=1600" src="/dw/image/v2/BFBV_PRD/example.png?sw=540" />
+      </picture>
 
       <select class="quantity-select">
         <option value="1">1</option>
@@ -38,6 +44,10 @@ test("parseProductStockPage extracts size availability and capped totals", () =>
   assert.equal(snapshot.masterPid, "152701BLKXXX04K");
   assert.equal(snapshot.selectedVariantPid, "152701BLKXSM04K");
   assert.equal(snapshot.name, "BLACK HOODIE");
+  assert.equal(snapshot.brand, "Chrome Hearts");
+  assert.equal(snapshot.category, "Hoodie");
+  assert.equal(snapshot.image, "https://www.chromehearts.com/dw/image/v2/BFBV_PRD/example-large.png?sw=1600");
+  assert.ok(snapshot.images.includes("https://www.chromehearts.com/dw/image/v2/BFBV_PRD/example.png?sw=540"));
   assert.equal(snapshot.maxOrderQuantity, 10);
   assert.equal(snapshot.exactStockKnown, false);
   assert.equal(snapshot.totalStock, null);
@@ -83,4 +93,18 @@ test("stockDiff reports availability and total changes", () => {
     { code: "LRG", label: "L", from: "out_of_stock", to: "in_stock" },
     { code: "XSM", label: "XS", from: "in_stock", to: "out_of_stock" }
   ]);
+});
+
+test("fetchStockSnapshot rejects pages without product metadata", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("<html><body>home</body></html>", { status: 200 });
+
+  try {
+    await assert.rejects(
+      () => fetchStockSnapshot("https://www.chromehearts.com/stale-product.html", { timeoutMs: 1000 }),
+      /did not contain product metadata/
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

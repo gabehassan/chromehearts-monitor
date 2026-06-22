@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildProductEmbed,
   buildEmbeds,
   computeBackoffUntil,
+  enrichProduct,
   parseProducts,
   priceText,
   productGridUrl,
@@ -102,6 +104,64 @@ test("buildEmbeds limits Discord payload fields", () => {
   assert.equal(embeds.length, 1);
   assert.equal(embeds[0].title.length, 256);
   assert.equal(embeds[0].fields.find((field) => field.name === "Price").value, "$1,000");
+  assert.equal(embeds[0].fields.find((field) => field.name === "Stock").value, "No size data");
+  assert.equal(embeds[0].author.name, "CHROME HEARTS // NEW LOAD");
+});
+
+test("buildProductEmbed includes price, image, stock, and size fields", () => {
+  const embed = buildProductEmbed({
+    pid: "MASTER1",
+    masterPid: "MASTER1",
+    selectedVariantPid: "VAR1",
+    name: "BLACK HOODIE",
+    price: "750.00",
+    brand: "Chrome Hearts",
+    category: "Hoodie",
+    productType: "master",
+    url: "https://www.chromehearts.com/hoodie/black-hoodie/MASTER1.html",
+    image: "https://www.chromehearts.com/image.png",
+    exactStockKnown: false,
+    totalStock: null,
+    inStockSizeCount: 2,
+    cappedOrderableTotal: 20,
+    sizes: [
+      { code: "XSM", label: "XS", inStock: true },
+      { code: "LRG", label: "L", inStock: false },
+      { code: "2XL", label: "XXL", inStock: true }
+    ]
+  });
+
+  assert.equal(embed.title, "BLACK HOODIE");
+  assert.equal(embed.image.url, "https://www.chromehearts.com/image.png");
+  assert.equal(embed.fields.find((field) => field.name === "Price").value, "$750");
+  assert.equal(embed.fields.find((field) => field.name === "Stock").value, "2/3 sizes live");
+  assert.equal(embed.fields.find((field) => field.name === "Inventory").value, "exact hidden / cap 20");
+  assert.equal(embed.fields.find((field) => field.name === "Sizes live").value, "XS, XXL");
+  assert.equal(embed.fields.find((field) => field.name === "Sizes gone").value, "L");
+});
+
+test("enrichProduct falls back to grid data when PDP fetch fails", async () => {
+  const product = {
+    pid: "PID1",
+    name: "GRID NAME",
+    price: "100",
+    url: "https://www.chromehearts.com/example.html",
+    image: "https://www.chromehearts.com/grid.png"
+  };
+  const enriched = await enrichProduct(
+    product,
+    { requestTimeoutMs: 1000, userAgent: "test" },
+    {
+      async fetchStockSnapshot() {
+        throw new Error("pdp down");
+      }
+    }
+  );
+
+  assert.equal(enriched.name, "GRID NAME");
+  assert.equal(enriched.image, "https://www.chromehearts.com/grid.png");
+  assert.equal(enriched.detailError, "pdp down");
+  assert.deepEqual(enriched.sizes, []);
 });
 
 test("interval skip respects recent successful run", () => {
@@ -166,6 +226,9 @@ test("runMonitor does not mark a new product seen when Discord fails", async () 
         },
         async sendDiscord() {
           throw new Error("discord down");
+        },
+        async enrichProducts(products) {
+          return products;
         }
       }),
     /discord down/
@@ -199,6 +262,9 @@ test("runMonitor baselines stock snapshot without initial stock alert", async ()
       return stockSnapshot;
     },
     stockDiff,
+    async enrichProducts(products) {
+      return products;
+    },
     async sendDiscord() {
       throw new Error("new product alert should be suppressed on baseline");
     },
@@ -254,6 +320,9 @@ test("runMonitor sends stock alert when size availability changes", async () => 
       return nextSnapshot;
     },
     stockDiff,
+    async enrichProducts(products) {
+      return products;
+    },
     async sendDiscord() {
       throw new Error("no new product alert expected");
     },
@@ -267,4 +336,42 @@ test("runMonitor sends stock alert when size availability changes", async () => 
   assert.equal(stockAlert.snapshot, nextSnapshot);
   assert.equal(stockAlert.diff.inStockSizeCountChange, 1);
   assert.deepEqual(storage.state.stockSnapshot, nextSnapshot);
+});
+
+test("runMonitor still alerts new products when optional stock URL fails", async () => {
+  const storage = fakeStore({
+    seen: { PID1: { pid: "PID1", name: "One", url: "https://example.com/1" } },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    errorStreak: 0,
+    backoffUntil: null
+  });
+  let sentProducts = [];
+
+  const result = await runMonitor({ ...baseCfg(), stockProductUrl: "https://example.com/stale" }, storage, {
+    async fetchProducts() {
+      return {
+        PID1: { pid: "PID1", name: "One", url: "https://example.com/1" },
+        PID2: { pid: "PID2", name: "Two", url: "https://example.com/2" }
+      };
+    },
+    async enrichProducts(products) {
+      return products;
+    },
+    async fetchStockSnapshot() {
+      throw new Error("stale stock url");
+    },
+    async sendDiscord(_cfg, products) {
+      sentProducts = products;
+    }
+  });
+
+  assert.equal(result.alerted, 1);
+  assert.equal(result.stock.error, "stale stock url");
+  assert.deepEqual(
+    sentProducts.map((product) => product.pid),
+    ["PID2"]
+  );
+  assert.ok(storage.state.seen.PID2);
+  assert.equal(storage.state.errorStreak, 0);
 });

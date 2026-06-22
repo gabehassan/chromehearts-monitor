@@ -13,6 +13,28 @@ function absoluteUrl(url) {
   return new URL(url, BASE_URL).toString();
 }
 
+function firstSrcsetUrl(srcset) {
+  return String(srcset || "")
+    .split(",")
+    .map((item) => item.trim().split(/\s+/)[0])
+    .find(Boolean) || "";
+}
+
+function uniqueValues(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function collectProductImages($) {
+  return uniqueValues([
+    $("meta[property='og:image']").attr("content"),
+    $("img[data-large-img]").first().attr("data-large-img"),
+    $("img[data-large-img]").first().attr("src"),
+    firstSrcsetUrl($("source[srcset]").first().attr("srcset")),
+    $("img.tile-image").first().attr("src"),
+    $("picture img").first().attr("src")
+  ]).map(absoluteUrl);
+}
+
 function intOption(value, name, min) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed < min) {
@@ -43,6 +65,7 @@ function parseProductStockPage(html, pageUrl = "") {
   const $ = cheerio.load(html);
   const metadata = $(".product-metadata").first();
   const productDetail = $(".product-detail[data-pid]").first();
+  const images = collectProductImages($);
   const maxOrderQuantity =
     $("select.quantity-select option")
       .toArray()
@@ -85,6 +108,10 @@ function parseProductStockPage(html, pageUrl = "") {
     selectedVariantPid: String(productDetail.attr("data-pid") || metadata.attr("data-defaultvariant-id") || "").trim(),
     name: String(metadata.attr("data-name") || $("h1").first().text() || "").trim(),
     price: String(metadata.attr("data-price") || "").trim(),
+    brand: String(metadata.attr("data-brand") || "Chrome Hearts").trim(),
+    category: String(metadata.attr("data-category") || "").trim(),
+    image: images[0] || "",
+    images,
     maxOrderQuantity,
     exactStockKnown: false,
     totalStock: null,
@@ -166,7 +193,11 @@ async function fetchStockSnapshot(productUrl, options = {}) {
     throw new Error(`Chrome Hearts returned HTTP ${response.status}`);
   }
 
-  return parseProductStockPage(await response.text(), productUrl);
+  const snapshot = parseProductStockPage(await response.text(), productUrl);
+  if (!snapshot.masterPid && snapshot.sizes.length === 0 && !snapshot.image) {
+    throw new Error("Product detail page did not contain product metadata");
+  }
+  return snapshot;
 }
 
 async function readPreviousState(path) {
