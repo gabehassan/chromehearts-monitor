@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { fetchStockSnapshot, parseProductStockPage, stockDiff } from "../scripts/stock-watch.js";
+import { fetchStockSnapshot, parseProductStockPage, parseProductVariationJson, stockDiff } from "../scripts/stock-watch.js";
 
 function stockHtml() {
   return `
@@ -11,7 +11,8 @@ function stockHtml() {
         data-price="750.00"
         data-brand="Chrome Hearts"
         data-category="Hoodie"
-        data-defaultvariant-id="152701BLKXSM04K"></span>
+        data-defaultvariant-id="152701BLKXSM04K"
+        data-defaultvariant-url="/on/demandware.store/Sites-ChromeHearts-Site/en_US/Product-Variation?dwvar_152701BLKXXX04K_size=XSM&amp;pid=152701BLKXXX04K&amp;quantity=1"></span>
       <picture>
         <source srcset="/dw/image/v2/BFBV_PRD/example-large.png?sw=1600 1600w">
         <img data-large-img="/dw/image/v2/BFBV_PRD/example-large.png?sw=1600" src="/dw/image/v2/BFBV_PRD/example.png?sw=540" />
@@ -82,6 +83,10 @@ test("parseProductStockPage extracts size availability and capped totals", () =>
   assert.equal(snapshot.totalStock, null);
   assert.equal(snapshot.inStockSizeCount, 2);
   assert.equal(snapshot.cappedOrderableTotal, 20);
+  assert.equal(
+    snapshot.variationUrl,
+    "https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Product-Variation?dwvar_152701BLKXXX04K_size=XSM&pid=152701BLKXXX04K&quantity=1"
+  );
   assert.deepEqual(
     snapshot.sizes.map((size) => [size.code, size.label, size.inStock]),
     [
@@ -91,6 +96,115 @@ test("parseProductStockPage extracts size availability and capped totals", () =>
     ]
   );
   assert.equal(new URL(snapshot.sizes[0].variationUrl).searchParams.get("dwvar_152701BLKXXX04K_size"), "XSM");
+});
+
+test("parseProductVariationJson extracts Demandware selectable stock signal", () => {
+  const signal = parseProductVariationJson(
+    {
+      product: {
+        id: "165064BLKLRG140",
+        masterProductId: "165064XXXXXX140",
+        selectedQuantity: 1,
+        maxOrderQuantity: 10,
+        available: true,
+        readyToOrder: true,
+        availability: { messages: ["In Stock"], inStockDate: null },
+        variationAttributes: [
+          {
+            id: "color",
+            values: [
+              { id: "BLK", displayValue: "Black", selected: true, selectable: true },
+              { id: "PNB", displayValue: "Baby Pink", selected: false, selectable: true }
+            ]
+          },
+          {
+            id: "size",
+            values: [
+              { id: "XSM", displayValue: "XS", selected: false, selectable: false },
+              { id: "SML", displayValue: "S", selected: false, selectable: false },
+              { id: "MED", displayValue: "M", selected: false, selectable: false },
+              { id: "LRG", displayValue: "L", selected: true, selectable: true },
+              { id: "1XL", displayValue: "XL", selected: false, selectable: true }
+            ]
+          }
+        ]
+      }
+    },
+    "https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Product-Variation?dwvar_165064XXXXXX140_color=BLK&dwvar_165064XXXXXX140_size=LRG&pid=165064XXXXXX140&quantity=1"
+  );
+
+  assert.equal(signal.stockSource, "Product-Variation JSON");
+  assert.equal(signal.masterPid, "165064XXXXXX140");
+  assert.equal(signal.selectedVariantPid, "165064BLKLRG140");
+  assert.equal(signal.productAvailable, true);
+  assert.equal(signal.readyToOrder, true);
+  assert.equal(signal.maxOrderQuantity, 10);
+  assert.equal(signal.inStockSizeCount, 2);
+  assert.equal(signal.cappedOrderableTotal, 20);
+  assert.deepEqual(
+    signal.sizes.map((size) => [size.code, size.label, size.inStock]),
+    [
+      ["XSM", "XS", false],
+      ["SML", "S", false],
+      ["MED", "M", false],
+      ["LRG", "L", true],
+      ["1XL", "XL", true]
+    ]
+  );
+});
+
+test("fetchStockSnapshot overlays Product-Variation JSON over PDP HTML", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes("Product-Variation")) {
+      return new Response(
+        JSON.stringify({
+          product: {
+            id: "152701BLKXSM04K",
+            masterProductId: "152701BLKXXX04K",
+            maxOrderQuantity: 10,
+            available: true,
+            readyToOrder: true,
+            availability: { messages: ["In Stock"] },
+            variationAttributes: [
+              {
+                id: "size",
+                values: [
+                  { id: "XSM", displayValue: "XS", selected: true, selectable: true },
+                  { id: "LRG", displayValue: "L", selected: false, selectable: false }
+                ]
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    return new Response(stockHtml(), { status: 200, headers: { "content-type": "text/html" } });
+  };
+
+  try {
+    const snapshot = await fetchStockSnapshot("https://www.chromehearts.com/hoodie/black-hoodie/152701BLKXXX04K.html", {
+      timeoutMs: 1000
+    });
+
+    assert.equal(calls.length, 2);
+    assert.equal(snapshot.stockSource, "Product-Variation JSON");
+    assert.equal(snapshot.selectedVariantPid, "152701BLKXSM04K");
+    assert.equal(snapshot.inStockSizeCount, 1);
+    assert.equal(snapshot.cappedOrderableTotal, 10);
+    assert.deepEqual(
+      snapshot.sizes.map((size) => [size.code, size.label, size.inStock]),
+      [
+        ["XSM", "XS", true],
+        ["LRG", "L", false]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("parseProductStockPage creates an OS stock row for one-size products", () => {

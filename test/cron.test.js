@@ -122,6 +122,9 @@ test("buildProductEmbed includes price, image, stock, and size fields", () => {
     image: "https://www.chromehearts.com/image.png",
     exactStockKnown: false,
     totalStock: null,
+    productAvailable: true,
+    readyToOrder: true,
+    stockSource: "Product-Variation JSON",
     inStockSizeCount: 2,
     cappedOrderableTotal: 20,
     sizes: [
@@ -138,6 +141,10 @@ test("buildProductEmbed includes price, image, stock, and size fields", () => {
   assert.equal(embed.fields.find((field) => field.name === "† Inventory").value, "† EXACT HIDDEN // CART CAP 20");
   assert.equal(embed.fields.find((field) => field.name === "⛓ Sizes live").value, "「 XS, XXL 」");
   assert.equal(embed.fields.find((field) => field.name === "⌁ Sizes gone").value, "「 L 」");
+  assert.equal(
+    embed.fields.find((field) => field.name === "⌁ SFCC signal").value,
+    "Product-Variation JSON // available=true // ready=true"
+  );
   assert.equal(embed.color, 0xd7d7d7);
 });
 

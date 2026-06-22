@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 const BASE_URL = "https://www.chromehearts.com";
+const PRODUCT_VARIATION_BASE_URL = `${BASE_URL}/on/demandware.store/Sites-ChromeHearts-Site/en_US/Product-Variation`;
 const DEFAULT_INTERVAL_SECONDS = 10;
 const DEFAULT_TIMEOUT_MS = 12000;
 const DEFAULT_USER_AGENT = "ChromeHeartsMonitor/1.0";
@@ -52,6 +53,10 @@ function normalizeVariationUrl(rawUrl, sizeCode) {
     }
   }
   return url.toString();
+}
+
+function normalizeUrl(rawUrl) {
+  return rawUrl ? absoluteUrl(rawUrl) : "";
 }
 
 function parseClasses(value) {
@@ -110,6 +115,113 @@ function oneSizeCode(masterPid, selectedVariantPid) {
   return value.includes("OSZ") ? "OSZ" : "ONE_SIZE";
 }
 
+function defaultVariationUrl($) {
+  return normalizeUrl(
+    $(".product-metadata").first().attr("data-defaultvariant-url") ||
+      $(".product-metadata-defvar-url").first().attr("data-defaultvariant-url") ||
+      $("select.quantity-select option[data-url]").first().attr("data-url") ||
+      $("input.quantity-select").first().attr("data-url")
+  );
+}
+
+function productVariationUrl(pid, quantity = 1) {
+  if (!pid) return "";
+  const url = new URL(PRODUCT_VARIATION_BASE_URL);
+  url.searchParams.set("pid", pid);
+  url.searchParams.set("quantity", String(quantity));
+  return url.toString();
+}
+
+function isVariationInStock(product) {
+  const messages = product?.availability?.messages || [];
+  const text = messages.join(" ").toLowerCase();
+  if (text.includes("out of stock") || text.includes("unavailable")) return false;
+  return Boolean(product?.available || product?.readyToOrder || text.includes("in stock"));
+}
+
+function maxOrderQuantityFromProduct(product) {
+  const direct = Number.parseInt(product?.maxOrderQuantity, 10);
+  if (Number.isFinite(direct)) return direct;
+  return (
+    (product?.quantities || [])
+      .map((quantity) => Number.parseInt(quantity.value, 10))
+      .filter(Number.isFinite)
+      .sort((a, b) => b - a)[0] || null
+  );
+}
+
+function parseProductVariationJson(body, pageUrl = "") {
+  const product = body?.product || {};
+  const sizeAttribute = (product.variationAttributes || []).find(
+    (attribute) => attribute?.attributeId === "size" || attribute?.id === "size"
+  );
+  const masterPid = String(product.masterProductId || product.id || "").trim();
+  const selectedVariantPid = String(product.id || "").trim();
+  const maxOrderQuantity = maxOrderQuantityFromProduct(product);
+  let sizes = [];
+
+  if (sizeAttribute?.values?.length) {
+    sizes = sizeAttribute.values
+      .filter((value) => value?.id)
+      .map((value) => ({
+        code: String(value.id),
+        label: String(value.displayValue || value.value || value.id).trim(),
+        selected: Boolean(value.selected),
+        inStock: Boolean(value.selectable),
+        selectable: Boolean(value.selectable),
+        variationUrl: normalizeUrl(value.url) || pageUrl
+      }));
+  } else if (selectedVariantPid) {
+    const inStock = isVariationInStock(product);
+    sizes = [
+      {
+        code: oneSizeCode(masterPid, selectedVariantPid),
+        label: "OS",
+        selected: true,
+        inStock,
+        selectable: inStock,
+        variationUrl: pageUrl
+      }
+    ];
+  }
+
+  const inStockSizeCount = sizes.filter((size) => size.inStock).length;
+
+  return {
+    masterPid,
+    selectedVariantPid,
+    maxOrderQuantity,
+    productAvailable: Boolean(product.available),
+    readyToOrder: Boolean(product.readyToOrder),
+    availabilityMessages: product.availability?.messages || [],
+    exactStockKnown: false,
+    totalStock: null,
+    inStockSizeCount,
+    cappedOrderableTotal: maxOrderQuantity === null ? null : inStockSizeCount * maxOrderQuantity,
+    sizes,
+    stockSource: "Product-Variation JSON"
+  };
+}
+
+function applyVariationStock(snapshot, variation) {
+  if (!variation || !variation.sizes?.length) return snapshot;
+  return {
+    ...snapshot,
+    masterPid: variation.masterPid || snapshot.masterPid,
+    selectedVariantPid: variation.selectedVariantPid || snapshot.selectedVariantPid,
+    maxOrderQuantity: variation.maxOrderQuantity ?? snapshot.maxOrderQuantity,
+    exactStockKnown: variation.exactStockKnown,
+    totalStock: variation.totalStock,
+    inStockSizeCount: variation.inStockSizeCount,
+    cappedOrderableTotal: variation.cappedOrderableTotal,
+    productAvailable: variation.productAvailable,
+    readyToOrder: variation.readyToOrder,
+    availabilityMessages: variation.availabilityMessages,
+    sizes: variation.sizes,
+    stockSource: variation.stockSource
+  };
+}
+
 function parseProductStockPage(html, pageUrl = "") {
   const $ = cheerio.load(html);
   const metadata = $(".product-metadata").first();
@@ -118,6 +230,7 @@ function parseProductStockPage(html, pageUrl = "") {
   const masterPid = String(metadata.attr("data-pid") || "").trim();
   const selectedVariantPid = String(productDetail.attr("data-pid") || metadata.attr("data-defaultvariant-id") || "").trim();
   const availability = schemaAvailability($);
+  const variationUrl = defaultVariationUrl($) || productVariationUrl(masterPid);
   const maxOrderQuantity =
     $("select.quantity-select option")
       .toArray()
@@ -185,7 +298,9 @@ function parseProductStockPage(html, pageUrl = "") {
     totalStock: null,
     inStockSizeCount,
     cappedOrderableTotal,
-    sizes
+    sizes,
+    stockSource: sizes.length > 0 ? "PDP HTML" : "",
+    variationUrl
   };
 }
 
@@ -261,9 +376,31 @@ async function fetchStockSnapshot(productUrl, options = {}) {
     throw new Error(`Chrome Hearts returned HTTP ${response.status}`);
   }
 
-  const snapshot = parseProductStockPage(await response.text(), productUrl);
+  let snapshot = parseProductStockPage(await response.text(), productUrl);
   if (!snapshot.masterPid && snapshot.sizes.length === 0 && !snapshot.image) {
     throw new Error("Product detail page did not contain product metadata");
+  }
+
+  if (snapshot.variationUrl) {
+    try {
+      const variationResponse = await fetchWithTimeout(
+        snapshot.variationUrl,
+        {
+          headers: {
+            accept: "application/json, text/javascript, */*; q=0.01",
+            "user-agent": userAgent,
+            "x-requested-with": "XMLHttpRequest"
+          },
+          cache: "no-store"
+        },
+        timeoutMs
+      );
+      if (variationResponse.ok) {
+        snapshot = applyVariationStock(snapshot, parseProductVariationJson(await variationResponse.json(), snapshot.variationUrl));
+      }
+    } catch (error) {
+      snapshot = { ...snapshot, stockSignalError: error.message };
+    }
   }
   return snapshot;
 }
@@ -388,4 +525,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   );
 }
 
-export { fetchStockSnapshot, formatSnapshot, parseArgs, parseProductStockPage, stockDiff };
+export {
+  applyVariationStock,
+  fetchStockSnapshot,
+  formatSnapshot,
+  parseArgs,
+  parseProductStockPage,
+  parseProductVariationJson,
+  stockDiff
+};

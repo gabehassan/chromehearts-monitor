@@ -516,6 +516,10 @@ function mergeProductDetail(product, detail) {
     masterPid: detail?.masterPid || product.pid,
     selectedVariantPid: detail?.selectedVariantPid || "",
     maxOrderQuantity: detail?.maxOrderQuantity ?? null,
+    productAvailable: detail?.productAvailable ?? null,
+    readyToOrder: detail?.readyToOrder ?? null,
+    availabilityMessages: detail?.availabilityMessages || [],
+    stockSource: detail?.stockSource || "PDP HTML",
     exactStockKnown: Boolean(detail?.exactStockKnown),
     totalStock: detail?.totalStock ?? null,
     inStockSizeCount: detail?.inStockSizeCount ?? sizes.filter((size) => size.inStock).length,
@@ -538,6 +542,10 @@ async function enrichProduct(product, cfg, deps = { fetchStockSnapshot }) {
       masterPid: product.pid,
       selectedVariantPid: "",
       maxOrderQuantity: null,
+      productAvailable: null,
+      readyToOrder: null,
+      availabilityMessages: [],
+      stockSource: "",
       exactStockKnown: false,
       totalStock: null,
       inStockSizeCount: 0,
@@ -574,6 +582,15 @@ function buildProductEmbed(product) {
 
   if (product.selectedVariantPid) {
     fields.push({ name: "◇ Variant", value: truncate(product.selectedVariantPid, 1024), inline: true });
+  }
+  if (product.stockSource) {
+    const available = product.productAvailable === null ? "unknown" : String(Boolean(product.productAvailable));
+    const ready = product.readyToOrder === null ? "unknown" : String(Boolean(product.readyToOrder));
+    fields.push({
+      name: "⌁ SFCC signal",
+      value: truncate(`${product.stockSource} // available=${available} // ready=${ready}`, 1024),
+      inline: false
+    });
   }
   if (product.detailError) {
     fields.push({ name: "⌁ PDP", value: truncate(`detail fetch failed: ${product.detailError}`, 1024), inline: false });
