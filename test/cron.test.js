@@ -103,9 +103,9 @@ test("buildEmbeds limits Discord payload fields", () => {
 
   assert.equal(embeds.length, 1);
   assert.equal(embeds[0].title.length, 256);
-  assert.equal(embeds[0].fields.find((field) => field.name === "✠ Price").value, "$1,000");
-  assert.equal(embeds[0].fields.find((field) => field.name === "✠ Stock").value, "✠ STOCK SIGNAL HIDDEN");
-  assert.equal(embeds[0].author.name, "✠ CHROME HEARTS // DROP SIGNAL ✠");
+  assert.equal(embeds[0].fields.find((field) => field.name === "✦ Price").value, "$1,000");
+  assert.equal(embeds[0].fields.find((field) => field.name === "✧ Availability").value, "Awaiting size data");
+  assert.equal(embeds[0].author.name, "✦ Chrome Hearts Drop Monitor ✦");
 });
 
 test("buildProductEmbed includes price, image, stock, and size fields", () => {
@@ -134,18 +134,31 @@ test("buildProductEmbed includes price, image, stock, and size fields", () => {
     ]
   });
 
-  assert.equal(embed.title, "† BLACK HOODIE");
+  assert.equal(embed.title, "✠ BLACK HOODIE");
   assert.equal(embed.image.url, "https://www.chromehearts.com/image.png");
-  assert.equal(embed.fields.find((field) => field.name === "✠ Price").value, "$750");
-  assert.equal(embed.fields.find((field) => field.name === "✠ Stock").value, "✠ LIVE // 2/3 sizes");
-  assert.equal(embed.fields.find((field) => field.name === "† Inventory").value, "† EXACT HIDDEN // CART CAP 20");
-  assert.equal(embed.fields.find((field) => field.name === "⛓ Sizes live").value, "「 XS, XXL 」");
-  assert.equal(embed.fields.find((field) => field.name === "⌁ Sizes gone").value, "「 L 」");
-  assert.equal(
-    embed.fields.find((field) => field.name === "⌁ SFCC signal").value,
-    "Product-Variation JSON // available=true // ready=true"
-  );
-  assert.equal(embed.color, 0xd7d7d7);
+  assert.equal(embed.fields.find((field) => field.name === "✦ Price").value, "$750");
+  assert.equal(embed.fields.find((field) => field.name === "✧ Availability").value, "2 of 3 sizes available");
+  assert.equal(embed.fields.find((field) => field.name === "✠ Available sizes").value, "XS, XXL");
+  assert.equal(embed.fields.find((field) => field.name === "☾ Unavailable sizes").value, "L");
+  assert.equal(embed.fields.find((field) => field.name === "† Inventory"), undefined);
+  assert.equal(embed.fields.find((field) => field.name === "⌁ SFCC signal"), undefined);
+  assert.equal(embed.description.includes("//"), false);
+  assert.equal(embed.color, 0xb8f3d4);
+});
+
+test("buildProductEmbed only shows inventory when exact stock is known", () => {
+  const embed = buildProductEmbed({
+    pid: "PID1",
+    name: "EXACT ITEM",
+    price: "100.00",
+    url: "https://www.chromehearts.com/item/PID1.html",
+    exactStockKnown: true,
+    totalStock: 7,
+    inStockSizeCount: 1,
+    sizes: [{ code: "OSZ", label: "OS", inStock: true }]
+  });
+
+  assert.equal(embed.fields.find((field) => field.name === "✧ Exact stock").value, "7 units");
 });
 
 test("enrichProduct falls back to grid data when PDP fetch fails", async () => {
