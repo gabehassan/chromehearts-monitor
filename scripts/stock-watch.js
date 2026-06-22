@@ -61,19 +61,73 @@ function parseClasses(value) {
     .filter(Boolean);
 }
 
+function parseJsonLd(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function findAvailability(value) {
+  if (!value || typeof value !== "object") return "";
+  if (Array.isArray(value)) {
+    return value.map(findAvailability).find(Boolean) || "";
+  }
+
+  const type = Array.isArray(value["@type"]) ? value["@type"].join(" ") : String(value["@type"] || "");
+  if (type.toLowerCase().includes("product")) {
+    const offers = Array.isArray(value.offers) ? value.offers : [value.offers];
+    const availability = offers.map((offer) => offer?.availability).find(Boolean);
+    if (availability) return String(availability);
+  }
+
+  return Object.values(value).map(findAvailability).find(Boolean) || "";
+}
+
+function schemaAvailability($) {
+  return $("script[type='application/ld+json']")
+    .toArray()
+    .map((script) => findAvailability(parseJsonLd($(script).text())))
+    .find(Boolean) || "";
+}
+
+function isSchemaInStock(availability) {
+  const text = String(availability || "").toLowerCase();
+  if (text.includes("outofstock") || text.includes("discontinued") || text.includes("soldout")) return false;
+  return text.includes("instock") || text.includes("limitedavailability");
+}
+
+function hasEnabledAddToCart($) {
+  const button = $("button.add-to-cart").first();
+  if (!button.length) return false;
+  const classes = parseClasses(button.attr("class"));
+  return !button.attr("disabled") && !classes.includes("disabled");
+}
+
+function oneSizeCode(masterPid, selectedVariantPid) {
+  const value = `${masterPid} ${selectedVariantPid}`;
+  return value.includes("OSZ") ? "OSZ" : "ONE_SIZE";
+}
+
 function parseProductStockPage(html, pageUrl = "") {
   const $ = cheerio.load(html);
   const metadata = $(".product-metadata").first();
   const productDetail = $(".product-detail[data-pid]").first();
   const images = collectProductImages($);
+  const masterPid = String(metadata.attr("data-pid") || "").trim();
+  const selectedVariantPid = String(productDetail.attr("data-pid") || metadata.attr("data-defaultvariant-id") || "").trim();
+  const availability = schemaAvailability($);
   const maxOrderQuantity =
     $("select.quantity-select option")
       .toArray()
       .map((option) => Number.parseInt($(option).attr("value") || $(option).text(), 10))
       .filter(Number.isFinite)
-      .sort((a, b) => b - a)[0] || null;
+      .sort((a, b) => b - a)[0] ||
+    Number.parseInt($("input.quantity-select").first().attr("max"), 10) ||
+    null;
 
-  const sizes = $("button.size-attribute")
+  let sizes = $("button.size-attribute")
     .toArray()
     .map((button) => {
       const root = $(button);
@@ -98,14 +152,28 @@ function parseProductStockPage(html, pageUrl = "") {
     })
     .filter(Boolean);
 
+  if (sizes.length === 0 && (masterPid || selectedVariantPid)) {
+    const inStock = isSchemaInStock(availability) || hasEnabledAddToCart($);
+    sizes = [
+      {
+        code: oneSizeCode(masterPid, selectedVariantPid),
+        label: "OS",
+        selected: true,
+        inStock,
+        selectable: inStock,
+        variationUrl: pageUrl || ""
+      }
+    ];
+  }
+
   const inStockSizeCount = sizes.filter((size) => size.inStock).length;
   const cappedOrderableTotal = maxOrderQuantity === null ? null : inStockSizeCount * maxOrderQuantity;
 
   return {
     checkedAt: new Date().toISOString(),
     sourceUrl: pageUrl || "",
-    masterPid: String(metadata.attr("data-pid") || "").trim(),
-    selectedVariantPid: String(productDetail.attr("data-pid") || metadata.attr("data-defaultvariant-id") || "").trim(),
+    masterPid,
+    selectedVariantPid,
     name: String(metadata.attr("data-name") || $("h1").first().text() || "").trim(),
     price: String(metadata.attr("data-price") || "").trim(),
     brand: String(metadata.attr("data-brand") || "Chrome Hearts").trim(),

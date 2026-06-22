@@ -38,6 +38,35 @@ function stockHtml() {
   `;
 }
 
+function oneSizeHtml() {
+  return `
+    <script type="application/ld+json">
+      {
+        "@context": "http://schema.org/",
+        "@type": "Product",
+        "name": "TRUCKER HAT",
+        "sku": "196451DAYOSZ262",
+        "offers": {
+          "@type": "Offer",
+          "price": "395.00",
+          "availability": "http://schema.org/InStock"
+        }
+      }
+    </script>
+    <div class="container product-detail" data-pid="196451DAYOSZ262">
+      <span class="product-metadata d-none"
+        data-pid="196451DAYOSZ262"
+        data-name="TRUCKER HAT"
+        data-price="395.00"
+        data-brand="CHROME HEARTS"
+        data-category="Hat"></span>
+      <img data-large-img="/dw/image/v2/BFBV_PRD/hat.png?sw=1600" src="/dw/image/v2/BFBV_PRD/hat.png?sw=540" />
+      <input id="qty-select-input" class="quantity-select" min="1" max="10" value="1" name="quantity" type="number" />
+      <button class="add-to-cart" data-pid="196451DAYOSZ262">Add to cart</button>
+    </div>
+  `;
+}
+
 test("parseProductStockPage extracts size availability and capped totals", () => {
   const snapshot = parseProductStockPage(stockHtml(), "https://www.chromehearts.com/example.html");
 
@@ -62,6 +91,26 @@ test("parseProductStockPage extracts size availability and capped totals", () =>
     ]
   );
   assert.equal(new URL(snapshot.sizes[0].variationUrl).searchParams.get("dwvar_152701BLKXXX04K_size"), "XSM");
+});
+
+test("parseProductStockPage creates an OS stock row for one-size products", () => {
+  const snapshot = parseProductStockPage(oneSizeHtml(), "https://www.chromehearts.com/hat/trucker-hat/196451DAYOSZ262.html");
+
+  assert.equal(snapshot.masterPid, "196451DAYOSZ262");
+  assert.equal(snapshot.name, "TRUCKER HAT");
+  assert.equal(snapshot.maxOrderQuantity, 10);
+  assert.equal(snapshot.inStockSizeCount, 1);
+  assert.equal(snapshot.cappedOrderableTotal, 10);
+  assert.deepEqual(snapshot.sizes, [
+    {
+      code: "OSZ",
+      label: "OS",
+      selected: true,
+      inStock: true,
+      selectable: true,
+      variationUrl: "https://www.chromehearts.com/hat/trucker-hat/196451DAYOSZ262.html"
+    }
+  ]);
 });
 
 test("stockDiff reports availability and total changes", () => {
