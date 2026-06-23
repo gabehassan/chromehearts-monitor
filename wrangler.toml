@@ -1,0 +1,28 @@
+name = "chrome-hearts-monitor"
+main = "src/worker.js"
+compatibility_date = "2026-06-23"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[vars]
+CHECK_MIN_INTERVAL_SECONDS = "240"
+EXACT_STOCK_PROBE_CONCURRENCY = "3"
+EXACT_STOCK_PROBE_QUANTITY = "999"
+MAX_ALERTS_PER_RUN = "5"
+MAX_CATEGORY_IDS = "20"
+MAX_CATEGORY_PAGES = "2"
+MAX_PAGES = "10"
+MIN_PRODUCTS = "1"
+PAGE_SIZE = "200"
+PROBE_EXACT_STOCK = "true"
+DISCOVER_SITEMAP_CATEGORIES = "true"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "REPLACE_WITH_CLOUDFLARE_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_CLOUDFLARE_PREVIEW_KV_NAMESPACE_ID"

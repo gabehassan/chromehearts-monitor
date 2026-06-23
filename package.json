@@ -10,10 +10,17 @@
     "stock:watch": "node scripts/stock-watch.js",
     "cron:daily": "node scripts/set-vercel-cron.js daily",
     "cron:5m": "node scripts/set-vercel-cron.js 5m",
-    "cron:1m": "node scripts/set-vercel-cron.js 1m"
+    "cron:1m": "node scripts/set-vercel-cron.js 1m",
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "wrangler deploy",
+    "cf:tail": "wrangler tail",
+    "cf:kv:create": "wrangler kv namespace create STATE"
   },
   "dependencies": {
     "@vercel/blob": "^2.4.0",
     "cheerio": "^1.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.103.0"
   }
 }
