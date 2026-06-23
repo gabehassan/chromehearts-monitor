@@ -66,6 +66,7 @@ function getConfig(env) {
     maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 20, 1),
     minProducts: intSetting(env, "MIN_PRODUCTS", 1, 0),
     maxAlertsPerRun: intSetting(env, "MAX_ALERTS_PER_RUN", 5, 1),
+    relistAfterAbsentRuns: intSetting(env, "RELIST_AFTER_ABSENT_RUNS", 2, 1),
     notifyInitial: boolSetting(env, "NOTIFY_INITIAL", false),
     discoverSitemapCategories: boolSetting(env, "DISCOVER_SITEMAP_CATEGORIES", true),
     discoverHomepageCategories: boolSetting(env, "DISCOVER_HOMEPAGE_CATEGORIES", true),
@@ -835,7 +836,7 @@ async function fetchStockSnapshot(productUrl, cfg) {
 }
 
 function defaultState() {
-  return { seen: {}, createdAt: nowIso(), updatedAt: nowIso(), errorStreak: 0, backoffUntil: null, lastResult: null };
+  return { seen: {}, active: {}, missing: {}, createdAt: nowIso(), updatedAt: nowIso(), errorStreak: 0, backoffUntil: null, lastResult: null };
 }
 
 function parseState(raw) {
@@ -847,6 +848,8 @@ function parseState(raw) {
     }
     return {
       ...state,
+      active: state.active && typeof state.active === "object" && !Array.isArray(state.active) ? state.active : null,
+      missing: state.missing && typeof state.missing === "object" && !Array.isArray(state.missing) ? state.missing : {},
       updatedAt: state.updatedAt || nowIso(),
       errorStreak: Number.isFinite(state.errorStreak) ? state.errorStreak : 0,
       backoffUntil: state.backoffUntil || null,
@@ -1032,24 +1035,56 @@ async function sendDiscord(cfg, products) {
   }
 }
 
-function buildSeen(products, previousSeen, deferredPids) {
-  const seen = { ...(previousSeen || {}) };
+function productStateRecord(product, previousRecord, now) {
+  return {
+    ...(previousRecord || {}),
+    pid: product.pid,
+    name: product.name,
+    price: product.price,
+    category: product.category,
+    url: product.url,
+    image: product.image,
+    firstSeenAt: previousRecord?.firstSeenAt || now,
+    lastSeenAt: now
+  };
+}
+
+function relistEligible(pid, previousSeen, previousActive, previousMissing, cfg) {
+  if (!previousSeen[pid] || previousActive[pid]) return false;
+  return Number(previousMissing[pid]?.count || 0) >= cfg.relistAfterAbsentRuns;
+}
+
+function buildCatalogState(products, state, deferredPids, cfg) {
+  const previousSeen = state.seen || {};
+  const previousActive = state.active || previousSeen;
+  const previousMissing = state.missing || {};
+  const seen = { ...previousSeen };
+  const active = { ...previousActive };
+  const missing = { ...previousMissing };
   const now = nowIso();
+  const currentPids = new Set(Object.keys(products));
+
   for (const [pid, product] of Object.entries(products)) {
     if (deferredPids.has(pid)) continue;
-    seen[pid] = {
-      ...seen[pid],
-      pid,
-      name: product.name,
-      price: product.price,
-      category: product.category,
-      url: product.url,
-      image: product.image,
-      firstSeenAt: seen[pid]?.firstSeenAt || now,
-      lastSeenAt: now
-    };
+    seen[pid] = productStateRecord(product, seen[pid], now);
+    active[pid] = productStateRecord(product, active[pid] || seen[pid], now);
+    delete missing[pid];
   }
-  return seen;
+
+  for (const pid of Object.keys(previousActive)) {
+    if (currentPids.has(pid)) continue;
+    const previous = previousMissing[pid] || {};
+    const count = Number(previous.count || 0) + 1;
+    missing[pid] = {
+      pid,
+      firstMissingAt: previous.firstMissingAt || now,
+      lastMissingAt: now,
+      count
+    };
+    if (count >= cfg.relistAfterAbsentRuns) delete active[pid];
+  }
+
+  return { seen, active, missing };
 }
 
 async function runMonitor(env, cfg = getConfig(env)) {
@@ -1066,8 +1101,13 @@ async function runMonitor(env, cfg = getConfig(env)) {
     }
 
     const products = await fetchProducts(cfg);
-    const newPids = Object.keys(products).filter((pid) => !state.seen[pid]);
-    const firstRun = Object.keys(state.seen).length === 0;
+    const previousSeen = state.seen || {};
+    const previousActive = state.active || previousSeen;
+    const previousMissing = state.missing || {};
+    const newPids = Object.keys(products).filter(
+      (pid) => !previousSeen[pid] || relistEligible(pid, previousSeen, previousActive, previousMissing, cfg)
+    );
+    const firstRun = Object.keys(previousSeen).length === 0;
     const baseline = firstRun && !cfg.notifyInitial;
     const candidates = baseline ? [] : newPids.map((pid) => products[pid]);
     const productsToAlert = candidates.slice(0, cfg.maxAlertsPerRun);
@@ -1093,7 +1133,7 @@ async function runMonitor(env, cfg = getConfig(env)) {
 
     await saveState(env, cfg, {
       ...state,
-      seen: buildSeen(products, state.seen, baseline ? new Set() : deferredPids),
+      ...buildCatalogState(products, state, baseline ? new Set() : deferredPids, cfg),
       lastRunAt: nowIso(),
       lastResult: result,
       errorStreak: 0,

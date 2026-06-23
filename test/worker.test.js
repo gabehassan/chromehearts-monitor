@@ -86,6 +86,13 @@ function stateWithSeen(products) {
   };
 }
 
+function stateWithActive(products) {
+  const state = stateWithSeen(products);
+  state.active = structuredClone(state.seen);
+  state.missing = {};
+  return state;
+}
+
 function fakeKV(initialState = stateWithSeen([])) {
   const values = new Map([[STATE_KEY, JSON.stringify(initialState)]]);
   return {
@@ -350,7 +357,7 @@ test("Cloudflare Worker defers excess new products without marking them seen", a
   });
 });
 
-test("Cloudflare Worker never re-alerts a same PID that was seen before and later relisted", async () => {
+test("Cloudflare Worker does not re-alert a same PID after restart or one transient miss", async () => {
   const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
   const relistedProduct = productTile("OLD_RELIST", "OLD RELISTED ITEM", "shop", "Shop", "300.00");
   const kv = fakeKV(
@@ -397,6 +404,53 @@ test("Cloudflare Worker never re-alerts a same PID that was seen before and late
     assert.equal(result.alerted, 0);
     assert.deepEqual(result.newPids, []);
     assert.equal(secondMock.discordPayloads.length, 0);
+  });
+});
+
+test("Cloudflare Worker alerts a same PID relist after confirmed absence", async () => {
+  const keepProduct = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const relistedProduct = productTile("OLD_RELIST", "OLD RELISTED ITEM", "shop", "Shop", "300.00");
+  const kv = fakeKV(
+    stateWithActive([
+      { pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" },
+      { pid: "OLD_RELIST", name: "OLD RELISTED ITEM" }
+    ])
+  );
+  const stableEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    RELIST_AFTER_ABSENT_RUNS: "2"
+  };
+
+  for (let index = 0; index < 2; index += 1) {
+    const missingMock = createChromeHeartsFetch({ root: keepProduct });
+    await withMockedFetch(missingMock.fetchMock, async () => {
+      const result = await runWorkerOnce(env(stableEnv, kv));
+      assert.equal(result.alerted, 0);
+      assert.equal(missingMock.discordPayloads.length, 0);
+    });
+    kv.values.delete(LOCK_KEY);
+  }
+
+  const stateAfterAbsence = JSON.parse(kv.values.get(STATE_KEY));
+  assert.ok(stateAfterAbsence.seen.OLD_RELIST);
+  assert.equal(stateAfterAbsence.active.OLD_RELIST, undefined);
+  assert.equal(stateAfterAbsence.missing.OLD_RELIST.count, 2);
+
+  const relistMock = createChromeHeartsFetch({
+    root: `${keepProduct}${relistedProduct}`,
+    productDetails: {
+      OLD_RELIST: { name: "OLD RELISTED ITEM", categoryName: "Shop", price: "300.00" }
+    }
+  });
+  await withMockedFetch(relistMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stableEnv, kv));
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["OLD_RELIST"]);
+    assert.equal(relistMock.discordPayloads.length, 1);
+    assert.equal(relistMock.discordPayloads[0].embeds[0].title, "OLD RELISTED ITEM");
   });
 });
 
