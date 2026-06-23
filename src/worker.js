@@ -5,6 +5,7 @@ const PRODUCT_GRID_BASE_URL =
   "https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Search-UpdateGrid";
 const PRODUCT_VARIATION_BASE_URL =
   "https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Product-Variation";
+const ROBOTS_URL = `${BASE_URL}/robots.txt`;
 const DEFAULT_STATE_KEY = "chrome-hearts:cloudflare:state";
 const DEFAULT_LOCK_KEY = "chrome-hearts:cloudflare:lock";
 const DEFAULT_SETTINGS_KEY = "chrome-hearts:cloudflare:settings";
@@ -24,10 +25,17 @@ const INT_SETTING_LIMITS = {
   maxAlertsPerRun: [1, 10],
   maxCategoryIds: [1, 50],
   maxCategoryPages: [1, 5],
+  maxDirectProductUrls: [0, 50],
   maxPages: [1, 20],
   relistAfterAbsentRuns: [1, 12]
 };
-const BOOL_SETTING_KEYS = ["discoverSitemapCategories", "discoverHomepageCategories", "discoverProductUrlCategories", "probeExactStock"];
+const BOOL_SETTING_KEYS = [
+  "discoverSitemapCategories",
+  "discoverHomepageCategories",
+  "discoverProductUrlCategories",
+  "discoverRobotsProducts",
+  "probeExactStock"
+];
 
 class MonitorError extends Error {
   constructor(message, statusCode = 500, details = {}) {
@@ -75,6 +83,7 @@ function getConfig(env) {
     maxPages: intSetting(env, "MAX_PAGES", 10, 1),
     maxCategoryPages: intSetting(env, "MAX_CATEGORY_PAGES", 2, 1),
     maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 20, 1),
+    maxDirectProductUrls: intSetting(env, "MAX_DIRECT_PRODUCT_URLS", 10, 0),
     minProducts: intSetting(env, "MIN_PRODUCTS", 1, 0),
     maxAlertsPerRun: intSetting(env, "MAX_ALERTS_PER_RUN", 5, 1),
     relistAfterAbsentRuns: intSetting(env, "RELIST_AFTER_ABSENT_RUNS", 2, 1),
@@ -82,10 +91,15 @@ function getConfig(env) {
     discoverSitemapCategories: boolSetting(env, "DISCOVER_SITEMAP_CATEGORIES", true),
     discoverHomepageCategories: boolSetting(env, "DISCOVER_HOMEPAGE_CATEGORIES", true),
     discoverProductUrlCategories: boolSetting(env, "DISCOVER_PRODUCT_URL_CATEGORIES", true),
+    discoverRobotsProducts: boolSetting(env, "DISCOVER_ROBOTS_PRODUCTS", true),
     sitemapIndexUrl: env.SITEMAP_INDEX_URL || `${BASE_URL}/sitemap_index.xml`,
     extraCategoryIds: String(env.EXTRA_CATEGORY_IDS || "")
       .split(",")
       .map((value) => value.trim())
+      .filter(Boolean),
+    extraProductUrls: String(env.EXTRA_PRODUCT_URLS || "")
+      .split(/[\s,]+/)
+      .map((value) => productUrlFromUrl(value))
       .filter(Boolean),
     probeExactStock: boolSetting(env, "PROBE_EXACT_STOCK", true),
     exactStockProbeQuantity: intSetting(env, "EXACT_STOCK_PROBE_QUANTITY", 999, 1),
@@ -124,6 +138,9 @@ function applyRuntimeSettings(cfg, settings) {
   if (Array.isArray(settings.extraCategoryIds)) {
     next.extraCategoryIds = settings.extraCategoryIds.map((value) => String(value || "").trim()).filter(Boolean);
   }
+  if (Array.isArray(settings.extraProductUrls)) {
+    next.extraProductUrls = settings.extraProductUrls.map((value) => productUrlFromUrl(value)).filter(Boolean);
+  }
   if (typeof settings.discordWebhookUrl === "string" && settings.discordWebhookUrl.startsWith("https://")) {
     next.discordWebhookUrl = settings.discordWebhookUrl;
   }
@@ -154,6 +171,15 @@ function parseCategoryIds(value) {
   ).slice(0, INT_SETTING_LIMITS.maxCategoryIds[1]);
 }
 
+function parseProductUrls(value) {
+  return uniqueValues(
+    String(value || "")
+      .split(/[\s,]+/)
+      .map((item) => productUrlFromUrl(item))
+      .filter(Boolean)
+  ).slice(0, INT_SETTING_LIMITS.maxDirectProductUrls[1]);
+}
+
 function validateDiscordWebhookUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
@@ -179,9 +205,11 @@ async function saveSettingsFromRequest(request, env, cfg) {
     maxAlertsPerRun: parseFormInt(formData, "maxAlertsPerRun"),
     maxCategoryIds: parseFormInt(formData, "maxCategoryIds"),
     maxCategoryPages: parseFormInt(formData, "maxCategoryPages"),
+    maxDirectProductUrls: parseFormInt(formData, "maxDirectProductUrls"),
     maxPages: parseFormInt(formData, "maxPages"),
     relistAfterAbsentRuns: parseFormInt(formData, "relistAfterAbsentRuns"),
     extraCategoryIds: parseCategoryIds(formData.get("extraCategoryIds")),
+    extraProductUrls: parseProductUrls(formData.get("extraProductUrls")),
     updatedAt: nowIso()
   };
 
@@ -373,46 +401,92 @@ function categoryIdFromUrl(value) {
   }
 }
 
-async function fetchSitemapCategoryIds(cfg) {
-  if (!cfg.discoverSitemapCategories) return [];
+function productUrlFromUrl(value) {
+  try {
+    const url = new URL(value, BASE_URL);
+    if (url.origin !== BASE_URL) return "";
+    const pathSegments = url.pathname.split("/").filter(Boolean);
+    if (pathSegments.length < 3 || !url.pathname.endsWith(".html")) return "";
+    if (RESERVED_CATEGORY_IDS.has(pathSegments[0])) return "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+async function fetchSitemapSignals(cfg) {
+  const empty = { categoryIds: [], productUrls: [] };
+  if (!cfg.discoverSitemapCategories) return empty;
   try {
     const indexResponse = await fetchWithTimeout(
       cfg.sitemapIndexUrl,
       fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"),
       cfg.requestTimeoutMs
     );
-    if (!indexResponse.ok) return [];
+    if (!indexResponse.ok) return empty;
 
     const sitemapUrls = extractXmlLocations(await indexResponse.text()).filter((url) => url.endsWith(".xml"));
     const categoryIds = [];
+    const productUrls = [];
     for (const sitemapUrl of sitemapUrls.slice(0, 5)) {
       const response = await fetchWithTimeout(sitemapUrl, fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs);
       if (!response.ok) continue;
       for (const loc of extractXmlLocations(await response.text())) {
         const categoryId = categoryIdFromUrl(loc);
         if (categoryId) categoryIds.push(categoryId);
+        const productUrl = productUrlFromUrl(loc);
+        if (productUrl) productUrls.push(productUrl);
       }
     }
-    return categoryIds;
+    return { categoryIds, productUrls };
   } catch {
-    return [];
+    return empty;
   }
 }
 
-async function fetchHomepageCategoryIds(cfg) {
-  if (!cfg.discoverHomepageCategories) return [];
+async function fetchHomepageSignals(cfg) {
+  const empty = { categoryIds: [], productUrls: [] };
+  if (!cfg.discoverHomepageCategories) return empty;
   try {
     const html = await fetchHtml(BASE_URL, cfg);
     const hrefs = [...html.matchAll(/\bhref=["']([^"']+)["']/gi)].map((match) => absoluteUrl(match[1]));
-    return hrefs.map(categoryIdFromUrl).filter(Boolean);
+    return {
+      categoryIds: hrefs.map(categoryIdFromUrl).filter(Boolean),
+      productUrls: hrefs.map(productUrlFromUrl).filter(Boolean)
+    };
+  } catch {
+    return empty;
+  }
+}
+
+async function fetchRobotsProductUrls(cfg) {
+  if (!cfg.discoverRobotsProducts) return [];
+  try {
+    const response = await fetchWithTimeout(ROBOTS_URL, fetchOptions(cfg, "text/plain,*/*;q=0.8"), cfg.requestTimeoutMs);
+    if (!response.ok) return [];
+    return [...(await response.text()).matchAll(/(?:Allow|Disallow):\s*(\S+)/gi)]
+      .map((match) => productUrlFromUrl(match[1]))
+      .filter(Boolean);
   } catch {
     return [];
   }
 }
 
-async function productCategoryIds(cfg) {
-  const ids = ["root", ...(await fetchSitemapCategoryIds(cfg)), ...(await fetchHomepageCategoryIds(cfg)), ...cfg.extraCategoryIds];
-  return [...new Set(ids)].slice(0, cfg.maxCategoryIds);
+async function productDiscoverySignals(cfg) {
+  const [sitemap, homepage, robotsProductUrls] = await Promise.all([
+    fetchSitemapSignals(cfg),
+    fetchHomepageSignals(cfg),
+    fetchRobotsProductUrls(cfg)
+  ]);
+  const categoryIds = uniqueValues(["root", "shop", ...sitemap.categoryIds, ...homepage.categoryIds, ...cfg.extraCategoryIds]).slice(
+    0,
+    cfg.maxCategoryIds
+  );
+  const productUrls = uniqueValues([...sitemap.productUrls, ...homepage.productUrls, ...robotsProductUrls, ...cfg.extraProductUrls]).slice(
+    0,
+    cfg.maxDirectProductUrls
+  );
+  return { categoryIds, productUrls };
 }
 
 async function fetchProductsForCategory(cgid, cfg, maxPages) {
@@ -436,10 +510,31 @@ async function fetchProductsForCategory(cgid, cfg, maxPages) {
   return allProducts;
 }
 
+async function fetchDirectProduct(productUrl, cfg) {
+  try {
+    const html = await fetchHtml(productUrl, cfg);
+    const snapshot = parseProductStockPage(html, productUrl);
+    const pid = snapshot.masterPid || snapshot.selectedVariantPid || productUrl.match(/\/([^/]+)\.html/)?.[1] || "";
+    if (!pid || !snapshot.name) return null;
+    return {
+      pid,
+      name: snapshot.name || pid,
+      price: snapshot.price || "",
+      brand: snapshot.brand || "Chrome Hearts",
+      category: snapshot.category || categoryFromUrl(productUrl),
+      productType: "direct",
+      url: productUrl,
+      image: snapshot.image || ""
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchProducts(cfg) {
   const allProducts = {};
-  const categoryIds = await productCategoryIds(cfg);
-  const queuedCategoryIds = [...categoryIds];
+  const discovery = await productDiscoverySignals(cfg);
+  const queuedCategoryIds = [...discovery.categoryIds];
   const visitedCategoryIds = new Set();
 
   for (let index = 0; index < queuedCategoryIds.length && visitedCategoryIds.size < cfg.maxCategoryIds; index += 1) {
@@ -461,6 +556,11 @@ async function fetchProducts(cfg) {
         }
       }
     }
+  }
+
+  for (const productUrl of discovery.productUrls) {
+    const product = await fetchDirectProduct(productUrl, cfg);
+    if (product) allProducts[product.pid] = product;
   }
 
   const count = Object.keys(allProducts).length;
@@ -1351,6 +1451,7 @@ function dashboard(state, cfg, settings = {}, saved = false) {
   const lastProducts = last.productCount ?? seenCount;
   const updated = state.updatedAt || state.createdAt || nowIso();
   const extraCategoryIds = cfg.extraCategoryIds.join(", ");
+  const extraProductUrls = cfg.extraProductUrls.join("\n");
   const webhookStatus = settings.discordWebhookUrl ? "Dashboard webhook saved" : "Worker secret";
 
   return `<!doctype html>
@@ -1377,7 +1478,8 @@ function dashboard(state, cfg, settings = {}, saved = false) {
     .form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     .field { display: grid; gap: 7px; }
     label, .check { color: var(--muted); font-size: 13px; }
-    input[type="text"], input[type="url"], input[type="number"] { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--text); padding: 9px 10px; font: inherit; }
+    input[type="text"], input[type="url"], input[type="number"], textarea { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--text); padding: 9px 10px; font: inherit; }
+    textarea { min-height: 92px; resize: vertical; grid-column: span 2; }
     input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--mint); }
     .checks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
     .check { display: flex; align-items: center; gap: 8px; min-height: 28px; }
@@ -1436,6 +1538,10 @@ function dashboard(state, cfg, settings = {}, saved = false) {
             <input id="maxCategoryPages" name="maxCategoryPages" type="number" min="1" max="5" value="${escapeHtml(cfg.maxCategoryPages)}">
           </div>
           <div class="field">
+            <label for="maxDirectProductUrls">Direct product URLs</label>
+            <input id="maxDirectProductUrls" name="maxDirectProductUrls" type="number" min="0" max="50" value="${escapeHtml(cfg.maxDirectProductUrls)}">
+          </div>
+          <div class="field">
             <label for="maxPages">Root pages</label>
             <input id="maxPages" name="maxPages" type="number" min="1" max="20" value="${escapeHtml(cfg.maxPages)}">
           </div>
@@ -1447,12 +1553,17 @@ function dashboard(state, cfg, settings = {}, saved = false) {
             <label for="extraCategoryIds">Extra categories</label>
             <input id="extraCategoryIds" name="extraCategoryIds" type="text" value="${escapeHtml(extraCategoryIds)}" placeholder="hat, hoodie, jewelry">
           </div>
+          <div class="field">
+            <label for="extraProductUrls">Extra product URLs</label>
+            <textarea id="extraProductUrls" name="extraProductUrls" placeholder="https://www.chromehearts.com/category/item/PID.html">${escapeHtml(extraProductUrls)}</textarea>
+          </div>
           <label class="check"><input name="clearDiscordWebhook" type="checkbox"> Use Worker secret webhook</label>
         </div>
         <div class="checks">
           <label class="check"><input name="discoverSitemapCategories" type="checkbox"${checked(cfg.discoverSitemapCategories)}> Sitemap categories</label>
           <label class="check"><input name="discoverHomepageCategories" type="checkbox"${checked(cfg.discoverHomepageCategories)}> Homepage categories</label>
           <label class="check"><input name="discoverProductUrlCategories" type="checkbox"${checked(cfg.discoverProductUrlCategories)}> Product URL categories</label>
+          <label class="check"><input name="discoverRobotsProducts" type="checkbox"${checked(cfg.discoverRobotsProducts)}> Robots product URLs</label>
           <label class="check"><input name="probeExactStock" type="checkbox"${checked(cfg.probeExactStock)}> Exact stock probe</label>
         </div>
       </form>
@@ -1518,7 +1629,9 @@ async function handleFetch(request, env) {
         dashboardWebhook: Boolean(settings.discordWebhookUrl),
         checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
         maxAlertsPerRun: cfg.maxAlertsPerRun,
-        extraCategoryIds: cfg.extraCategoryIds
+        extraCategoryIds: cfg.extraCategoryIds,
+        extraProductUrls: cfg.extraProductUrls,
+        maxDirectProductUrls: cfg.maxDirectProductUrls
       },
       lastRunAt: state.lastRunAt || null,
       lastResult: state.lastResult || null

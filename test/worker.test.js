@@ -123,6 +123,7 @@ function env(overrides = {}, kv = fakeKV()) {
     MAX_ALERTS_PER_RUN: "5",
     MAX_CATEGORY_IDS: "20",
     MAX_CATEGORY_PAGES: "1",
+    MAX_DIRECT_PRODUCT_URLS: "10",
     MAX_PAGES: "1",
     MIN_PRODUCTS: "1",
     PAGE_SIZE: "200",
@@ -141,7 +142,17 @@ function basicAuthHeaders(password = "secret") {
   return { authorization: `Basic ${Buffer.from(`chrome-hearts:${password}`).toString("base64")}` };
 }
 
-function createChromeHeartsFetch({ root = "", categories = {}, sitemapCategories = [], homepageCategories = [], productDetails = {} }) {
+function createChromeHeartsFetch({
+  root = "",
+  categories = {},
+  sitemapCategories = [],
+  sitemapProductUrls = [],
+  homepageCategories = [],
+  homepageProductUrls = [],
+  robotsProductUrls = [],
+  robotsExtraLines = [],
+  productDetails = {}
+}) {
   const discordPayloads = [];
   const discordUrls = [];
   const gridCategoryCalls = [];
@@ -164,11 +175,24 @@ function createChromeHeartsFetch({ root = "", categories = {}, sitemapCategories
     }
 
     if (url.pathname === "/") {
-      const links = homepageCategories.map((category) => `<a href="/${category}/">${category}</a>`).join("");
+      const links = [
+        ...homepageCategories.map((category) => `<a href="/${category}/">${category}</a>`),
+        ...homepageProductUrls.map((productUrl) => `<a href="${productUrl}">${productUrl}</a>`)
+      ].join("");
       return new Response(`<!doctype html><nav>${links}</nav>`, {
         status: 200,
         headers: { "content-type": "text/html" }
       });
+    }
+
+    if (url.pathname === "/robots.txt") {
+      const lines = [
+        "User-agent: *",
+        ...robotsProductUrls.map((productUrl) => `Disallow: ${new URL(productUrl, "https://www.chromehearts.com").pathname}`),
+        ...robotsExtraLines,
+        "Allow: /"
+      ];
+      return new Response(lines.join("\n"), { status: 200, headers: { "content-type": "text/plain" } });
     }
 
     if (url.pathname === "/sitemap_index.xml") {
@@ -179,7 +203,10 @@ function createChromeHeartsFetch({ root = "", categories = {}, sitemapCategories
     }
 
     if (url.pathname === "/sitemap_0.xml") {
-      const locs = sitemapCategories.map((category) => `<url><loc>https://www.chromehearts.com/${category}/</loc></url>`).join("");
+      const locs = [
+        ...sitemapCategories.map((category) => `<url><loc>https://www.chromehearts.com/${category}/</loc></url>`),
+        ...sitemapProductUrls.map((productUrl) => `<url><loc>${new URL(productUrl, "https://www.chromehearts.com").toString()}</loc></url>`)
+      ].join("");
       return new Response(`<urlset>${locs}</urlset>`, { status: 200, headers: { "content-type": "application/xml" } });
     }
 
@@ -299,7 +326,9 @@ test("Cloudflare Worker infers category grids from product URLs in the root grid
 
     assert.equal(result.alerted, 1);
     assert.deepEqual(result.newPids, ["NEW_HAT_2"]);
-    assert.deepEqual(mock.gridCategoryCalls, ["root", "hat"]);
+    assert.ok(mock.gridCategoryCalls.includes("root"));
+    assert.ok(mock.gridCategoryCalls.includes("shop"));
+    assert.ok(mock.gridCategoryCalls.includes("hat"));
   });
 });
 
@@ -327,6 +356,60 @@ test("Cloudflare Worker checks manually listed extra category IDs", async () => 
     assert.equal(result.alerted, 1);
     assert.deepEqual(result.newPids, ["NEW_EXTRA"]);
     assert.ok(mock.gridCategoryCalls.includes("unlisted"));
+  });
+});
+
+test("Cloudflare Worker alerts direct product URLs found in sitemap, homepage, and robots", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const directUrls = [
+    "https://www.chromehearts.com/hidden/sitemap-drop/SITEMAP_NEW.html",
+    "https://www.chromehearts.com/hidden/homepage-drop/HOME_NEW.html",
+    "https://www.chromehearts.com/hidden/robots-drop/ROBOTS_NEW.html"
+  ];
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({
+    root: oldProduct,
+    sitemapProductUrls: [directUrls[0]],
+    homepageProductUrls: [directUrls[1]],
+    robotsProductUrls: [directUrls[2]],
+    productDetails: {
+      SITEMAP_NEW: { name: "SITEMAP DROP", categoryName: "Hidden", price: "100.00" },
+      HOME_NEW: { name: "HOME DROP", categoryName: "Hidden", price: "200.00" },
+      ROBOTS_NEW: { name: "ROBOTS DROP", categoryName: "Hidden", price: "300.00" }
+    }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          MAX_ALERTS_PER_RUN: "5"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 3);
+    assert.deepEqual(new Set(result.newPids), new Set(["SITEMAP_NEW", "HOME_NEW", "ROBOTS_NEW"]));
+    assert.equal(mock.discordPayloads[0].embeds.length, 3);
+  });
+});
+
+test("Cloudflare Worker ignores non-product direct URLs from public discovery files", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({
+    root: oldProduct,
+    robotsExtraLines: ["Disallow: /locations.html", "Disallow: /privacy.html"]
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(env({ DISCOVER_PRODUCT_URL_CATEGORIES: "false" }, kv));
+
+    assert.equal(result.alerted, 0);
+    assert.deepEqual(result.newPids, []);
+    assert.equal(mock.discordPayloads.length, 0);
   });
 });
 
@@ -474,12 +557,15 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
     maxAlertsPerRun: "1",
     maxCategoryIds: "7",
     maxCategoryPages: "1",
+    maxDirectProductUrls: "4",
     maxPages: "1",
     relistAfterAbsentRuns: "3",
     extraCategoryIds: "hat, jewelry",
+    extraProductUrls: "https://www.chromehearts.com/hidden/manual/MANUAL_NEW.html",
     discoverSitemapCategories: "on",
     discoverHomepageCategories: "on",
-    discoverProductUrlCategories: "on"
+    discoverProductUrlCategories: "on",
+    discoverRobotsProducts: "on"
   });
 
   const saveResponse = await worker.fetch(
@@ -497,7 +583,10 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
   const savedSettings = JSON.parse(kv.values.get(SETTINGS_KEY));
   assert.equal(savedSettings.discordWebhookUrl, webhookUrl);
   assert.equal(savedSettings.maxAlertsPerRun, 1);
+  assert.equal(savedSettings.maxDirectProductUrls, 4);
   assert.deepEqual(savedSettings.extraCategoryIds, ["hat", "jewelry"]);
+  assert.deepEqual(savedSettings.extraProductUrls, ["https://www.chromehearts.com/hidden/manual/MANUAL_NEW.html"]);
+  assert.equal(savedSettings.discoverRobotsProducts, true);
   assert.equal(savedSettings.probeExactStock, false);
 
   const dashboardResponse = await worker.fetch(new Request("https://monitor.test/?saved=1", { headers: basicAuthHeaders() }), testEnv);
@@ -516,6 +605,35 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
     assert.equal(mock.discordUrls[0], webhookUrl);
     assert.equal(mock.discordPayloads[0].embeds.length, 1);
   });
+});
+
+test("Worker dashboard rejects unsafe runtime settings without overwriting KV", async () => {
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  kv.values.set(SETTINGS_KEY, JSON.stringify({ maxAlertsPerRun: 2, extraCategoryIds: ["hat"] }));
+  const badForm = new URLSearchParams({
+    discordWebhookUrl: "https://example.com/not-discord",
+    checkMinIntervalSeconds: "0",
+    maxAlertsPerRun: "500",
+    maxCategoryIds: "7",
+    maxCategoryPages: "1",
+    maxDirectProductUrls: "4",
+    maxPages: "1",
+    relistAfterAbsentRuns: "3"
+  });
+
+  const response = await worker.fetch(
+    new Request("https://monitor.test/settings", {
+      method: "POST",
+      headers: { ...basicAuthHeaders(), "content-type": "application/x-www-form-urlencoded" },
+      body: badForm
+    }),
+    env({}, kv)
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /maxAlertsPerRun|Discord webhook/);
+  assert.deepEqual(JSON.parse(kv.values.get(SETTINGS_KEY)), { maxAlertsPerRun: 2, extraCategoryIds: ["hat"] });
 });
 
 test("Worker dashboard and health pages are private", async () => {
