@@ -1,2 +1,4 @@
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 CRON_SECRET=replace-with-a-long-random-secret
+DASHBOARD_USERNAME=chrome-hearts
+DASHBOARD_PASSWORD=optional-separate-dashboard-password

@@ -8,6 +8,16 @@ const PRODUCT_VARIATION_BASE_URL =
 const DEFAULT_STATE_KEY = "chrome-hearts:cloudflare:state";
 const DEFAULT_LOCK_KEY = "chrome-hearts:cloudflare:lock";
 const DEFAULT_USER_AGENT = "ChromeHeartsMonitor/1.0";
+const RESERVED_CATEGORY_IDS = new Set([
+  "account",
+  "cart",
+  "checkout",
+  "customer-service",
+  "login",
+  "on",
+  "search",
+  "wishlist"
+]);
 
 class MonitorError extends Error {
   constructor(message, statusCode = 500, details = {}) {
@@ -48,6 +58,8 @@ function getConfig(env) {
     lockKey: env.LOCK_KEY || DEFAULT_LOCK_KEY,
     discordWebhookUrl: env.DISCORD_WEBHOOK_URL,
     cronSecret: env.CRON_SECRET || "",
+    dashboardUsername: env.DASHBOARD_USERNAME || "chrome-hearts",
+    dashboardPassword: env.DASHBOARD_PASSWORD || env.CRON_SECRET || "",
     pageSize: intSetting(env, "PAGE_SIZE", 200, 1),
     maxPages: intSetting(env, "MAX_PAGES", 10, 1),
     maxCategoryPages: intSetting(env, "MAX_CATEGORY_PAGES", 2, 1),
@@ -56,6 +68,8 @@ function getConfig(env) {
     maxAlertsPerRun: intSetting(env, "MAX_ALERTS_PER_RUN", 5, 1),
     notifyInitial: boolSetting(env, "NOTIFY_INITIAL", false),
     discoverSitemapCategories: boolSetting(env, "DISCOVER_SITEMAP_CATEGORIES", true),
+    discoverHomepageCategories: boolSetting(env, "DISCOVER_HOMEPAGE_CATEGORIES", true),
+    discoverProductUrlCategories: boolSetting(env, "DISCOVER_PRODUCT_URL_CATEGORIES", true),
     sitemapIndexUrl: env.SITEMAP_INDEX_URL || `${BASE_URL}/sitemap_index.xml`,
     extraCategoryIds: String(env.EXTRA_CATEGORY_IDS || "")
       .split(",")
@@ -227,8 +241,10 @@ function categoryIdFromUrl(value) {
     const url = new URL(value);
     if (url.origin !== BASE_URL) return "";
     const path = url.pathname.replace(/^\/+|\/+$/g, "");
-    if (!path || path.includes(".") || path.includes("demandware.store")) return "";
-    return path.split("/")[0];
+    const firstSegment = path.split("/")[0];
+    if (!firstSegment || firstSegment.includes(".") || RESERVED_CATEGORY_IDS.has(firstSegment)) return "";
+    if (path.includes("demandware.store")) return "";
+    return firstSegment;
   } catch {
     return "";
   }
@@ -260,8 +276,19 @@ async function fetchSitemapCategoryIds(cfg) {
   }
 }
 
+async function fetchHomepageCategoryIds(cfg) {
+  if (!cfg.discoverHomepageCategories) return [];
+  try {
+    const html = await fetchHtml(BASE_URL, cfg);
+    const hrefs = [...html.matchAll(/\bhref=["']([^"']+)["']/gi)].map((match) => absoluteUrl(match[1]));
+    return hrefs.map(categoryIdFromUrl).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 async function productCategoryIds(cfg) {
-  const ids = ["root", ...(await fetchSitemapCategoryIds(cfg)), ...cfg.extraCategoryIds];
+  const ids = ["root", ...(await fetchSitemapCategoryIds(cfg)), ...(await fetchHomepageCategoryIds(cfg)), ...cfg.extraCategoryIds];
   return [...new Set(ids)].slice(0, cfg.maxCategoryIds);
 }
 
@@ -289,12 +316,27 @@ async function fetchProductsForCategory(cgid, cfg, maxPages) {
 async function fetchProducts(cfg) {
   const allProducts = {};
   const categoryIds = await productCategoryIds(cfg);
+  const queuedCategoryIds = [...categoryIds];
+  const visitedCategoryIds = new Set();
 
-  for (const cgid of categoryIds) {
+  for (let index = 0; index < queuedCategoryIds.length && visitedCategoryIds.size < cfg.maxCategoryIds; index += 1) {
+    const cgid = queuedCategoryIds[index];
+    if (!cgid || visitedCategoryIds.has(cgid)) continue;
+    visitedCategoryIds.add(cgid);
+
     const maxPages = cgid === "root" ? cfg.maxPages : cfg.maxCategoryPages;
     const products = await fetchProductsForCategory(cgid, cfg, maxPages);
     for (const [pid, product] of Object.entries(products)) {
       allProducts[pid] = product;
+    }
+
+    if (cfg.discoverProductUrlCategories) {
+      for (const product of Object.values(products)) {
+        const categoryId = categoryIdFromUrl(product.url);
+        if (categoryId && !visitedCategoryIds.has(categoryId) && !queuedCategoryIds.includes(categoryId)) {
+          queuedCategoryIds.push(categoryId);
+        }
+      }
     }
   }
 
@@ -1077,6 +1119,49 @@ function isAuthorized(request, cfg) {
   return request.headers.get("authorization") === `Bearer ${cfg.cronSecret}`;
 }
 
+function decodeBasicCredentials(header) {
+  const match = String(header || "").match(/^Basic\s+(.+)$/i);
+  if (!match) return null;
+  try {
+    const decoded = atob(match[1]);
+    const separatorIndex = decoded.indexOf(":");
+    if (separatorIndex === -1) return null;
+    return {
+      username: decoded.slice(0, separatorIndex),
+      password: decoded.slice(separatorIndex + 1)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isPrivatePageAuthorized(request, cfg) {
+  if (!cfg.dashboardPassword && !cfg.cronSecret) return true;
+  if (isAuthorized(request, cfg)) return true;
+
+  const credentials = decodeBasicCredentials(request.headers.get("authorization"));
+  return Boolean(
+    credentials &&
+      credentials.username === cfg.dashboardUsername &&
+      credentials.password === (cfg.dashboardPassword || cfg.cronSecret)
+  );
+}
+
+function privatePageUnauthorized(request) {
+  const wantsHtml = String(request.headers.get("accept") || "").includes("text/html");
+  const headers = {
+    "www-authenticate": 'Basic realm="Chrome Hearts Monitor", charset="UTF-8"',
+    "cache-control": "no-store"
+  };
+  if (wantsHtml) {
+    return new Response("<!doctype html><title>Private</title><h1>Private monitor</h1>", {
+      status: 401,
+      headers: { ...headers, "content-type": "text/html; charset=utf-8" }
+    });
+  }
+  return jsonResponse({ ok: false, error: "Unauthorized" }, 401, headers);
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -1160,9 +1245,11 @@ async function handleFetch(request, env) {
 
   const url = new URL(request.url);
   if (url.pathname === "/" || url.pathname === "/dashboard") {
+    if (!isPrivatePageAuthorized(request, cfg)) return privatePageUnauthorized(request);
     return htmlResponse(dashboard(await loadState(env, cfg), cfg));
   }
   if (url.pathname === "/health") {
+    if (!isPrivatePageAuthorized(request, cfg)) return privatePageUnauthorized(request);
     const state = await loadState(env, cfg);
     return jsonResponse({
       ok: true,
