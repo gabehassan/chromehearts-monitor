@@ -24,5 +24,5 @@ crons = ["*/5 * * * *"]
 
 [[kv_namespaces]]
 binding = "STATE"
-id = "REPLACE_WITH_CLOUDFLARE_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_CLOUDFLARE_PREVIEW_KV_NAMESPACE_ID"
+id = "<your-kv-namespace-id>"
+preview_id = "<your-preview-kv-namespace-id>"
