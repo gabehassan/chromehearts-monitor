@@ -7,6 +7,7 @@ const PRODUCT_VARIATION_BASE_URL =
   "https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Product-Variation";
 const DEFAULT_STATE_KEY = "chrome-hearts:cloudflare:state";
 const DEFAULT_LOCK_KEY = "chrome-hearts:cloudflare:lock";
+const DEFAULT_SETTINGS_KEY = "chrome-hearts:cloudflare:settings";
 const DEFAULT_USER_AGENT = "ChromeHeartsMonitor/1.0";
 const RESERVED_CATEGORY_IDS = new Set([
   "account",
@@ -18,6 +19,15 @@ const RESERVED_CATEGORY_IDS = new Set([
   "search",
   "wishlist"
 ]);
+const INT_SETTING_LIMITS = {
+  checkMinIntervalSeconds: [0, 3600],
+  maxAlertsPerRun: [1, 10],
+  maxCategoryIds: [1, 50],
+  maxCategoryPages: [1, 5],
+  maxPages: [1, 20],
+  relistAfterAbsentRuns: [1, 12]
+};
+const BOOL_SETTING_KEYS = ["discoverSitemapCategories", "discoverHomepageCategories", "discoverProductUrlCategories", "probeExactStock"];
 
 class MonitorError extends Error {
   constructor(message, statusCode = 500, details = {}) {
@@ -56,6 +66,7 @@ function getConfig(env) {
   return {
     stateKey: env.STATE_KEY || DEFAULT_STATE_KEY,
     lockKey: env.LOCK_KEY || DEFAULT_LOCK_KEY,
+    settingsKey: env.SETTINGS_KEY || DEFAULT_SETTINGS_KEY,
     discordWebhookUrl: env.DISCORD_WEBHOOK_URL,
     cronSecret: env.CRON_SECRET || "",
     dashboardUsername: env.DASHBOARD_USERNAME || "chrome-hearts",
@@ -86,6 +97,117 @@ function getConfig(env) {
     maxBackoffSeconds: intSetting(env, "MAX_BACKOFF_SECONDS", 900, 1),
     userAgent: env.MONITOR_USER_AGENT || DEFAULT_USER_AGENT
   };
+}
+
+function parseSettings(raw) {
+  if (!raw) return {};
+  try {
+    const settings = JSON.parse(raw);
+    return settings && typeof settings === "object" && !Array.isArray(settings) ? settings : {};
+  } catch {
+    return {};
+  }
+}
+
+async function loadSettings(env, cfg) {
+  return parseSettings(await env.STATE.get(cfg.settingsKey));
+}
+
+function applyRuntimeSettings(cfg, settings) {
+  const next = { ...cfg };
+  for (const [key, [min, max]] of Object.entries(INT_SETTING_LIMITS)) {
+    if (Number.isInteger(settings[key]) && settings[key] >= min && settings[key] <= max) next[key] = settings[key];
+  }
+  for (const key of BOOL_SETTING_KEYS) {
+    if (typeof settings[key] === "boolean") next[key] = settings[key];
+  }
+  if (Array.isArray(settings.extraCategoryIds)) {
+    next.extraCategoryIds = settings.extraCategoryIds.map((value) => String(value || "").trim()).filter(Boolean);
+  }
+  if (typeof settings.discordWebhookUrl === "string" && settings.discordWebhookUrl.startsWith("https://")) {
+    next.discordWebhookUrl = settings.discordWebhookUrl;
+  }
+  return next;
+}
+
+async function getRuntimeConfig(env) {
+  const cfg = getConfig(env);
+  return applyRuntimeSettings(cfg, await loadSettings(env, cfg));
+}
+
+function parseFormInt(formData, key) {
+  const [min, max] = INT_SETTING_LIMITS[key];
+  const value = Number.parseInt(String(formData.get(key) || ""), 10);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new MonitorError(`${key} must be between ${min} and ${max}.`, 400);
+  }
+  return value;
+}
+
+function parseCategoryIds(value) {
+  return uniqueValues(
+    String(value || "")
+      .split(/[\s,]+/)
+      .map((item) => item.trim().toLowerCase())
+      .filter(Boolean)
+      .filter((item) => /^[a-z0-9_-]+$/.test(item) && !RESERVED_CATEGORY_IDS.has(item))
+  ).slice(0, INT_SETTING_LIMITS.maxCategoryIds[1]);
+}
+
+function validateDiscordWebhookUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new MonitorError("Discord webhook must be a valid URL.", 400);
+  }
+  const validHost = url.hostname === "discord.com" || url.hostname.endsWith(".discord.com") || url.hostname === "discordapp.com";
+  if (url.protocol !== "https:" || !validHost || !url.pathname.startsWith("/api/webhooks/")) {
+    throw new MonitorError("Discord webhook must be an https://discord.com/api/webhooks/... URL.", 400);
+  }
+  return url.toString();
+}
+
+async function saveSettingsFromRequest(request, env, cfg) {
+  const current = await loadSettings(env, cfg);
+  const formData = await request.formData();
+  const next = {
+    ...current,
+    checkMinIntervalSeconds: parseFormInt(formData, "checkMinIntervalSeconds"),
+    maxAlertsPerRun: parseFormInt(formData, "maxAlertsPerRun"),
+    maxCategoryIds: parseFormInt(formData, "maxCategoryIds"),
+    maxCategoryPages: parseFormInt(formData, "maxCategoryPages"),
+    maxPages: parseFormInt(formData, "maxPages"),
+    relistAfterAbsentRuns: parseFormInt(formData, "relistAfterAbsentRuns"),
+    extraCategoryIds: parseCategoryIds(formData.get("extraCategoryIds")),
+    updatedAt: nowIso()
+  };
+
+  for (const key of BOOL_SETTING_KEYS) {
+    next[key] = formData.get(key) === "on";
+  }
+
+  const webhookUrl = validateDiscordWebhookUrl(formData.get("discordWebhookUrl"));
+  if (formData.get("clearDiscordWebhook") === "on") {
+    delete next.discordWebhookUrl;
+  } else if (webhookUrl) {
+    next.discordWebhookUrl = webhookUrl;
+  }
+
+  await env.STATE.put(cfg.settingsKey, JSON.stringify(next));
+  return next;
+}
+
+function redirectResponse(location) {
+  return new Response(null, {
+    status: 303,
+    headers: {
+      location,
+      "cache-control": "no-store"
+    }
+  });
 }
 
 function jsonResponse(body, status = 200, headers = {}) {
@@ -1087,7 +1209,8 @@ function buildCatalogState(products, state, deferredPids, cfg) {
   return { seen, active, missing };
 }
 
-async function runMonitor(env, cfg = getConfig(env)) {
+async function runMonitor(env, cfg = null) {
+  if (!cfg) cfg = await getRuntimeConfig(env);
   const lockToken = await acquireLock(env, cfg);
   if (!lockToken) return { ok: true, skipped: true, reason: "locked", storage: "cloudflare-kv" };
 
@@ -1213,14 +1336,22 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function dashboard(state, cfg) {
+function checked(value) {
+  return value ? " checked" : "";
+}
+
+function dashboard(state, cfg, settings = {}, saved = false) {
   const last = state.lastResult || {};
   const seenCount = Object.keys(state.seen || {}).length;
+  const activeCount = Object.keys(state.active || state.seen || {}).length;
+  const missingCount = Object.keys(state.missing || {}).length;
   const status = last.ok === false ? "Issue" : state.lastRunAt ? "Online" : "Ready";
   const lastRun = state.lastRunAt || "Never";
   const next = cfg.checkMinIntervalSeconds ? `${cfg.checkMinIntervalSeconds}s minimum` : "No throttle";
   const lastProducts = last.productCount ?? seenCount;
   const updated = state.updatedAt || state.createdAt || nowIso();
+  const extraCategoryIds = cfg.extraCategoryIds.join(", ");
+  const webhookStatus = settings.discordWebhookUrl ? "Dashboard webhook saved" : "Worker secret";
 
   return `<!doctype html>
 <html lang="en">
@@ -1229,10 +1360,10 @@ function dashboard(state, cfg) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Chrome Hearts Monitor</title>
   <style>
-    :root { color-scheme: dark; --bg: #080909; --panel: #121414; --line: #2a2d2d; --text: #f1f1ee; --muted: #a9aaa4; --mint: #b8f3d4; --blue: #b7b2ff; }
+    :root { color-scheme: dark; --bg: #080909; --panel: #121414; --line: #2a2d2d; --text: #f1f1ee; --muted: #a9aaa4; --mint: #b8f3d4; --blue: #b7b2ff; --field: #0c0d0d; }
     * { box-sizing: border-box; }
     body { margin: 0; font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-    main { width: min(980px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0; }
+    main { width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0; }
     header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; border-bottom: 1px solid var(--line); padding-bottom: 18px; }
     h1 { margin: 0; font-size: clamp(24px, 5vw, 44px); line-height: 1; letter-spacing: 0; }
     .pill { border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; color: var(--mint); white-space: nowrap; }
@@ -1242,8 +1373,21 @@ function dashboard(state, cfg) {
     .value { margin-top: 10px; font-size: 22px; font-weight: 700; overflow-wrap: anywhere; }
     section { border-top: 1px solid var(--line); padding-top: 18px; margin-top: 18px; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0c0d0d; border: 1px solid var(--line); border-radius: 8px; padding: 14px; color: var(--muted); }
+    form { display: grid; gap: 16px; }
+    .form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .field { display: grid; gap: 7px; }
+    label, .check { color: var(--muted); font-size: 13px; }
+    input[type="text"], input[type="url"], input[type="number"] { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--text); padding: 9px 10px; font: inherit; }
+    input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--mint); }
+    .checks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
+    .check { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+    .actions { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button { border: 1px solid var(--mint); border-radius: 6px; background: var(--mint); color: #07100b; min-height: 40px; padding: 0 14px; font: inherit; font-weight: 700; cursor: pointer; }
+    .note { color: var(--muted); margin: 0; }
+    .saved { color: var(--mint); }
     a { color: var(--blue); }
-    @media (max-width: 760px) { header { display: block; } .pill { display: inline-block; margin-top: 14px; } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 860px) { header { display: block; } .pill { display: inline-block; margin-top: 14px; } .grid, .form-grid, .checks { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 560px) { .grid, .form-grid, .checks { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -1257,13 +1401,69 @@ function dashboard(state, cfg) {
     </header>
     <div class="grid">
       <div class="card"><div class="label">Seen products</div><div class="value">${seenCount}</div></div>
-      <div class="card"><div class="label">Last grid count</div><div class="value">${escapeHtml(lastProducts)}</div></div>
-      <div class="card"><div class="label">Last alerted</div><div class="value">${escapeHtml(last.alerted ?? 0)}</div></div>
+      <div class="card"><div class="label">Active listings</div><div class="value">${activeCount}</div></div>
+      <div class="card"><div class="label">Missing watch</div><div class="value">${missingCount}</div></div>
       <div class="card"><div class="label">Cadence</div><div class="value">${escapeHtml(next)}</div></div>
     </div>
     <section>
+      <form action="/settings" method="post">
+        <div class="actions">
+          <div>
+            <div class="label">Runtime settings</div>
+            <p class="note">${escapeHtml(webhookStatus)}${saved ? ' <span class="saved">Settings saved.</span>' : ""}</p>
+          </div>
+          <button type="submit">Save settings</button>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label for="discordWebhookUrl">Discord webhook</label>
+            <input id="discordWebhookUrl" name="discordWebhookUrl" type="url" autocomplete="off" placeholder="Paste a new webhook URL">
+          </div>
+          <div class="field">
+            <label for="checkMinIntervalSeconds">Minimum interval seconds</label>
+            <input id="checkMinIntervalSeconds" name="checkMinIntervalSeconds" type="number" min="0" max="3600" value="${escapeHtml(cfg.checkMinIntervalSeconds)}">
+          </div>
+          <div class="field">
+            <label for="maxAlertsPerRun">Max alerts per run</label>
+            <input id="maxAlertsPerRun" name="maxAlertsPerRun" type="number" min="1" max="10" value="${escapeHtml(cfg.maxAlertsPerRun)}">
+          </div>
+          <div class="field">
+            <label for="maxCategoryIds">Max categories</label>
+            <input id="maxCategoryIds" name="maxCategoryIds" type="number" min="1" max="50" value="${escapeHtml(cfg.maxCategoryIds)}">
+          </div>
+          <div class="field">
+            <label for="maxCategoryPages">Pages per category</label>
+            <input id="maxCategoryPages" name="maxCategoryPages" type="number" min="1" max="5" value="${escapeHtml(cfg.maxCategoryPages)}">
+          </div>
+          <div class="field">
+            <label for="maxPages">Root pages</label>
+            <input id="maxPages" name="maxPages" type="number" min="1" max="20" value="${escapeHtml(cfg.maxPages)}">
+          </div>
+          <div class="field">
+            <label for="relistAfterAbsentRuns">Relist absent runs</label>
+            <input id="relistAfterAbsentRuns" name="relistAfterAbsentRuns" type="number" min="1" max="12" value="${escapeHtml(cfg.relistAfterAbsentRuns)}">
+          </div>
+          <div class="field">
+            <label for="extraCategoryIds">Extra categories</label>
+            <input id="extraCategoryIds" name="extraCategoryIds" type="text" value="${escapeHtml(extraCategoryIds)}" placeholder="hat, hoodie, jewelry">
+          </div>
+          <label class="check"><input name="clearDiscordWebhook" type="checkbox"> Use Worker secret webhook</label>
+        </div>
+        <div class="checks">
+          <label class="check"><input name="discoverSitemapCategories" type="checkbox"${checked(cfg.discoverSitemapCategories)}> Sitemap categories</label>
+          <label class="check"><input name="discoverHomepageCategories" type="checkbox"${checked(cfg.discoverHomepageCategories)}> Homepage categories</label>
+          <label class="check"><input name="discoverProductUrlCategories" type="checkbox"${checked(cfg.discoverProductUrlCategories)}> Product URL categories</label>
+          <label class="check"><input name="probeExactStock" type="checkbox"${checked(cfg.probeExactStock)}> Exact stock probe</label>
+        </div>
+      </form>
+    </section>
+    <section>
       <div class="label">Last run</div>
       <pre>${escapeHtml(lastRun)}</pre>
+      <div class="label">Last grid count</div>
+      <pre>${escapeHtml(lastProducts)}</pre>
+      <div class="label">Last alerted</div>
+      <pre>${escapeHtml(last.alerted ?? 0)}</pre>
       <div class="label">State updated</div>
       <pre>${escapeHtml(updated)}</pre>
       <div class="label">Last result</div>
@@ -1278,34 +1478,57 @@ function dashboard(state, cfg) {
 }
 
 async function handleFetch(request, env) {
-  let cfg;
+  let baseCfg;
   try {
-    cfg = getConfig(env);
+    baseCfg = getConfig(env);
   } catch (error) {
     return jsonResponse({ ok: false, error: error.message }, 500);
   }
 
   const url = new URL(request.url);
   if (url.pathname === "/" || url.pathname === "/dashboard") {
-    if (!isPrivatePageAuthorized(request, cfg)) return privatePageUnauthorized(request);
-    return htmlResponse(dashboard(await loadState(env, cfg), cfg));
+    if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
+    const settings = await loadSettings(env, baseCfg);
+    const cfg = applyRuntimeSettings(baseCfg, settings);
+    return htmlResponse(dashboard(await loadState(env, cfg), cfg, settings, url.searchParams.get("saved") === "1"));
+  }
+  if (url.pathname === "/settings") {
+    if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
+    if (request.method !== "POST") return redirectResponse("/");
+    try {
+      await saveSettingsFromRequest(request, env, baseCfg);
+      return redirectResponse("/?saved=1");
+    } catch (error) {
+      const status = error instanceof MonitorError ? error.statusCode : 500;
+      return jsonResponse({ ok: false, error: error.message }, status);
+    }
   }
   if (url.pathname === "/health") {
-    if (!isPrivatePageAuthorized(request, cfg)) return privatePageUnauthorized(request);
+    if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
+    const settings = await loadSettings(env, baseCfg);
+    const cfg = applyRuntimeSettings(baseCfg, settings);
     const state = await loadState(env, cfg);
     return jsonResponse({
       ok: true,
       storage: "cloudflare-kv",
       seen: Object.keys(state.seen || {}).length,
+      active: Object.keys(state.active || state.seen || {}).length,
+      missing: Object.keys(state.missing || {}).length,
+      settings: {
+        dashboardWebhook: Boolean(settings.discordWebhookUrl),
+        checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
+        maxAlertsPerRun: cfg.maxAlertsPerRun,
+        extraCategoryIds: cfg.extraCategoryIds
+      },
       lastRunAt: state.lastRunAt || null,
       lastResult: state.lastResult || null
     });
   }
   if (url.pathname === "/api/cron" || url.pathname === "/run") {
     if (!["GET", "POST"].includes(request.method)) return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
-    if (!isAuthorized(request, cfg)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
+    if (!isAuthorized(request, baseCfg)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
     try {
-      return jsonResponse(await runMonitor(env, cfg));
+      return jsonResponse(await runMonitor(env, await getRuntimeConfig(env)));
     } catch (error) {
       const status = error instanceof MonitorError ? error.statusCode : 500;
       return jsonResponse({ ok: false, error: error.message, details: error.details || {} }, status);

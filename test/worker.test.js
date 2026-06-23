@@ -4,6 +4,7 @@ import worker from "../src/worker.js";
 
 const STATE_KEY = "state";
 const LOCK_KEY = "lock";
+const SETTINGS_KEY = "settings";
 
 function productTile(pid, name, categorySlug, categoryName, price = "395.00") {
   const href = `/${categorySlug}/${name.toLowerCase().replaceAll(" ", "-")}/${pid}.html`;
@@ -111,6 +112,7 @@ function env(overrides = {}, kv = fakeKV()) {
     STATE: kv,
     STATE_KEY,
     LOCK_KEY,
+    SETTINGS_KEY,
     DISCORD_WEBHOOK_URL: "https://discord.test/webhook",
     CRON_SECRET: "secret",
     CHECK_MIN_INTERVAL_SECONDS: "0",
@@ -141,12 +143,18 @@ function basicAuthHeaders(password = "secret") {
 
 function createChromeHeartsFetch({ root = "", categories = {}, sitemapCategories = [], homepageCategories = [], productDetails = {} }) {
   const discordPayloads = [];
+  const discordUrls = [];
   const gridCategoryCalls = [];
 
   const fetchMock = async (input, init = {}) => {
     const url = new URL(String(input));
 
-    if (url.href === "https://discord.test/webhook") {
+    const isDiscordWebhook =
+      url.href === "https://discord.test/webhook" ||
+      ((url.hostname === "discord.com" || url.hostname.endsWith(".discord.com") || url.hostname === "discordapp.com") &&
+        url.pathname.startsWith("/api/webhooks/"));
+    if (isDiscordWebhook) {
+      discordUrls.push(url.toString());
       discordPayloads.push(JSON.parse(init.body || "{}"));
       return new Response(null, { status: 204 });
     }
@@ -203,7 +211,7 @@ function createChromeHeartsFetch({ root = "", categories = {}, sitemapCategories
     });
   };
 
-  return { fetchMock, discordPayloads, gridCategoryCalls };
+  return { fetchMock, discordPayloads, discordUrls, gridCategoryCalls };
 }
 
 async function withMockedFetch(fetchMock, fn) {
@@ -451,6 +459,62 @@ test("Cloudflare Worker alerts a same PID relist after confirmed absence", async
     assert.deepEqual(result.newPids, ["OLD_RELIST"]);
     assert.equal(relistMock.discordPayloads.length, 1);
     assert.equal(relistMock.discordPayloads[0].embeds[0].title, "OLD RELISTED ITEM");
+  });
+});
+
+test("Worker dashboard saves runtime settings and applies a write-only webhook", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const newProduct = productTile("NEW_SHOP", "NEW SHOP ITEM", "shop", "Shop", "200.00");
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const testEnv = env({}, kv);
+  const webhookUrl = "https://discord.com/api/webhooks/1234567890/runtime-secret-token";
+  const form = new URLSearchParams({
+    discordWebhookUrl: webhookUrl,
+    checkMinIntervalSeconds: "0",
+    maxAlertsPerRun: "1",
+    maxCategoryIds: "7",
+    maxCategoryPages: "1",
+    maxPages: "1",
+    relistAfterAbsentRuns: "3",
+    extraCategoryIds: "hat, jewelry",
+    discoverSitemapCategories: "on",
+    discoverHomepageCategories: "on",
+    discoverProductUrlCategories: "on"
+  });
+
+  const saveResponse = await worker.fetch(
+    new Request("https://monitor.test/settings", {
+      method: "POST",
+      headers: { ...basicAuthHeaders(), "content-type": "application/x-www-form-urlencoded" },
+      body: form
+    }),
+    testEnv
+  );
+
+  assert.equal(saveResponse.status, 303);
+  assert.equal(saveResponse.headers.get("location"), "/?saved=1");
+
+  const savedSettings = JSON.parse(kv.values.get(SETTINGS_KEY));
+  assert.equal(savedSettings.discordWebhookUrl, webhookUrl);
+  assert.equal(savedSettings.maxAlertsPerRun, 1);
+  assert.deepEqual(savedSettings.extraCategoryIds, ["hat", "jewelry"]);
+  assert.equal(savedSettings.probeExactStock, false);
+
+  const dashboardResponse = await worker.fetch(new Request("https://monitor.test/?saved=1", { headers: basicAuthHeaders() }), testEnv);
+  const dashboardHtml = await dashboardResponse.text();
+  assert.equal(dashboardResponse.status, 200);
+  assert.match(dashboardHtml, /Dashboard webhook saved/);
+  assert.match(dashboardHtml, /Settings saved/);
+  assert.equal(dashboardHtml.includes(webhookUrl), false);
+
+  const mock = createChromeHeartsFetch({ root: `${oldProduct}${newProduct}` });
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(testEnv);
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["NEW_SHOP"]);
+    assert.equal(mock.discordUrls[0], webhookUrl);
+    assert.equal(mock.discordPayloads[0].embeds.length, 1);
   });
 });
 

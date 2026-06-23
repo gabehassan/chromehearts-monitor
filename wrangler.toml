@@ -8,6 +8,7 @@ enabled = true
 
 [vars]
 CHECK_MIN_INTERVAL_SECONDS = "240"
+SETTINGS_KEY = "chrome-hearts:cloudflare:settings"
 EXACT_STOCK_PROBE_CONCURRENCY = "3"
 EXACT_STOCK_PROBE_QUANTITY = "999"
 MAX_ALERTS_PER_RUN = "5"
