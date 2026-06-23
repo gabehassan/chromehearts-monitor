@@ -232,6 +232,75 @@ test("fetchStockSnapshot overlays Product-Variation JSON over PDP HTML", async (
   }
 });
 
+test("fetchStockSnapshot can probe exact stock from high-quantity SFCC messages", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const currentUrl = new URL(String(url));
+    calls.push(currentUrl.toString());
+    if (currentUrl.pathname.includes("Product-Variation") && currentUrl.searchParams.get("quantity") === "999") {
+      return new Response(
+        JSON.stringify({
+          product: {
+            id: "152701BLKXSM04K",
+            availability: {
+              messages: ["7 Item(s) in Stock", "The remaining items are currently not available. Please adjust the quantity"]
+            }
+          }
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    if (currentUrl.pathname.includes("Product-Variation")) {
+      return new Response(
+        JSON.stringify({
+          product: {
+            id: "152701BLKXSM04K",
+            masterProductId: "152701BLKXXX04K",
+            maxOrderQuantity: 10,
+            available: true,
+            readyToOrder: true,
+            availability: { messages: ["In Stock"] },
+            variationAttributes: [
+              {
+                id: "size",
+                values: [
+                  { id: "XSM", displayValue: "XS", selected: true, selectable: true },
+                  { id: "LRG", displayValue: "L", selected: false, selectable: false }
+                ]
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    return new Response(stockHtml(), { status: 200, headers: { "content-type": "text/html" } });
+  };
+
+  try {
+    const snapshot = await fetchStockSnapshot("https://www.chromehearts.com/hoodie/black-hoodie/152701BLKXXX04K.html", {
+      timeoutMs: 1000,
+      probeExactStock: true,
+      exactStockProbeQuantity: 999
+    });
+
+    assert.equal(calls.length, 3);
+    assert.equal(snapshot.exactStockKnown, true);
+    assert.equal(snapshot.totalStock, 7);
+    assert.equal(snapshot.stockSource, "Product-Variation JSON + exact quantity probe");
+    assert.deepEqual(
+      snapshot.sizes.map((size) => [size.code, size.label, size.inStock, size.exactStock]),
+      [
+        ["XSM", "XS", true, 7],
+        ["LRG", "L", false, 0]
+      ]
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("parseProductStockPage creates an OS stock row for one-size products", () => {
   const snapshot = parseProductStockPage(oneSizeHtml(), "https://www.chromehearts.com/hat/trucker-hat/196451DAYOSZ262.html");
 

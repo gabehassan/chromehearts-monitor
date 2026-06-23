@@ -162,10 +162,11 @@ test("buildProductEmbed only shows inventory when exact stock is known", () => {
     exactStockKnown: true,
     totalStock: 7,
     inStockSizeCount: 1,
-    sizes: [{ code: "OSZ", label: "OS", inStock: true }]
+    sizes: [{ code: "OSZ", label: "OS", inStock: true, exactStock: 7 }]
   });
 
   assert.equal(embed.fields.find((field) => field.name === "Exact stock").value, "7 units");
+  assert.equal(embed.fields.find((field) => field.name === "Available sizes").value, "OS (7)");
   assert.equal(embed.description, "Chrome Hearts, product, $100");
 });
 

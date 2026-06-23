@@ -8,6 +8,8 @@ const PRODUCT_VARIATION_BASE_URL = `${BASE_URL}/on/demandware.store/Sites-Chrome
 const DEFAULT_INTERVAL_SECONDS = 10;
 const DEFAULT_TIMEOUT_MS = 12000;
 const DEFAULT_USER_AGENT = "ChromeHeartsMonitor/1.0";
+const DEFAULT_EXACT_STOCK_PROBE_QUANTITY = 999;
+const DEFAULT_EXACT_STOCK_PROBE_CONCURRENCY = 3;
 
 function absoluteUrl(url) {
   if (!url) return "";
@@ -73,6 +75,13 @@ function normalizeVariationUrl(rawUrl, sizeCode) {
       url.searchParams.set(key, sizeCode);
     }
   }
+  return url.toString();
+}
+
+function quantityUrl(rawUrl, quantity) {
+  if (!rawUrl) return "";
+  const url = new URL(absoluteUrl(rawUrl));
+  url.searchParams.set("quantity", String(quantity));
   return url.toString();
 }
 
@@ -228,6 +237,48 @@ function maxOrderQuantityFromProduct(product) {
   );
 }
 
+function parseStockNumber(value) {
+  const number = Number.parseInt(String(value || "").replace(/,/g, ""), 10);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function exactStockFromMessages(messages = []) {
+  const text = messages.join(" ");
+  const patterns = [
+    /([\d,]+)\s*item\s*\(s\)\s*in\s*stock/i,
+    /([\d,]+)\s*items?\s*in\s*stock/i,
+    /only\s*([\d,]+)\s*items?\s*(?:left|available)/i,
+    /([\d,]+)\s*items?\s*(?:left|available)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const stock = parseStockNumber(match?.[1]);
+    if (stock !== null) return stock;
+  }
+
+  return null;
+}
+
+function exactStockFromProduct(product) {
+  const directFields = [
+    product?.ats,
+    product?.stockLevel,
+    product?.inventory,
+    product?.availability?.ats,
+    product?.availability?.stockLevel,
+    product?.availability?.inventory,
+    product?.availability?.quantity
+  ];
+
+  for (const value of directFields) {
+    const stock = parseStockNumber(value);
+    if (stock !== null) return stock;
+  }
+
+  return exactStockFromMessages(product?.availability?.messages || []);
+}
+
 function parseProductVariationJson(body, pageUrl = "") {
   const product = body?.product || {};
   const sizeAttribute = (product.variationAttributes || []).find(
@@ -247,7 +298,7 @@ function parseProductVariationJson(body, pageUrl = "") {
         selected: Boolean(value.selected),
         inStock: Boolean(value.selectable),
         selectable: Boolean(value.selectable),
-        variationUrl: normalizeUrl(value.url) || pageUrl
+        variationUrl: normalizeVariationUrl(value.url, String(value.id)) || pageUrl
       }));
   } else if (selectedVariantPid) {
     const inStock = isVariationInStock(product);
@@ -278,6 +329,80 @@ function parseProductVariationJson(body, pageUrl = "") {
     cappedOrderableTotal: maxOrderQuantity === null ? null : inStockSizeCount * maxOrderQuantity,
     sizes,
     stockSource: "Product-Variation JSON"
+  };
+}
+
+async function mapWithConcurrency(values, concurrency, mapper) {
+  const results = new Array(values.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < values.length) {
+      const currentIndex = index;
+      index += 1;
+      results[currentIndex] = await mapper(values[currentIndex], currentIndex);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, worker));
+  return results;
+}
+
+function exactStockTotal(sizes) {
+  let total = 0;
+  for (const size of sizes) {
+    if (!size.inStock) continue;
+    if (!Number.isFinite(size.exactStock)) return { exactStockKnown: false, totalStock: null };
+    total += size.exactStock;
+  }
+  return { exactStockKnown: true, totalStock: total };
+}
+
+async function probeExactStock(snapshot, options = {}) {
+  const sizes = snapshot.sizes || [];
+  if (!sizes.length) return snapshot;
+
+  const probeQuantity = options.exactStockProbeQuantity || DEFAULT_EXACT_STOCK_PROBE_QUANTITY;
+  const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  const userAgent = options.userAgent || DEFAULT_USER_AGENT;
+  const concurrency = options.exactStockProbeConcurrency || DEFAULT_EXACT_STOCK_PROBE_CONCURRENCY;
+
+  const nextSizes = await mapWithConcurrency(sizes, concurrency, async (size) => {
+    if (!size.inStock) return { ...size, exactStockKnown: true, exactStock: 0 };
+    if (!size.variationUrl) return size;
+
+    try {
+      const response = await fetchWithTimeout(
+        quantityUrl(size.variationUrl, probeQuantity),
+        {
+          headers: {
+            accept: "application/json, text/javascript, */*; q=0.01",
+            "user-agent": userAgent,
+            "x-requested-with": "XMLHttpRequest"
+          },
+          cache: "no-store"
+        },
+        timeoutMs
+      );
+
+      if (!response.ok) return { ...size, exactStockError: `HTTP ${response.status}` };
+      const stock = exactStockFromProduct((await response.json())?.product || {});
+      return stock === null ? size : { ...size, exactStockKnown: true, exactStock: stock };
+    } catch (error) {
+      return { ...size, exactStockError: error.message };
+    }
+  });
+
+  const { exactStockKnown, totalStock } = exactStockTotal(nextSizes);
+  return {
+    ...snapshot,
+    sizes: nextSizes,
+    exactStockKnown,
+    totalStock,
+    stockSource:
+      exactStockKnown && !String(snapshot.stockSource || "").includes("exact quantity probe")
+        ? `${snapshot.stockSource || "PDP HTML"} + exact quantity probe`
+        : snapshot.stockSource
   };
 }
 
@@ -439,6 +564,7 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 async function fetchStockSnapshot(productUrl, options = {}) {
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
   const userAgent = options.userAgent || DEFAULT_USER_AGENT;
+  const shouldProbeExactStock = Boolean(options.probeExactStock);
   const response = await fetchWithTimeout(
     productUrl,
     {
@@ -481,6 +607,11 @@ async function fetchStockSnapshot(productUrl, options = {}) {
       snapshot = { ...snapshot, stockSignalError: error.message };
     }
   }
+
+  if (shouldProbeExactStock) {
+    snapshot = await probeExactStock(snapshot, { ...options, timeoutMs, userAgent });
+  }
+
   return snapshot;
 }
 
@@ -536,6 +667,7 @@ function parseArgs(argv) {
     json: false,
     stateFile: "",
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    probeExactStock: false,
     productUrl: process.env.STOCK_URL || ""
   };
 
@@ -543,6 +675,7 @@ function parseArgs(argv) {
     const value = argv[index];
     if (value === "--once") args.once = true;
     else if (value === "--json") args.json = true;
+    else if (value === "--exact-stock") args.probeExactStock = true;
     else if (value === "--interval") args.intervalSeconds = intOption(argv[++index], "--interval", 1);
     else if (value === "--state-file") args.stateFile = argv[++index] || "";
     else if (value === "--timeout-ms") args.timeoutMs = intOption(argv[++index], "--timeout-ms", 1000);
@@ -555,7 +688,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage: node scripts/stock-watch.js <product-url> [--once] [--interval 10] [--json] [--state-file path]\n\nExamples:\n  npm run stock:once -- "https://www.chromehearts.com/hoodie/black-hoodie/152701BLKXXX04K.html?dwvar_152701BLKXXX04K_size=XSM"\n  npm run stock:watch -- "https://www.chromehearts.com/hoodie/black-hoodie/152701BLKXXX04K.html?dwvar_152701BLKXXX04K_size=XSM" --interval 10`;
+  return `Usage: node scripts/stock-watch.js <product-url> [--once] [--interval 10] [--json] [--exact-stock] [--state-file path]\n\nExamples:\n  npm run stock:once -- "https://www.chromehearts.com/hoodie/black-hoodie/152701BLKXXX04K.html?dwvar_152701BLKXXX04K_size=XSM"\n  npm run stock:watch -- "https://www.chromehearts.com/hoodie/black-hoodie/152701BLKXXX04K.html?dwvar_152701BLKXXX04K_size=XSM" --interval 10`;
 }
 
 async function sleep(ms) {
@@ -572,7 +705,7 @@ async function main(argv = process.argv.slice(2)) {
   let previous = await readPreviousState(args.stateFile);
 
   while (true) {
-    const snapshot = await fetchStockSnapshot(args.productUrl, { timeoutMs: args.timeoutMs });
+    const snapshot = await fetchStockSnapshot(args.productUrl, { timeoutMs: args.timeoutMs, probeExactStock: args.probeExactStock });
     const diff = stockDiff(previous, snapshot);
 
     if (args.json) {

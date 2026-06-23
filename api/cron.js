@@ -87,6 +87,9 @@ function getConfig() {
     maxPages: intEnv("MAX_PAGES", 10, 1),
     minProducts: intEnv("MIN_PRODUCTS", 1, 0),
     stockProductUrl: process.env.STOCK_PRODUCT_URL || "",
+    probeExactStock: boolEnv("PROBE_EXACT_STOCK", true),
+    exactStockProbeQuantity: intEnv("EXACT_STOCK_PROBE_QUANTITY", 999, 1),
+    exactStockProbeConcurrency: intEnv("EXACT_STOCK_PROBE_CONCURRENCY", 3, 1),
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 12000, 1000),
     webhookTimeoutMs: intEnv("WEBHOOK_TIMEOUT_MS", 8000, 1000),
     checkMinIntervalSeconds,
@@ -481,7 +484,11 @@ function isAuthorized(req, cronSecret) {
 function sizeLabels(product, inStock) {
   return (product.sizes || [])
     .filter((size) => size.inStock === inStock)
-    .map((size) => size.label || size.code)
+    .map((size) => {
+      const label = size.label || size.code;
+      if (inStock && Number.isFinite(size.exactStock)) return `${label} (${size.exactStock})`;
+      return label;
+    })
     .filter(Boolean);
 }
 
@@ -544,7 +551,10 @@ async function enrichProduct(product, cfg, deps = { fetchStockSnapshot }) {
   try {
     const detail = await deps.fetchStockSnapshot(product.url, {
       timeoutMs: cfg.requestTimeoutMs,
-      userAgent: cfg.userAgent
+      userAgent: cfg.userAgent,
+      probeExactStock: cfg.probeExactStock,
+      exactStockProbeQuantity: cfg.exactStockProbeQuantity,
+      exactStockProbeConcurrency: cfg.exactStockProbeConcurrency
     });
     return mergeProductDetail(product, detail);
   } catch (error) {
@@ -793,7 +803,10 @@ async function runMonitor(
       try {
         stockSnapshot = await services.fetchStockSnapshot(cfg.stockProductUrl, {
           timeoutMs: cfg.requestTimeoutMs,
-          userAgent: cfg.userAgent
+          userAgent: cfg.userAgent,
+          probeExactStock: cfg.probeExactStock,
+          exactStockProbeQuantity: cfg.exactStockProbeQuantity,
+          exactStockProbeConcurrency: cfg.exactStockProbeConcurrency
         });
         stockDelta = services.stockDiff(state.stockSnapshot || null, stockSnapshot);
       } catch (error) {
