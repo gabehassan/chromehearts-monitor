@@ -350,6 +350,56 @@ test("Cloudflare Worker defers excess new products without marking them seen", a
   });
 });
 
+test("Cloudflare Worker never re-alerts a same PID that was seen before and later relisted", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const relistedProduct = productTile("OLD_RELIST", "OLD RELISTED ITEM", "shop", "Shop", "300.00");
+  const kv = fakeKV(
+    stateWithSeen([
+      { pid: "OLD_SHOP", name: "OLD SHOP ITEM" },
+      { pid: "OLD_RELIST", name: "OLD RELISTED ITEM" }
+    ])
+  );
+
+  const firstMock = createChromeHeartsFetch({ root: oldProduct });
+  await withMockedFetch(firstMock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false"
+        },
+        kv
+      )
+    );
+
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.equal(result.alerted, 0);
+    assert.ok(state.seen.OLD_RELIST);
+    assert.equal(firstMock.discordPayloads.length, 0);
+  });
+
+  kv.values.delete(LOCK_KEY);
+
+  const secondMock = createChromeHeartsFetch({ root: `${oldProduct}${relistedProduct}` });
+  await withMockedFetch(secondMock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 0);
+    assert.deepEqual(result.newPids, []);
+    assert.equal(secondMock.discordPayloads.length, 0);
+  });
+});
+
 test("Worker dashboard and health pages are private", async () => {
   const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
   const testEnv = env({}, kv);

@@ -1033,18 +1033,20 @@ async function sendDiscord(cfg, products) {
 }
 
 function buildSeen(products, previousSeen, deferredPids) {
-  const seen = {};
+  const seen = { ...(previousSeen || {}) };
   const now = nowIso();
   for (const [pid, product] of Object.entries(products)) {
     if (deferredPids.has(pid)) continue;
     seen[pid] = {
+      ...seen[pid],
       pid,
       name: product.name,
       price: product.price,
       category: product.category,
       url: product.url,
       image: product.image,
-      firstSeenAt: previousSeen[pid]?.firstSeenAt || now
+      firstSeenAt: seen[pid]?.firstSeenAt || now,
+      lastSeenAt: now
     };
   }
   return seen;
@@ -1091,7 +1093,7 @@ async function runMonitor(env, cfg = getConfig(env)) {
 
     await saveState(env, cfg, {
       ...state,
-      seen: baseline ? buildSeen(products, {}, new Set()) : buildSeen(products, state.seen, deferredPids),
+      seen: buildSeen(products, state.seen, baseline ? new Set() : deferredPids),
       lastRunAt: nowIso(),
       lastResult: result,
       errorStreak: 0,
