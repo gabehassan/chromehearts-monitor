@@ -23,34 +23,22 @@ const RESERVED_CATEGORY_IDS = new Set([
   "wishlist"
 ]);
 const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
+  "scents",
+  "baccarat",
+  "intimates",
+  "socks",
+  "boxers-leggings",
+  "underwear",
+  // Eyewear
   "eyewear",
   "sunglasses",
   "glasses",
   "eyeglasses",
   "optical",
   "frames",
-  "hat",
-  "hats",
-  "cap",
-  "caps",
-  "trucker",
-  "hoodie",
-  "hoodies",
-  "sweatshirt",
-  "sweatshirts",
-  "sweatpants",
-  "t-shirt",
-  "t-shirts",
-  "shirt",
-  "shirts",
-  "long-sleeve",
-  "long-sleeves",
-  "short-sleeve",
-  "short-sleeves",
-  "denim",
-  "jeans",
-  "pants",
-  "shorts",
+  "readers",
+  "eyewear-accessories",
+  // Jewelry
   "jewelry",
   "ring",
   "rings",
@@ -62,35 +50,203 @@ const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
   "earrings",
   "pendant",
   "pendants",
+  "chain",
+  "chains",
+  "charm",
+  "charms",
+  "cuff",
+  "cuffs",
+  "dagger",
+  "cross",
+  "band",
+  "bands",
+  "wedding-bands",
+  "silver",
+  "gold",
+  "22k-gold",
+  "cemetery",
+  "keeper",
+  // Headwear
+  "hat",
+  "hats",
+  "cap",
+  "caps",
+  "trucker",
+  "trucker-hat",
+  "trucker-hats",
+  "beanie",
+  "beanies",
+  "bucket",
+  "bucket-hat",
+  "snapback",
+  "baseball-cap",
+  "fitted",
+  "visor",
+  // Tops
+  "hoodie",
+  "hoodies",
+  "sweatshirt",
+  "sweatshirts",
+  "hoodies-sweatshirts",
+  "sweatpants",
+  "t-shirt",
+  "t-shirts",
+  "tee",
+  "tees",
+  "shirt",
+  "shirts",
+  "long-sleeve",
+  "long-sleeves",
+  "short-sleeve",
+  "short-sleeves",
+  "tank",
+  "tanks",
+  "polo",
+  "polos",
+  "crewneck",
+  "thermal",
+  "jersey",
+  "sweater",
+  "sweaters",
+  "knit",
+  "knitwear",
+  "cardigan",
+  "flannel",
+  // Bottoms
+  "denim",
+  "jeans",
+  "pants",
+  "trousers",
+  "shorts",
+  "sweatshorts",
+  "leggings",
+  // Outerwear
+  "jacket",
+  "jackets",
+  "outerwear",
+  "coat",
+  "coats",
+  "vest",
+  "vests",
+  "fur",
+  "leather-jacket",
+  // Full looks
+  "dress",
+  "dresses",
+  "skirt",
+  "skirts",
+  "jumpsuit",
+  "overalls",
+  "matty-boy",
+  "made-in-hollywood",
+  // Accessories
+  "accessories",
   "wallet",
   "wallets",
-  "leather",
-  "bag",
-  "bags",
   "belt",
   "belts",
+  "bag",
+  "bags",
+  "backpack",
+  "backpacks",
+  "tote",
+  "totes",
+  "pouch",
+  "pouches",
+  "keychain",
+  "keychains",
   "scarf",
   "scarves",
-  "socks",
-  "underwear",
-  "intimates",
-  "boxers-leggings",
-  "baccarat",
-  "scents",
+  "gloves",
+  "tie",
+  "ties",
+  "leather",
+  "leather-goods",
+  "phone-case",
+  "phone-cases",
+  "cases",
+  "patches",
+  "pins",
+  "stickers",
+  "playing-cards",
+  "cards",
+  "lighter",
+  "lighters",
+  "zippo",
+  "ashtray",
+  "ashtrays",
+  "flask",
+  "flasks",
+  "money-clip",
+  "cigarette-case",
+  // Footwear
+  "footwear",
+  "shoes",
+  "sneakers",
+  "boots",
+  "sandals",
+  "slides",
+  "slippers",
+  // Underwear / intimates
+  "boxers",
+  "bra",
+  "bras",
+  "briefs",
+  "lingerie",
+  // Home
   "home",
-  "accessories",
-  "silver"
+  "furniture",
+  "homeware",
+  "candles",
+  "candle",
+  "blanket",
+  "blankets",
+  "pillow",
+  "pillows",
+  "towel",
+  "towels",
+  "rug",
+  "rugs",
+  "mug",
+  "mugs",
+  "glassware",
+  "plates",
+  "decor",
+  // Fragrance
+  "fragrance",
+  "fragrances",
+  "scent",
+  "perfume",
+  "cologne",
+  "parfum",
+  // Merch / collabs / drop landings
+  "collections",
+  "collabs",
+  "limited",
+  "exclusive",
+  "online-exclusive",
+  "new",
+  "new-arrivals",
+  "just-dropped",
+  "drops",
+  "featured",
+  "gifts",
+  "mens",
+  "womens",
+  "kids",
+  "clothing",
+  "apparel"
 ];
 const INT_SETTING_LIMITS = {
-  categoryFetchConcurrency: [1, 10],
+  categoryFetchConcurrency: [1, 24],
   checkMinIntervalSeconds: [0, 3600],
   maxAlertsPerRun: [1, 10],
-  maxCategoryIds: [1, 50],
+  maxCategoryIds: [1, 400],
   maxCategoryPages: [1, 5],
   maxDirectProductUrls: [0, 50],
-  maxStorefrontSubrequests: [10, 50],
+  maxStorefrontSubrequests: [10, 400],
   maxPages: [1, 20],
-  prospectiveCategoryShardSize: [1, 50],
+  prospectiveCategoryShardSize: [1, 400],
   relistAfterAbsentRuns: [1, 12]
 };
 const BOOL_SETTING_KEYS = [
@@ -146,11 +302,12 @@ function getConfig(env) {
     pageSize: intSetting(env, "PAGE_SIZE", 200, 1),
     maxPages: intSetting(env, "MAX_PAGES", 10, 1),
     maxCategoryPages: intSetting(env, "MAX_CATEGORY_PAGES", 2, 1),
-    maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 40, 1),
-    categoryFetchConcurrency: intSetting(env, "CATEGORY_FETCH_CONCURRENCY", 8, 1),
+    maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 250, 1),
+    categoryFetchConcurrency: intSetting(env, "CATEGORY_FETCH_CONCURRENCY", 14, 1),
     maxDirectProductUrls: intSetting(env, "MAX_DIRECT_PRODUCT_URLS", 5, 0),
-    maxStorefrontSubrequests: intSetting(env, "MAX_STOREFRONT_SUBREQUESTS", 38, 10),
-    prospectiveCategoryShardSize: intSetting(env, "PROSPECTIVE_CATEGORY_SHARD_SIZE", 24, 1),
+    maxStorefrontSubrequests: intSetting(env, "MAX_STOREFRONT_SUBREQUESTS", 260, 10),
+    scanAllCategoriesOnFullSweep: boolSetting(env, "SCAN_ALL_CATEGORIES_ON_FULL_SWEEP", true),
+    prospectiveCategoryShardSize: intSetting(env, "PROSPECTIVE_CATEGORY_SHARD_SIZE", 60, 1),
     minProducts: intSetting(env, "MIN_PRODUCTS", 1, 0),
     maxAlertsPerRun: intSetting(env, "MAX_ALERTS_PER_RUN", 5, 1),
     relistAfterAbsentRuns: intSetting(env, "RELIST_AFTER_ABSENT_RUNS", 2, 1),
@@ -182,7 +339,11 @@ function getConfig(env) {
     fastPollEnabled: boolSetting(env, "FAST_POLL_ENABLED", true),
     fastPollIntervalSeconds: intSetting(env, "FAST_POLL_INTERVAL_SECONDS", 15, 5),
     fullSweepEveryTicks: intSetting(env, "FULL_SWEEP_EVERY_TICKS", 4, 1),
-    fastCategoryShardSize: intSetting(env, "FAST_CATEGORY_SHARD_SIZE", 6, 0),
+    fastCategoryShardSize: intSetting(env, "FAST_CATEGORY_SHARD_SIZE", 40, 0),
+    fastMaxCategories: intSetting(env, "FAST_MAX_CATEGORIES", 45, 2),
+    // Structured run logging for debugging + data collection.
+    logBufferSize: intSetting(env, "LOG_BUFFER_SIZE", 200, 0),
+    logVerbose: boolSetting(env, "LOG_VERBOSE", true),
     userAgent: env.MONITOR_USER_AGENT || DEFAULT_USER_AGENT
   };
 }
@@ -590,7 +751,10 @@ async function productDiscoverySignals(cfg, state = {}) {
   const maxCategoryFetches = Math.max(2, cfg.maxStorefrontSubrequests - reserve - cfg.maxDirectProductUrls);
   const categoryLimit = Math.min(cfg.maxCategoryIds, maxCategoryFetches);
   const prospectiveCursor = finiteInteger(state.prospectiveCategoryCursor, 0);
-  const prospectiveLimit = Math.max(0, Math.min(cfg.prospectiveCategoryShardSize, categoryLimit - baseCategoryIds.length));
+  const prospectiveRoom = Math.max(0, categoryLimit - baseCategoryIds.length);
+  const prospectiveLimit = cfg.scanAllCategoriesOnFullSweep
+    ? prospectiveRoom
+    : Math.max(0, Math.min(cfg.prospectiveCategoryShardSize, prospectiveRoom));
   const prospectiveCategoryIds = rotatingSlice(cfg.prospectiveCategoryIds, prospectiveCursor, prospectiveLimit);
   const categoryIds = uniqueValues([...baseCategoryIds, ...prospectiveCategoryIds]).slice(0, categoryLimit);
   const productUrlLimit = Math.max(0, Math.min(cfg.maxDirectProductUrls, cfg.maxStorefrontSubrequests - reserve - categoryIds.length));
@@ -627,9 +791,7 @@ async function fetchProductsForCategory(cgid, cfg, maxPages) {
     }
 
     if (pagePids.length < cfg.pageSize) break;
-    if (newOnPage === 0) {
-      throw new MonitorError(`Pagination did not advance for cgid=${cgid} start=${start}; refusing duplicate full page.`);
-    }
+    if (newOnPage === 0) break;
   }
   return allProducts;
 }
@@ -661,7 +823,7 @@ async function fetchProducts(cfg, state = {}) {
   cfg.discoveryRun = {
     categoryCount: discovery.categoryIds.length,
     directProductUrlCount: discovery.productUrls.length,
-    prospectiveCategoryIds: discovery.prospectiveCategoryIds,
+    prospectiveCategoryCount: discovery.prospectiveCategoryIds.length,
     prospectiveCategoryCursor: discovery.prospectiveCategoryCursor,
     nextProspectiveCategoryCursor: discovery.nextProspectiveCategoryCursor,
     plannedStorefrontSubrequests: discovery.plannedStorefrontSubrequests,
@@ -669,6 +831,8 @@ async function fetchProducts(cfg, state = {}) {
   };
   const queuedCategoryIds = [...discovery.categoryIds];
   const visitedCategoryIds = new Set();
+  const activeCategoryIds = new Set(); // cgids that returned >=1 product this sweep
+  const failedCategoryIds = [];
 
   while (queuedCategoryIds.length && visitedCategoryIds.size < cfg.maxCategoryIds) {
     const batch = [];
@@ -682,10 +846,17 @@ async function fetchProducts(cfg, state = {}) {
     for (const cgid of batch) visitedCategoryIds.add(cgid);
     const results = await mapWithConcurrency(batch, cfg.categoryFetchConcurrency, async (cgid) => {
       const maxPages = cgid === "root" || cgid === "shop" ? cfg.maxPages : cfg.maxCategoryPages;
-      return { cgid, products: await fetchProductsForCategory(cgid, cfg, maxPages) };
+      try {
+        return { cgid, products: await fetchProductsForCategory(cgid, cfg, maxPages) };
+      } catch (error) {
+        return { cgid, products: {}, error: error.message };
+      }
     });
 
-    for (const { products } of results) {
+    for (const { cgid, products, error } of results) {
+      if (error) failedCategoryIds.push(cgid);
+      const pids = Object.keys(products);
+      if (pids.length) activeCategoryIds.add(cgid);
       for (const [pid, product] of Object.entries(products)) {
         allProducts[pid] = product;
       }
@@ -705,6 +876,13 @@ async function fetchProducts(cfg, state = {}) {
     const product = await fetchDirectProduct(productUrl, cfg);
     if (product) allProducts[product.pid] = product;
   }
+
+  cfg.sweepStats = {
+    categoriesScanned: visitedCategoryIds.size,
+    activeCategoryIds: [...activeCategoryIds],
+    failedCategoryIds,
+    failedCategoryCount: failedCategoryIds.length
+  };
 
   const count = Object.keys(allProducts).length;
   if (count < cfg.minProducts) {
@@ -733,8 +911,12 @@ async function fetchGridHtmlSafe(cgid, cfg) {
 
 async function fastFetchProducts(cfg, state, fastCursor = 0) {
   const pool = uniqueValues([...cfg.extraCategoryIds, ...cfg.prospectiveCategoryIds]);
-  const shard = rotatingSlice(pool, fastCursor, cfg.fastCategoryShardSize);
-  const cgids = uniqueValues(["root", "shop", ...shard]);
+  const activeCategoryIds = Array.isArray(state.activeCategoryIds) ? state.activeCategoryIds : [];
+  const cap = Math.max(2, cfg.fastMaxCategories);
+  const head = uniqueValues(["root", "shop", ...activeCategoryIds]).slice(0, cap);
+  const shardRoom = Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
+  const shard = rotatingSlice(pool, fastCursor, shardRoom);
+  const cgids = uniqueValues([...head, ...shard]);
   const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
   const combinedHtml = htmls.join("\n");
   const pidUniverse = extractGridPids(combinedHtml);
@@ -749,8 +931,9 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
   const nextFastCursor = pool.length ? (fastCursor + shard.length) % pool.length : 0;
   const meta = {
     mode: "fast",
-    cgids,
     cgidCount: cgids.length,
+    activeCategoryCount: activeCategoryIds.length,
+    shardSize: shard.length,
     fetched: htmls.filter(Boolean).length,
     pidUniverse: pidUniverse.size,
     candidates: candidatePids.length,
@@ -1516,26 +1699,60 @@ function buildCatalogState(products, state, deferredPids, cfg, { partial = false
   return { seen, active, missing };
 }
 
+function logRun(cfg, entry) {
+  if (!cfg || cfg.logVerbose === false) return;
+  try {
+    console.log(`chmon ${JSON.stringify(entry)}`);
+  } catch {
+    // never let logging break a run
+  }
+}
+
+function runLogEntry(mode, result, ms, cfg) {
+  const sweep = cfg?.sweepStats || null;
+  return {
+    at: nowIso(),
+    mode,
+    ms,
+    ok: result.ok !== false,
+    reason: result.reason || null,
+    productCount: result.productCount ?? null,
+    alerted: result.alerted ?? 0,
+    deferred: result.deferred ?? 0,
+    newPids: result.newPids || [],
+    categoriesScanned: sweep?.categoriesScanned ?? result.fast?.cgidCount ?? null,
+    activeCategories: sweep ? sweep.activeCategoryIds?.length ?? null : result.fast?.activeCategoryCount ?? null,
+    failedCategories: sweep?.failedCategoryCount ?? 0,
+    error: result.error || null
+  };
+}
+
 async function runMonitor(env, cfg = null, opts = {}) {
   if (!cfg) cfg = await getRuntimeConfig(env);
   const mode = opts.mode === "fast" ? "fast" : "full";
   const skipLock = opts.skipLock === true;
   const fastCursor = mode === "fast" ? finiteInteger(opts.fastCursor, 0) : 0;
+  const startedAt = Date.now();
+  cfg.sweepStats = null;
+  const done = (result) => {
+    logRun(cfg, runLogEntry(mode, result, Date.now() - startedAt, cfg));
+    return result;
+  };
 
   let lockToken = null;
   if (!skipLock) {
     const lockTtl = mode === "fast" ? Math.max(10, cfg.fastPollIntervalSeconds + 10) : cfg.lockSeconds;
     lockToken = await acquireLock(env, cfg, lockTtl);
-    if (!lockToken) return { ok: true, skipped: true, reason: "locked", mode, storage: "cloudflare-kv" };
+    if (!lockToken) return done({ ok: true, skipped: true, reason: "locked", mode, storage: "cloudflare-kv" });
   }
 
   let state = await loadState(env, cfg);
   try {
     if (state.backoffUntil && Date.parse(state.backoffUntil) > Date.now()) {
-      return { ok: true, skipped: true, reason: "backoff", mode, backoffUntil: state.backoffUntil, storage: "cloudflare-kv" };
+      return done({ ok: true, skipped: true, reason: "backoff", mode, backoffUntil: state.backoffUntil, storage: "cloudflare-kv" });
     }
     if (!skipLock && mode === "full" && shouldSkipForInterval(state, cfg)) {
-      return { ok: true, skipped: true, reason: "interval", mode, lastRunAt: state.lastRunAt, storage: "cloudflare-kv" };
+      return done({ ok: true, skipped: true, reason: "interval", mode, lastRunAt: state.lastRunAt, storage: "cloudflare-kv" });
     }
 
     const previousSeen = state.seen || {};
@@ -1548,7 +1765,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
     let fastMeta = null;
     if (mode === "fast") {
       if (firstRun) {
-        return { ok: true, skipped: true, reason: "awaiting-baseline", mode, nextFastCursor: fastCursor, storage: "cloudflare-kv" };
+        return done({ ok: true, skipped: true, reason: "awaiting-baseline", mode, nextFastCursor: fastCursor, storage: "cloudflare-kv" });
       }
       const fast = await fastFetchProducts(cfg, state, fastCursor);
       products = fast.products;
@@ -1556,7 +1773,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
       fastMeta = fast.meta;
 
       if (fast.empty) {
-        return {
+        return done({
           ok: true,
           mode,
           alerted: 0,
@@ -1567,7 +1784,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
           nextFastCursor,
           storage: "cloudflare-kv",
           checkedAt: nowIso()
-        };
+        });
       }
     } else {
       products = await fetchProducts(cfg, state);
@@ -1581,13 +1798,17 @@ async function runMonitor(env, cfg = null, opts = {}) {
     const productsToAlert = candidates.slice(0, cfg.maxAlertsPerRun);
     const deferredProducts = candidates.slice(cfg.maxAlertsPerRun);
     const deferredPids = new Set(deferredProducts.map((product) => product.pid));
-    const enriched = [];
 
-    for (const product of productsToAlert) {
-      enriched.push(await enrichProduct(product, cfg));
-    }
+    const enriched = productsToAlert.length
+      ? await mapWithConcurrency(
+          productsToAlert,
+          Math.min(cfg.maxAlertsPerRun, cfg.exactStockProbeConcurrency > 1 ? 5 : 3),
+          (product) => enrichProduct(product, cfg)
+        )
+      : [];
     if (enriched.length) await sendDiscord(cfg, enriched);
 
+    const sweep = cfg.sweepStats || null;
     const result = {
       ok: true,
       mode,
@@ -1597,15 +1818,19 @@ async function runMonitor(env, cfg = null, opts = {}) {
       deferred: deferredProducts.length,
       newPids: productsToAlert.map((product) => product.pid),
       discovery: mode === "full" ? cfg.discoveryRun || null : null,
+      sweep,
       fast: fastMeta,
       nextFastCursor,
       storage: "cloudflare-kv",
       checkedAt: nowIso()
     };
 
+    const degraded = mode === "full" && (sweep?.failedCategoryCount || 0) > 5;
     const nextState = {
       ...state,
-      ...buildCatalogState(products, state, baseline ? new Set() : deferredPids, cfg, { partial: mode === "fast" }),
+      ...buildCatalogState(products, state, baseline ? new Set() : deferredPids, cfg, {
+        partial: mode === "fast" || degraded
+      }),
       lastRunAt: nowIso(),
       lastResult: result,
       errorStreak: 0,
@@ -1616,10 +1841,11 @@ async function runMonitor(env, cfg = null, opts = {}) {
     if (mode === "full") {
       nextState.prospectiveCategoryCursor =
         cfg.discoveryRun?.nextProspectiveCategoryCursor ?? state.prospectiveCategoryCursor ?? 0;
+      if (sweep && !degraded) nextState.activeCategoryIds = sweep.activeCategoryIds;
     }
     await saveState(env, cfg, nextState);
 
-    return result;
+    return done(result);
   } catch (error) {
     const backoff = computeBackoffUntil(state, cfg);
     await saveState(env, cfg, {
@@ -1629,6 +1855,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
       lastErrorAt: nowIso(),
       lastResult: { ok: false, mode, error: error.message, checkedAt: nowIso() }
     }).catch(() => {});
+    logRun(cfg, runLogEntry(mode, { ok: false, error: error.message }, Date.now() - startedAt, cfg));
     throw error;
   } finally {
     await releaseLock(env, cfg, lockToken);
@@ -1787,11 +2014,11 @@ function dashboard(state, cfg, settings = {}, saved = false) {
           </div>
           <div class="field">
             <label for="maxCategoryIds">Max categories</label>
-            <input id="maxCategoryIds" name="maxCategoryIds" type="number" min="1" max="50" value="${escapeHtml(cfg.maxCategoryIds)}">
+            <input id="maxCategoryIds" name="maxCategoryIds" type="number" min="1" max="400" value="${escapeHtml(cfg.maxCategoryIds)}">
           </div>
           <div class="field">
             <label for="categoryFetchConcurrency">Grid concurrency</label>
-            <input id="categoryFetchConcurrency" name="categoryFetchConcurrency" type="number" min="1" max="10" value="${escapeHtml(cfg.categoryFetchConcurrency)}">
+            <input id="categoryFetchConcurrency" name="categoryFetchConcurrency" type="number" min="1" max="24" value="${escapeHtml(cfg.categoryFetchConcurrency)}">
           </div>
           <div class="field">
             <label for="maxCategoryPages">Pages per category</label>
@@ -1799,7 +2026,7 @@ function dashboard(state, cfg, settings = {}, saved = false) {
           </div>
           <div class="field">
             <label for="prospectiveCategoryShardSize">Hidden category shard</label>
-            <input id="prospectiveCategoryShardSize" name="prospectiveCategoryShardSize" type="number" min="1" max="50" value="${escapeHtml(cfg.prospectiveCategoryShardSize)}">
+            <input id="prospectiveCategoryShardSize" name="prospectiveCategoryShardSize" type="number" min="1" max="400" value="${escapeHtml(cfg.prospectiveCategoryShardSize)}">
           </div>
           <div class="field">
             <label for="maxDirectProductUrls">Direct product URLs</label>
@@ -1807,7 +2034,7 @@ function dashboard(state, cfg, settings = {}, saved = false) {
           </div>
           <div class="field">
             <label for="maxStorefrontSubrequests">Storefront fetch budget</label>
-            <input id="maxStorefrontSubrequests" name="maxStorefrontSubrequests" type="number" min="10" max="50" value="${escapeHtml(cfg.maxStorefrontSubrequests)}">
+            <input id="maxStorefrontSubrequests" name="maxStorefrontSubrequests" type="number" min="10" max="400" value="${escapeHtml(cfg.maxStorefrontSubrequests)}">
           </div>
           <div class="field">
             <label for="maxPages">Root pages</label>
@@ -1893,11 +2120,14 @@ async function handleFetch(request, env) {
       seen: Object.keys(state.seen || {}).length,
       active: Object.keys(state.active || state.seen || {}).length,
       missing: Object.keys(state.missing || {}).length,
+      universeSize: cfg.prospectiveCategoryIds.length,
+      activeCategories: Array.isArray(state.activeCategoryIds) ? state.activeCategoryIds : [],
       fastPoll: {
         enabled: cfg.fastPollEnabled,
         intervalSeconds: cfg.fastPollIntervalSeconds,
         fullSweepEveryTicks: cfg.fullSweepEveryTicks,
         fastCategoryShardSize: cfg.fastCategoryShardSize,
+        scanAllOnFullSweep: cfg.scanAllCategoriesOnFullSweep,
         controller: await fastPollStatus(env)
       },
       settings: {
@@ -1905,9 +2135,9 @@ async function handleFetch(request, env) {
         checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
         categoryFetchConcurrency: cfg.categoryFetchConcurrency,
         maxAlertsPerRun: cfg.maxAlertsPerRun,
+        maxCategoryIds: cfg.maxCategoryIds,
         maxStorefrontSubrequests: cfg.maxStorefrontSubrequests,
         extraCategoryIds: cfg.extraCategoryIds,
-        prospectiveCategoryIds: cfg.prospectiveCategoryIds,
         prospectiveCategoryShardSize: cfg.prospectiveCategoryShardSize,
         extraProductUrls: cfg.extraProductUrls,
         maxDirectProductUrls: cfg.maxDirectProductUrls
@@ -1915,6 +2145,14 @@ async function handleFetch(request, env) {
       lastRunAt: state.lastRunAt || null,
       lastResult: state.lastResult || null
     });
+  }
+  if (url.pathname === "/logs") {
+    if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
+    const stub = monitorStub(env);
+    if (!stub) return jsonResponse({ ok: false, error: "MONITOR Durable Object binding is not configured." }, 501);
+    const limit = Math.min(500, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100));
+    const doResponse = await stub.fetch(`https://monitor.internal/logs?limit=${limit}`);
+    return jsonResponse({ ok: true, ...(await doResponse.json()) });
   }
   if (url.pathname === "/do") {
     if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
@@ -1991,19 +2229,36 @@ class MonitorController {
 
   async status() {
     const alarm = await this.state.storage.getAlarm();
+    const logs = (await this.state.storage.get("logs")) || [];
     return {
       tick: Number(await this.state.storage.get("tick")) || 0,
       lastTickAt: (await this.state.storage.get("lastTickAt")) || null,
       nextAlarm: alarm ? new Date(alarm).toISOString() : null,
       fastCursor: Number(await this.state.storage.get("fastCursor")) || 0,
+      logCount: logs.length,
       lastResult: (await this.state.storage.get("lastResult")) || null
     };
+  }
+
+  async logs(limit = 100) {
+    const logs = (await this.state.storage.get("logs")) || [];
+    return { count: logs.length, runs: logs.slice(-limit).reverse() };
+  }
+
+  async record(entry, bufferSize) {
+    const logs = (await this.state.storage.get("logs")) || [];
+    logs.push(entry);
+    const cap = Math.max(0, bufferSize || 0);
+    await this.state.storage.put("logs", cap ? logs.slice(-cap) : []);
   }
 
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/ensure" || url.pathname === "/start") return Response.json(await this.ensure());
     if (url.pathname === "/status") return Response.json(await this.status());
+    if (url.pathname === "/logs") {
+      return Response.json(await this.logs(Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100));
+    }
     if (url.pathname === "/stop") {
       await this.state.storage.deleteAlarm().catch(() => {});
       return Response.json({ armed: false, stopped: true });
@@ -2023,6 +2278,7 @@ class MonitorController {
     const tick = (Number(await this.state.storage.get("tick")) || 0) + 1;
     const everyTicks = Math.max(1, cfg.fullSweepEveryTicks);
     const mode = tick % everyTicks === 0 ? "full" : "fast";
+    const startedAt = Date.now();
 
     let result;
     try {
@@ -2038,6 +2294,24 @@ class MonitorController {
     await this.state.storage.put("tick", tick);
     await this.state.storage.put("lastTickAt", nowIso());
     await this.state.storage.put("lastResult", result);
+    // Ring buffer of recent ticks for the /logs endpoint.
+    await this.record(
+      {
+        at: nowIso(),
+        tick,
+        mode: result.mode || mode,
+        ms: Date.now() - startedAt,
+        ok: result.ok !== false,
+        reason: result.reason || null,
+        productCount: result.productCount ?? null,
+        alerted: result.alerted ?? 0,
+        newPids: result.newPids || [],
+        activeCategories: result.sweep?.activeCategoryIds?.length ?? result.fast?.activeCategoryCount ?? null,
+        failedCategories: result.sweep?.failedCategoryCount ?? 0,
+        error: result.error || null
+      },
+      cfg.logBufferSize
+    );
 
     const base = Math.max(5, cfg.fastPollIntervalSeconds) * 1000;
     const jitter = Math.floor(Math.random() * 2500);

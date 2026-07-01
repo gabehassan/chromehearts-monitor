@@ -366,6 +366,7 @@ test("Cloudflare Worker rotates through prospective category shards", async () =
     DISCOVER_PRODUCT_URL_CATEGORIES: "false",
     DISCOVER_ROBOTS_PRODUCTS: "false",
     DISCOVER_SITEMAP_CATEGORIES: "false",
+    SCAN_ALL_CATEGORIES_ON_FULL_SWEEP: "false",
     MAX_CATEGORY_IDS: "5",
     MAX_DIRECT_PRODUCT_URLS: "0",
     MAX_STOREFRONT_SUBREQUESTS: "10",
@@ -393,6 +394,40 @@ test("Cloudflare Worker rotates through prospective category shards", async () =
     assert.equal(result.alerted, 1);
     assert.deepEqual(result.newPids, ["LATE_HIDDEN"]);
     assert.ok(secondMock.gridCategoryCalls.includes("hidden-three"));
+  });
+});
+
+test("Full sweep scans the entire prospective universe in one run (no rotation wait)", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const stealth = productTile("STEALTH_DROP", "STEALTH DROP", "eyewear", "Eyewear", "1200.00");
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({
+    root: oldProduct,
+    categories: { "cat-49": stealth },
+    productDetails: { STEALTH_DROP: { name: "STEALTH DROP", categoryName: "Eyewear", price: "1200.00" } }
+  });
+  const universe = Array.from({ length: 50 }, (_, i) => `cat-${i}`).join(",");
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          PROSPECTIVE_CATEGORY_IDS: universe,
+          MAX_CATEGORY_IDS: "80",
+          MAX_STOREFRONT_SUBREQUESTS: "90"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["STEALTH_DROP"]);
+    assert.ok(mock.gridCategoryCalls.includes("cat-49"), "scan-all must reach the deepest category in one run");
+    assert.ok(result.sweep, "full sweep exposes sweep telemetry");
+    assert.ok(result.sweep.activeCategoryIds.includes("cat-49"));
   });
 });
 
