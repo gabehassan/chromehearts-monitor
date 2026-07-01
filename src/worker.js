@@ -26,11 +26,58 @@ const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
   "glasses",
   "eyeglasses",
   "optical",
+  "frames",
   "hat",
+  "hats",
+  "cap",
+  "caps",
+  "trucker",
   "hoodie",
+  "hoodies",
+  "sweatshirt",
+  "sweatshirts",
+  "sweatpants",
   "t-shirt",
+  "t-shirts",
   "shirt",
-  "jewelry"
+  "shirts",
+  "long-sleeve",
+  "long-sleeves",
+  "short-sleeve",
+  "short-sleeves",
+  "denim",
+  "jeans",
+  "pants",
+  "shorts",
+  "jewelry",
+  "ring",
+  "rings",
+  "necklace",
+  "necklaces",
+  "bracelet",
+  "bracelets",
+  "earring",
+  "earrings",
+  "pendant",
+  "pendants",
+  "wallet",
+  "wallets",
+  "leather",
+  "bag",
+  "bags",
+  "belt",
+  "belts",
+  "scarf",
+  "scarves",
+  "socks",
+  "underwear",
+  "intimates",
+  "boxers-leggings",
+  "baccarat",
+  "scents",
+  "home",
+  "accessories",
+  "silver"
 ];
 const INT_SETTING_LIMITS = {
   categoryFetchConcurrency: [1, 10],
@@ -39,7 +86,9 @@ const INT_SETTING_LIMITS = {
   maxCategoryIds: [1, 50],
   maxCategoryPages: [1, 5],
   maxDirectProductUrls: [0, 50],
+  maxStorefrontSubrequests: [10, 50],
   maxPages: [1, 20],
+  prospectiveCategoryShardSize: [1, 50],
   relistAfterAbsentRuns: [1, 12]
 };
 const BOOL_SETTING_KEYS = [
@@ -83,7 +132,7 @@ function getConfig(env) {
   if (!env.STATE) throw new MonitorError("Missing STATE KV binding.");
   if (!env.DISCORD_WEBHOOK_URL) throw new MonitorError("Missing DISCORD_WEBHOOK_URL secret.");
 
-  const checkMinIntervalSeconds = intSetting(env, "CHECK_MIN_INTERVAL_SECONDS", 240, 0);
+  const checkMinIntervalSeconds = intSetting(env, "CHECK_MIN_INTERVAL_SECONDS", 50, 0);
   return {
     stateKey: env.STATE_KEY || DEFAULT_STATE_KEY,
     lockKey: env.LOCK_KEY || DEFAULT_LOCK_KEY,
@@ -95,9 +144,11 @@ function getConfig(env) {
     pageSize: intSetting(env, "PAGE_SIZE", 200, 1),
     maxPages: intSetting(env, "MAX_PAGES", 10, 1),
     maxCategoryPages: intSetting(env, "MAX_CATEGORY_PAGES", 2, 1),
-    maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 30, 1),
-    categoryFetchConcurrency: intSetting(env, "CATEGORY_FETCH_CONCURRENCY", 5, 1),
-    maxDirectProductUrls: intSetting(env, "MAX_DIRECT_PRODUCT_URLS", 10, 0),
+    maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 40, 1),
+    categoryFetchConcurrency: intSetting(env, "CATEGORY_FETCH_CONCURRENCY", 8, 1),
+    maxDirectProductUrls: intSetting(env, "MAX_DIRECT_PRODUCT_URLS", 5, 0),
+    maxStorefrontSubrequests: intSetting(env, "MAX_STOREFRONT_SUBREQUESTS", 38, 10),
+    prospectiveCategoryShardSize: intSetting(env, "PROSPECTIVE_CATEGORY_SHARD_SIZE", 24, 1),
     minProducts: intSetting(env, "MIN_PRODUCTS", 1, 0),
     maxAlertsPerRun: intSetting(env, "MAX_ALERTS_PER_RUN", 5, 1),
     relistAfterAbsentRuns: intSetting(env, "RELIST_AFTER_ABSENT_RUNS", 2, 1),
@@ -224,7 +275,9 @@ async function saveSettingsFromRequest(request, env, cfg) {
     maxCategoryIds: parseFormInt(formData, "maxCategoryIds"),
     maxCategoryPages: parseFormInt(formData, "maxCategoryPages"),
     maxDirectProductUrls: parseFormInt(formData, "maxDirectProductUrls"),
+    maxStorefrontSubrequests: parseFormInt(formData, "maxStorefrontSubrequests"),
     maxPages: parseFormInt(formData, "maxPages"),
+    prospectiveCategoryShardSize: parseFormInt(formData, "prospectiveCategoryShardSize"),
     relistAfterAbsentRuns: parseFormInt(formData, "relistAfterAbsentRuns"),
     extraCategoryIds: parseCategoryIds(formData.get("extraCategoryIds")),
     extraProductUrls: parseProductUrls(formData.get("extraProductUrls")),
@@ -293,6 +346,21 @@ function firstSrcsetUrl(srcset) {
 
 function uniqueValues(values) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function finiteInteger(value, fallback = 0) {
+  const number = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function rotatingSlice(values, cursor, limit) {
+  if (!values.length || limit <= 0) return [];
+  const start = Math.max(0, finiteInteger(cursor, 0)) % values.length;
+  const selected = [];
+  for (let offset = 0; offset < values.length && selected.length < limit; offset += 1) {
+    selected.push(values[(start + offset) % values.length]);
+  }
+  return selected;
 }
 
 function truncate(value, limit) {
@@ -490,25 +558,52 @@ async function fetchRobotsProductUrls(cfg) {
   }
 }
 
-async function productDiscoverySignals(cfg) {
+function discoveryFetchReserve(cfg) {
+  let reserve = 0;
+  if (cfg.discoverSitemapCategories) reserve += 6;
+  if (cfg.discoverHomepageCategories) reserve += 1;
+  if (cfg.discoverRobotsProducts) reserve += 1;
+  return reserve;
+}
+
+async function productDiscoverySignals(cfg, state = {}) {
   const [sitemap, homepage, robotsProductUrls] = await Promise.all([
     fetchSitemapSignals(cfg),
     fetchHomepageSignals(cfg),
     fetchRobotsProductUrls(cfg)
   ]);
-  const categoryIds = uniqueValues([
+  const baseCategoryIds = uniqueValues([
     "root",
     "shop",
     ...sitemap.categoryIds,
     ...homepage.categoryIds,
-    ...cfg.extraCategoryIds,
-    ...cfg.prospectiveCategoryIds
-  ]).slice(0, cfg.maxCategoryIds);
+    ...cfg.extraCategoryIds
+  ]);
+  const reserve = discoveryFetchReserve(cfg);
+  const maxCategoryFetches = Math.max(2, cfg.maxStorefrontSubrequests - reserve - cfg.maxDirectProductUrls);
+  const categoryLimit = Math.min(cfg.maxCategoryIds, maxCategoryFetches);
+  const prospectiveCursor = finiteInteger(state.prospectiveCategoryCursor, 0);
+  const prospectiveLimit = Math.max(0, Math.min(cfg.prospectiveCategoryShardSize, categoryLimit - baseCategoryIds.length));
+  const prospectiveCategoryIds = rotatingSlice(cfg.prospectiveCategoryIds, prospectiveCursor, prospectiveLimit);
+  const categoryIds = uniqueValues([...baseCategoryIds, ...prospectiveCategoryIds]).slice(0, categoryLimit);
+  const productUrlLimit = Math.max(0, Math.min(cfg.maxDirectProductUrls, cfg.maxStorefrontSubrequests - reserve - categoryIds.length));
   const productUrls = uniqueValues([...sitemap.productUrls, ...homepage.productUrls, ...robotsProductUrls, ...cfg.extraProductUrls]).slice(
     0,
-    cfg.maxDirectProductUrls
+    productUrlLimit
   );
-  return { categoryIds, productUrls };
+  const nextProspectiveCategoryCursor = cfg.prospectiveCategoryIds.length
+    ? (prospectiveCursor + prospectiveCategoryIds.length) % cfg.prospectiveCategoryIds.length
+    : 0;
+
+  return {
+    categoryIds,
+    productUrls,
+    prospectiveCategoryIds,
+    prospectiveCategoryCursor: prospectiveCursor,
+    nextProspectiveCategoryCursor,
+    storefrontSubrequestBudget: cfg.maxStorefrontSubrequests,
+    plannedStorefrontSubrequests: reserve + categoryIds.length + productUrls.length
+  };
 }
 
 async function fetchProductsForCategory(cgid, cfg, maxPages) {
@@ -553,9 +648,18 @@ async function fetchDirectProduct(productUrl, cfg) {
   }
 }
 
-async function fetchProducts(cfg) {
+async function fetchProducts(cfg, state = {}) {
   const allProducts = {};
-  const discovery = await productDiscoverySignals(cfg);
+  const discovery = await productDiscoverySignals(cfg, state);
+  cfg.discoveryRun = {
+    categoryCount: discovery.categoryIds.length,
+    directProductUrlCount: discovery.productUrls.length,
+    prospectiveCategoryIds: discovery.prospectiveCategoryIds,
+    prospectiveCategoryCursor: discovery.prospectiveCategoryCursor,
+    nextProspectiveCategoryCursor: discovery.nextProspectiveCategoryCursor,
+    plannedStorefrontSubrequests: discovery.plannedStorefrontSubrequests,
+    storefrontSubrequestBudget: discovery.storefrontSubrequestBudget
+  };
   const queuedCategoryIds = [...discovery.categoryIds];
   const visitedCategoryIds = new Set();
 
@@ -1355,7 +1459,7 @@ async function runMonitor(env, cfg = null) {
       return { ok: true, skipped: true, reason: "interval", lastRunAt: state.lastRunAt, storage: "cloudflare-kv" };
     }
 
-    const products = await fetchProducts(cfg);
+    const products = await fetchProducts(cfg, state);
     const previousSeen = state.seen || {};
     const previousActive = state.active || previousSeen;
     const previousMissing = state.missing || {};
@@ -1382,6 +1486,7 @@ async function runMonitor(env, cfg = null) {
       alerted: enriched.length,
       deferred: deferredProducts.length,
       newPids: productsToAlert.map((product) => product.pid),
+      discovery: cfg.discoveryRun || null,
       storage: "cloudflare-kv",
       checkedAt: nowIso()
     };
@@ -1389,6 +1494,7 @@ async function runMonitor(env, cfg = null) {
     await saveState(env, cfg, {
       ...state,
       ...buildCatalogState(products, state, baseline ? new Set() : deferredPids, cfg),
+      prospectiveCategoryCursor: cfg.discoveryRun?.nextProspectiveCategoryCursor ?? state.prospectiveCategoryCursor ?? 0,
       lastRunAt: nowIso(),
       lastResult: result,
       errorStreak: 0,
@@ -1574,8 +1680,16 @@ function dashboard(state, cfg, settings = {}, saved = false) {
             <input id="maxCategoryPages" name="maxCategoryPages" type="number" min="1" max="5" value="${escapeHtml(cfg.maxCategoryPages)}">
           </div>
           <div class="field">
+            <label for="prospectiveCategoryShardSize">Hidden category shard</label>
+            <input id="prospectiveCategoryShardSize" name="prospectiveCategoryShardSize" type="number" min="1" max="50" value="${escapeHtml(cfg.prospectiveCategoryShardSize)}">
+          </div>
+          <div class="field">
             <label for="maxDirectProductUrls">Direct product URLs</label>
             <input id="maxDirectProductUrls" name="maxDirectProductUrls" type="number" min="0" max="50" value="${escapeHtml(cfg.maxDirectProductUrls)}">
+          </div>
+          <div class="field">
+            <label for="maxStorefrontSubrequests">Storefront fetch budget</label>
+            <input id="maxStorefrontSubrequests" name="maxStorefrontSubrequests" type="number" min="10" max="50" value="${escapeHtml(cfg.maxStorefrontSubrequests)}">
           </div>
           <div class="field">
             <label for="maxPages">Root pages</label>
@@ -1666,8 +1780,10 @@ async function handleFetch(request, env) {
         checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
         categoryFetchConcurrency: cfg.categoryFetchConcurrency,
         maxAlertsPerRun: cfg.maxAlertsPerRun,
+        maxStorefrontSubrequests: cfg.maxStorefrontSubrequests,
         extraCategoryIds: cfg.extraCategoryIds,
         prospectiveCategoryIds: cfg.prospectiveCategoryIds,
+        prospectiveCategoryShardSize: cfg.prospectiveCategoryShardSize,
         extraProductUrls: cfg.extraProductUrls,
         maxDirectProductUrls: cfg.maxDirectProductUrls
       },

@@ -115,21 +115,23 @@ function env(overrides = {}, kv = fakeKV()) {
     SETTINGS_KEY,
     DISCORD_WEBHOOK_URL: "https://discord.test/webhook",
     CRON_SECRET: "secret",
-    CATEGORY_FETCH_CONCURRENCY: "5",
+    CATEGORY_FETCH_CONCURRENCY: "8",
     CHECK_MIN_INTERVAL_SECONDS: "0",
     DISCOVER_HOMEPAGE_CATEGORIES: "true",
     DISCOVER_PRODUCT_URL_CATEGORIES: "true",
     DISCOVER_SITEMAP_CATEGORIES: "true",
     EXACT_STOCK_PROBE_CONCURRENCY: "1",
     MAX_ALERTS_PER_RUN: "5",
-    MAX_CATEGORY_IDS: "20",
+    MAX_CATEGORY_IDS: "40",
     MAX_CATEGORY_PAGES: "1",
-    MAX_DIRECT_PRODUCT_URLS: "10",
+    MAX_DIRECT_PRODUCT_URLS: "5",
+    MAX_STOREFRONT_SUBREQUESTS: "38",
     MAX_PAGES: "1",
     MIN_PRODUCTS: "1",
     PAGE_SIZE: "200",
     PROBE_EXACT_STOCK: "false",
     REQUEST_TIMEOUT_MS: "1000",
+    PROSPECTIVE_CATEGORY_SHARD_SIZE: "24",
     WEBHOOK_TIMEOUT_MS: "1000",
     ...overrides
   };
@@ -335,6 +337,48 @@ test("Cloudflare Worker checks prospective eyewear category before public discov
     assert.ok(mock.gridCategoryCalls.includes("eyewear"));
     assert.equal(mock.discordPayloads[0].embeds[0].title, "BLUEHER");
     assert.equal(mock.discordPayloads[0].embeds[0].fields.find((field) => field.name === "Category").value, "Eyewear");
+  });
+});
+
+test("Cloudflare Worker rotates through prospective category shards", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const hiddenProduct = productTile("LATE_HIDDEN", "LATE HIDDEN", "hidden-three", "Hidden Three", "600.00");
+  const kv = fakeKV({
+    ...stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]),
+    prospectiveCategoryCursor: 0
+  });
+  const config = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_ROBOTS_PRODUCTS: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    MAX_CATEGORY_IDS: "5",
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    MAX_STOREFRONT_SUBREQUESTS: "10",
+    PROSPECTIVE_CATEGORY_IDS: "hidden-one,hidden-two,hidden-three,hidden-four",
+    PROSPECTIVE_CATEGORY_SHARD_SIZE: "2"
+  };
+
+  const firstMock = createChromeHeartsFetch({ root: oldProduct, categories: { "hidden-three": hiddenProduct } });
+  await withMockedFetch(firstMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(config, kv));
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+
+    assert.equal(result.alerted, 0);
+    assert.ok(firstMock.gridCategoryCalls.includes("hidden-one"));
+    assert.ok(firstMock.gridCategoryCalls.includes("hidden-two"));
+    assert.equal(firstMock.gridCategoryCalls.includes("hidden-three"), false);
+    assert.equal(state.prospectiveCategoryCursor, 2);
+  });
+
+  kv.values.delete(LOCK_KEY);
+  const secondMock = createChromeHeartsFetch({ root: oldProduct, categories: { "hidden-three": hiddenProduct } });
+  await withMockedFetch(secondMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(config, kv));
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["LATE_HIDDEN"]);
+    assert.ok(secondMock.gridCategoryCalls.includes("hidden-three"));
   });
 });
 
@@ -593,7 +637,9 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
     maxCategoryIds: "7",
     maxCategoryPages: "1",
     maxDirectProductUrls: "4",
+    maxStorefrontSubrequests: "20",
     maxPages: "1",
+    prospectiveCategoryShardSize: "6",
     relistAfterAbsentRuns: "3",
     extraCategoryIds: "hat, jewelry",
     extraProductUrls: "https://www.chromehearts.com/hidden/manual/MANUAL_NEW.html",
@@ -620,6 +666,8 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
   assert.equal(savedSettings.categoryFetchConcurrency, 3);
   assert.equal(savedSettings.maxAlertsPerRun, 1);
   assert.equal(savedSettings.maxDirectProductUrls, 4);
+  assert.equal(savedSettings.maxStorefrontSubrequests, 20);
+  assert.equal(savedSettings.prospectiveCategoryShardSize, 6);
   assert.deepEqual(savedSettings.extraCategoryIds, ["hat", "jewelry"]);
   assert.deepEqual(savedSettings.extraProductUrls, ["https://www.chromehearts.com/hidden/manual/MANUAL_NEW.html"]);
   assert.equal(savedSettings.discoverRobotsProducts, true);
@@ -654,7 +702,9 @@ test("Worker dashboard rejects unsafe runtime settings without overwriting KV", 
     maxCategoryIds: "7",
     maxCategoryPages: "1",
     maxDirectProductUrls: "4",
+    maxStorefrontSubrequests: "20",
     maxPages: "1",
+    prospectiveCategoryShardSize: "6",
     relistAfterAbsentRuns: "3"
   });
 

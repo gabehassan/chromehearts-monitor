@@ -7,15 +7,16 @@ compatibility_flags = ["nodejs_compat"]
 enabled = true
 
 [vars]
-CHECK_MIN_INTERVAL_SECONDS = "240"
-CATEGORY_FETCH_CONCURRENCY = "5"
+CHECK_MIN_INTERVAL_SECONDS = "50"
+CATEGORY_FETCH_CONCURRENCY = "8"
 SETTINGS_KEY = "chrome-hearts:cloudflare:settings"
 EXACT_STOCK_PROBE_CONCURRENCY = "3"
 EXACT_STOCK_PROBE_QUANTITY = "999"
 MAX_ALERTS_PER_RUN = "5"
-MAX_CATEGORY_IDS = "30"
+MAX_CATEGORY_IDS = "40"
 MAX_CATEGORY_PAGES = "2"
-MAX_DIRECT_PRODUCT_URLS = "10"
+MAX_DIRECT_PRODUCT_URLS = "5"
+MAX_STOREFRONT_SUBREQUESTS = "38"
 MAX_PAGES = "10"
 MIN_PRODUCTS = "1"
 PAGE_SIZE = "200"
@@ -25,11 +26,12 @@ DISCOVER_SITEMAP_CATEGORIES = "true"
 DISCOVER_HOMEPAGE_CATEGORIES = "true"
 DISCOVER_PRODUCT_URL_CATEGORIES = "true"
 DISCOVER_ROBOTS_PRODUCTS = "true"
-PROSPECTIVE_CATEGORY_IDS = "eyewear,sunglasses,glasses,eyeglasses,optical,hat,hoodie,t-shirt,shirt,jewelry"
+PROSPECTIVE_CATEGORY_SHARD_SIZE = "24"
+PROSPECTIVE_CATEGORY_IDS = "eyewear,sunglasses,glasses,eyeglasses,optical,frames,hat,hats,cap,caps,trucker,hoodie,hoodies,sweatshirt,sweatshirts,sweatpants,t-shirt,t-shirts,shirt,shirts,long-sleeve,long-sleeves,short-sleeve,short-sleeves,denim,jeans,pants,shorts,jewelry,ring,rings,necklace,necklaces,bracelet,bracelets,earring,earrings,pendant,pendants,wallet,wallets,leather,bag,bags,belt,belts,scarf,scarves,socks,underwear,intimates,boxers-leggings,baccarat,scents,home,accessories,silver"
 DASHBOARD_USERNAME = "chrome-hearts"
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
 
 [[kv_namespaces]]
 binding = "STATE"
