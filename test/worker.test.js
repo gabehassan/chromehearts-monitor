@@ -115,6 +115,7 @@ function env(overrides = {}, kv = fakeKV()) {
     SETTINGS_KEY,
     DISCORD_WEBHOOK_URL: "https://discord.test/webhook",
     CRON_SECRET: "secret",
+    CATEGORY_FETCH_CONCURRENCY: "5",
     CHECK_MIN_INTERVAL_SECONDS: "0",
     DISCOVER_HOMEPAGE_CATEGORIES: "true",
     DISCOVER_PRODUCT_URL_CATEGORIES: "true",
@@ -301,6 +302,39 @@ test("Cloudflare Worker checks a brand-new homepage/nav category before it is ma
     assert.deepEqual(result.newPids, ["NEW_SECRET"]);
     assert.ok(mock.gridCategoryCalls.includes("secret-drop"));
     assert.equal(mock.discordPayloads[0].embeds[0].fields.find((field) => field.name === "Price").value, "$245");
+  });
+});
+
+test("Cloudflare Worker checks prospective eyewear category before public discovery", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const blueher = productTile("BLUEHER_OS", "BLUEHER", "eyewear", "Eyewear", "1670.00");
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({
+    root: oldProduct,
+    categories: { eyewear: blueher },
+    productDetails: {
+      BLUEHER_OS: { name: "BLUEHER", categoryName: "Eyewear", price: "1670.00" }
+    }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          MAX_CATEGORY_IDS: "12"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["BLUEHER_OS"]);
+    assert.ok(mock.gridCategoryCalls.includes("eyewear"));
+    assert.equal(mock.discordPayloads[0].embeds[0].title, "BLUEHER");
+    assert.equal(mock.discordPayloads[0].embeds[0].fields.find((field) => field.name === "Category").value, "Eyewear");
   });
 });
 
@@ -553,6 +587,7 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
   const webhookUrl = "https://discord.com/api/webhooks/1234567890/runtime-secret-token";
   const form = new URLSearchParams({
     discordWebhookUrl: webhookUrl,
+    categoryFetchConcurrency: "3",
     checkMinIntervalSeconds: "0",
     maxAlertsPerRun: "1",
     maxCategoryIds: "7",
@@ -582,6 +617,7 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
 
   const savedSettings = JSON.parse(kv.values.get(SETTINGS_KEY));
   assert.equal(savedSettings.discordWebhookUrl, webhookUrl);
+  assert.equal(savedSettings.categoryFetchConcurrency, 3);
   assert.equal(savedSettings.maxAlertsPerRun, 1);
   assert.equal(savedSettings.maxDirectProductUrls, 4);
   assert.deepEqual(savedSettings.extraCategoryIds, ["hat", "jewelry"]);
@@ -612,6 +648,7 @@ test("Worker dashboard rejects unsafe runtime settings without overwriting KV", 
   kv.values.set(SETTINGS_KEY, JSON.stringify({ maxAlertsPerRun: 2, extraCategoryIds: ["hat"] }));
   const badForm = new URLSearchParams({
     discordWebhookUrl: "https://example.com/not-discord",
+    categoryFetchConcurrency: "3",
     checkMinIntervalSeconds: "0",
     maxAlertsPerRun: "500",
     maxCategoryIds: "7",

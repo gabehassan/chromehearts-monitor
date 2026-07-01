@@ -20,7 +20,20 @@ const RESERVED_CATEGORY_IDS = new Set([
   "search",
   "wishlist"
 ]);
+const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
+  "eyewear",
+  "sunglasses",
+  "glasses",
+  "eyeglasses",
+  "optical",
+  "hat",
+  "hoodie",
+  "t-shirt",
+  "shirt",
+  "jewelry"
+];
 const INT_SETTING_LIMITS = {
+  categoryFetchConcurrency: [1, 10],
   checkMinIntervalSeconds: [0, 3600],
   maxAlertsPerRun: [1, 10],
   maxCategoryIds: [1, 50],
@@ -82,7 +95,8 @@ function getConfig(env) {
     pageSize: intSetting(env, "PAGE_SIZE", 200, 1),
     maxPages: intSetting(env, "MAX_PAGES", 10, 1),
     maxCategoryPages: intSetting(env, "MAX_CATEGORY_PAGES", 2, 1),
-    maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 20, 1),
+    maxCategoryIds: intSetting(env, "MAX_CATEGORY_IDS", 30, 1),
+    categoryFetchConcurrency: intSetting(env, "CATEGORY_FETCH_CONCURRENCY", 5, 1),
     maxDirectProductUrls: intSetting(env, "MAX_DIRECT_PRODUCT_URLS", 10, 0),
     minProducts: intSetting(env, "MIN_PRODUCTS", 1, 0),
     maxAlertsPerRun: intSetting(env, "MAX_ALERTS_PER_RUN", 5, 1),
@@ -97,6 +111,9 @@ function getConfig(env) {
       .split(",")
       .map((value) => value.trim())
       .filter(Boolean),
+    prospectiveCategoryIds: parseCategoryIds(
+      env.PROSPECTIVE_CATEGORY_IDS === undefined ? DEFAULT_PROSPECTIVE_CATEGORY_IDS.join(",") : env.PROSPECTIVE_CATEGORY_IDS
+    ),
     extraProductUrls: String(env.EXTRA_PRODUCT_URLS || "")
       .split(/[\s,]+/)
       .map((value) => productUrlFromUrl(value))
@@ -201,6 +218,7 @@ async function saveSettingsFromRequest(request, env, cfg) {
   const formData = await request.formData();
   const next = {
     ...current,
+    categoryFetchConcurrency: parseFormInt(formData, "categoryFetchConcurrency"),
     checkMinIntervalSeconds: parseFormInt(formData, "checkMinIntervalSeconds"),
     maxAlertsPerRun: parseFormInt(formData, "maxAlertsPerRun"),
     maxCategoryIds: parseFormInt(formData, "maxCategoryIds"),
@@ -478,10 +496,14 @@ async function productDiscoverySignals(cfg) {
     fetchHomepageSignals(cfg),
     fetchRobotsProductUrls(cfg)
   ]);
-  const categoryIds = uniqueValues(["root", "shop", ...sitemap.categoryIds, ...homepage.categoryIds, ...cfg.extraCategoryIds]).slice(
-    0,
-    cfg.maxCategoryIds
-  );
+  const categoryIds = uniqueValues([
+    "root",
+    "shop",
+    ...sitemap.categoryIds,
+    ...homepage.categoryIds,
+    ...cfg.extraCategoryIds,
+    ...cfg.prospectiveCategoryIds
+  ]).slice(0, cfg.maxCategoryIds);
   const productUrls = uniqueValues([...sitemap.productUrls, ...homepage.productUrls, ...robotsProductUrls, ...cfg.extraProductUrls]).slice(
     0,
     cfg.maxDirectProductUrls
@@ -537,22 +559,32 @@ async function fetchProducts(cfg) {
   const queuedCategoryIds = [...discovery.categoryIds];
   const visitedCategoryIds = new Set();
 
-  for (let index = 0; index < queuedCategoryIds.length && visitedCategoryIds.size < cfg.maxCategoryIds; index += 1) {
-    const cgid = queuedCategoryIds[index];
-    if (!cgid || visitedCategoryIds.has(cgid)) continue;
-    visitedCategoryIds.add(cgid);
-
-    const maxPages = cgid === "root" ? cfg.maxPages : cfg.maxCategoryPages;
-    const products = await fetchProductsForCategory(cgid, cfg, maxPages);
-    for (const [pid, product] of Object.entries(products)) {
-      allProducts[pid] = product;
+  while (queuedCategoryIds.length && visitedCategoryIds.size < cfg.maxCategoryIds) {
+    const batch = [];
+    while (queuedCategoryIds.length && visitedCategoryIds.size + batch.length < cfg.maxCategoryIds) {
+      const cgid = queuedCategoryIds.shift();
+      if (!cgid || visitedCategoryIds.has(cgid) || batch.includes(cgid)) continue;
+      batch.push(cgid);
     }
+    if (!batch.length) break;
 
-    if (cfg.discoverProductUrlCategories) {
-      for (const product of Object.values(products)) {
-        const categoryId = categoryIdFromUrl(product.url);
-        if (categoryId && !visitedCategoryIds.has(categoryId) && !queuedCategoryIds.includes(categoryId)) {
-          queuedCategoryIds.push(categoryId);
+    for (const cgid of batch) visitedCategoryIds.add(cgid);
+    const results = await mapWithConcurrency(batch, cfg.categoryFetchConcurrency, async (cgid) => {
+      const maxPages = cgid === "root" || cgid === "shop" ? cfg.maxPages : cfg.maxCategoryPages;
+      return { cgid, products: await fetchProductsForCategory(cgid, cfg, maxPages) };
+    });
+
+    for (const { products } of results) {
+      for (const [pid, product] of Object.entries(products)) {
+        allProducts[pid] = product;
+      }
+
+      if (cfg.discoverProductUrlCategories) {
+        for (const product of Object.values(products)) {
+          const categoryId = categoryIdFromUrl(product.url);
+          if (categoryId && !visitedCategoryIds.has(categoryId) && !queuedCategoryIds.includes(categoryId)) {
+            queuedCategoryIds.push(categoryId);
+          }
         }
       }
     }
@@ -1534,6 +1566,10 @@ function dashboard(state, cfg, settings = {}, saved = false) {
             <input id="maxCategoryIds" name="maxCategoryIds" type="number" min="1" max="50" value="${escapeHtml(cfg.maxCategoryIds)}">
           </div>
           <div class="field">
+            <label for="categoryFetchConcurrency">Grid concurrency</label>
+            <input id="categoryFetchConcurrency" name="categoryFetchConcurrency" type="number" min="1" max="10" value="${escapeHtml(cfg.categoryFetchConcurrency)}">
+          </div>
+          <div class="field">
             <label for="maxCategoryPages">Pages per category</label>
             <input id="maxCategoryPages" name="maxCategoryPages" type="number" min="1" max="5" value="${escapeHtml(cfg.maxCategoryPages)}">
           </div>
@@ -1628,8 +1664,10 @@ async function handleFetch(request, env) {
       settings: {
         dashboardWebhook: Boolean(settings.discordWebhookUrl),
         checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
+        categoryFetchConcurrency: cfg.categoryFetchConcurrency,
         maxAlertsPerRun: cfg.maxAlertsPerRun,
         extraCategoryIds: cfg.extraCategoryIds,
+        prospectiveCategoryIds: cfg.prospectiveCategoryIds,
         extraProductUrls: cfg.extraProductUrls,
         maxDirectProductUrls: cfg.maxDirectProductUrls
       },
