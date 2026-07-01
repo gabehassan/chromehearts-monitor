@@ -743,6 +743,7 @@ async function productDiscoverySignals(cfg, state = {}) {
   const baseCategoryIds = uniqueValues([
     "root",
     "shop",
+    ...(Array.isArray(state.knownCategoryIds) ? state.knownCategoryIds : []),
     ...sitemap.categoryIds,
     ...homepage.categoryIds,
     ...cfg.extraCategoryIds
@@ -911,9 +912,13 @@ async function fetchGridHtmlSafe(cgid, cfg) {
 
 async function fastFetchProducts(cfg, state, fastCursor = 0) {
   const pool = uniqueValues([...cfg.extraCategoryIds, ...cfg.prospectiveCategoryIds]);
-  const activeCategoryIds = Array.isArray(state.activeCategoryIds) ? state.activeCategoryIds : [];
+  const knownCategoryIds = Array.isArray(state.knownCategoryIds)
+    ? state.knownCategoryIds
+    : Array.isArray(state.activeCategoryIds)
+    ? state.activeCategoryIds
+    : [];
   const cap = Math.max(2, cfg.fastMaxCategories);
-  const head = uniqueValues(["root", "shop", ...activeCategoryIds]).slice(0, cap);
+  const head = uniqueValues(["root", "shop", ...knownCategoryIds]).slice(0, cap);
   const shardRoom = Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
   const shard = rotatingSlice(pool, fastCursor, shardRoom);
   const cgids = uniqueValues([...head, ...shard]);
@@ -932,7 +937,7 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
   const meta = {
     mode: "fast",
     cgidCount: cgids.length,
-    activeCategoryCount: activeCategoryIds.length,
+    activeCategoryCount: knownCategoryIds.length,
     shardSize: shard.length,
     fetched: htmls.filter(Boolean).length,
     pidUniverse: pidUniverse.size,
@@ -1842,6 +1847,14 @@ async function runMonitor(env, cfg = null, opts = {}) {
       nextState.prospectiveCategoryCursor =
         cfg.discoveryRun?.nextProspectiveCategoryCursor ?? state.prospectiveCategoryCursor ?? 0;
       if (sweep && !degraded) nextState.activeCategoryIds = sweep.activeCategoryIds;
+      const learned = uniqueValues([
+        ...(Array.isArray(state.knownCategoryIds) ? state.knownCategoryIds : []),
+        ...(sweep && !degraded ? sweep.activeCategoryIds : []),
+        ...Object.values(nextState.seen || {})
+          .map((record) => categoryIdFromUrl(record?.url))
+          .filter(Boolean)
+      ]).filter((cgid) => cgid && cgid !== "root" && cgid !== "shop");
+      nextState.knownCategoryIds = learned.slice(-120);
     }
     await saveState(env, cfg, nextState);
 
@@ -2122,6 +2135,7 @@ async function handleFetch(request, env) {
       missing: Object.keys(state.missing || {}).length,
       universeSize: cfg.prospectiveCategoryIds.length,
       activeCategories: Array.isArray(state.activeCategoryIds) ? state.activeCategoryIds : [],
+      knownCategories: Array.isArray(state.knownCategoryIds) ? state.knownCategoryIds : [],
       fastPoll: {
         enabled: cfg.fastPollEnabled,
         intervalSeconds: cfg.fastPollIntervalSeconds,
@@ -2153,6 +2167,35 @@ async function handleFetch(request, env) {
     const limit = Math.min(500, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100));
     const doResponse = await stub.fetch(`https://monitor.internal/logs?limit=${limit}`);
     return jsonResponse({ ok: true, ...(await doResponse.json()) });
+  }
+  if (url.pathname === "/selftest") {
+    if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
+    const settings = await loadSettings(env, baseCfg);
+    const cfg = applyRuntimeSettings(baseCfg, settings);
+    try {
+      await sendDiscord(cfg, [
+        {
+          pid: "SELFTEST",
+          name: "Monitor self-test",
+          price: "0",
+          category: "diagnostic",
+          brand: "Chrome Hearts Monitor",
+          url: BASE_URL,
+          image: "",
+          description: `Webhook delivery test at ${nowIso()}. If you can read this in Discord, alerts work.`,
+          sizes: [],
+          inStockSizeCount: 0
+        }
+      ]);
+      return jsonResponse({
+        ok: true,
+        sent: true,
+        webhookSource: settings.discordWebhookUrl ? "dashboard" : "worker-secret",
+        at: nowIso()
+      });
+    } catch (error) {
+      return jsonResponse({ ok: false, sent: false, error: error.message }, 502);
+    }
   }
   if (url.pathname === "/do") {
     if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
