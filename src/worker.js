@@ -9,7 +9,9 @@ const ROBOTS_URL = `${BASE_URL}/robots.txt`;
 const DEFAULT_STATE_KEY = "chrome-hearts:cloudflare:state";
 const DEFAULT_LOCK_KEY = "chrome-hearts:cloudflare:lock";
 const DEFAULT_SETTINGS_KEY = "chrome-hearts:cloudflare:settings";
-const DEFAULT_USER_AGENT = "ChromeHeartsMonitor/1.0";
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const DO_SINGLETON_NAME = "chrome-hearts-monitor";
 const RESERVED_CATEGORY_IDS = new Set([
   "account",
   "cart",
@@ -175,8 +177,12 @@ function getConfig(env) {
     requestTimeoutMs: intSetting(env, "REQUEST_TIMEOUT_MS", 12000, 1000),
     webhookTimeoutMs: intSetting(env, "WEBHOOK_TIMEOUT_MS", 8000, 1000),
     checkMinIntervalSeconds,
-    lockSeconds: Math.max(60, intSetting(env, "LOCK_SECONDS", 90, 60)),
+    lockSeconds: Math.max(10, intSetting(env, "LOCK_SECONDS", 30, 5)),
     maxBackoffSeconds: intSetting(env, "MAX_BACKOFF_SECONDS", 900, 1),
+    fastPollEnabled: boolSetting(env, "FAST_POLL_ENABLED", true),
+    fastPollIntervalSeconds: intSetting(env, "FAST_POLL_INTERVAL_SECONDS", 15, 5),
+    fullSweepEveryTicks: intSetting(env, "FULL_SWEEP_EVERY_TICKS", 4, 1),
+    fastCategoryShardSize: intSetting(env, "FAST_CATEGORY_SHARD_SIZE", 6, 0),
     userAgent: env.MONITOR_USER_AGENT || DEFAULT_USER_AGENT
   };
 }
@@ -396,6 +402,7 @@ function fetchOptions(cfg, accept) {
   return {
     headers: {
       accept,
+      "accept-language": "en-US,en;q=0.9",
       referer: `${BASE_URL}/`,
       "user-agent": cfg.userAgent
     },
@@ -704,6 +711,58 @@ async function fetchProducts(cfg, state = {}) {
     throw new MonitorError(`Fetched only ${count} products; refusing update below MIN_PRODUCTS=${cfg.minProducts}.`);
   }
   return allProducts;
+}
+
+function extractGridPids(html) {
+  const pids = new Set();
+  const pattern = /data-pid="([^"]+)"/g;
+  let match;
+  while ((match = pattern.exec(html)) !== null) {
+    if (match[1]) pids.add(match[1]);
+  }
+  return pids;
+}
+
+async function fetchGridHtmlSafe(cgid, cfg) {
+  try {
+    return await fetchHtml(productGridUrl(cgid, 0, cfg.pageSize), cfg);
+  } catch {
+    return "";
+  }
+}
+
+async function fastFetchProducts(cfg, state, fastCursor = 0) {
+  const pool = uniqueValues([...cfg.extraCategoryIds, ...cfg.prospectiveCategoryIds]);
+  const shard = rotatingSlice(pool, fastCursor, cfg.fastCategoryShardSize);
+  const cgids = uniqueValues(["root", "shop", ...shard]);
+  const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
+  const combinedHtml = htmls.join("\n");
+  const pidUniverse = extractGridPids(combinedHtml);
+
+  const previousSeen = state.seen || {};
+  const previousActive = state.active || previousSeen;
+  const previousMissing = state.missing || {};
+  const candidatePids = [...pidUniverse].filter(
+    (pid) => !previousSeen[pid] || relistEligible(pid, previousSeen, previousActive, previousMissing, cfg)
+  );
+
+  const nextFastCursor = pool.length ? (fastCursor + shard.length) % pool.length : 0;
+  const meta = {
+    mode: "fast",
+    cgids,
+    cgidCount: cgids.length,
+    fetched: htmls.filter(Boolean).length,
+    pidUniverse: pidUniverse.size,
+    candidates: candidatePids.length,
+    fastCursor,
+    nextFastCursor
+  };
+
+  if (candidatePids.length === 0) {
+    return { products: {}, meta, nextFastCursor, empty: true };
+  }
+
+  return { products: parseProducts(combinedHtml), meta, nextFastCursor, empty: false };
 }
 
 function collectProductImages($) {
@@ -1226,15 +1285,25 @@ async function saveState(env, cfg, state) {
   await env.STATE.put(cfg.stateKey, JSON.stringify({ ...state, updatedAt: nowIso() }));
 }
 
-async function acquireLock(env, cfg) {
+async function acquireLock(env, cfg, ttlSeconds = cfg.lockSeconds) {
   const existingRaw = await env.STATE.get(cfg.lockKey);
   const existing = existingRaw ? JSON.parse(existingRaw) : null;
   if (existing?.expiresAt && Date.parse(existing.expiresAt) > Date.now()) return null;
 
   const token = crypto.randomUUID();
-  const expiresAt = new Date(Date.now() + cfg.lockSeconds * 1000).toISOString();
-  await env.STATE.put(cfg.lockKey, JSON.stringify({ token, expiresAt }), { expirationTtl: cfg.lockSeconds });
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  await env.STATE.put(cfg.lockKey, JSON.stringify({ token, expiresAt }), { expirationTtl: ttlSeconds });
   return token;
+}
+
+async function releaseLock(env, cfg, token) {
+  if (!token) return;
+  try {
+    const existingRaw = await env.STATE.get(cfg.lockKey);
+    const existing = existingRaw ? JSON.parse(existingRaw) : null;
+    if (existing?.token === token) await env.STATE.delete(cfg.lockKey);
+  } catch {
+  }
 }
 
 function shouldSkipForInterval(state, cfg) {
@@ -1412,7 +1481,7 @@ function relistEligible(pid, previousSeen, previousActive, previousMissing, cfg)
   return Number(previousMissing[pid]?.count || 0) >= cfg.relistAfterAbsentRuns;
 }
 
-function buildCatalogState(products, state, deferredPids, cfg) {
+function buildCatalogState(products, state, deferredPids, cfg, { partial = false } = {}) {
   const previousSeen = state.seen || {};
   const previousActive = state.active || previousSeen;
   const previousMissing = state.missing || {};
@@ -1428,6 +1497,8 @@ function buildCatalogState(products, state, deferredPids, cfg) {
     active[pid] = productStateRecord(product, active[pid] || seen[pid], now);
     delete missing[pid];
   }
+
+  if (partial) return { seen, active, missing };
 
   for (const pid of Object.keys(previousActive)) {
     if (currentPids.has(pid)) continue;
@@ -1445,29 +1516,67 @@ function buildCatalogState(products, state, deferredPids, cfg) {
   return { seen, active, missing };
 }
 
-async function runMonitor(env, cfg = null) {
+async function runMonitor(env, cfg = null, opts = {}) {
   if (!cfg) cfg = await getRuntimeConfig(env);
-  const lockToken = await acquireLock(env, cfg);
-  if (!lockToken) return { ok: true, skipped: true, reason: "locked", storage: "cloudflare-kv" };
+  const mode = opts.mode === "fast" ? "fast" : "full";
+  const skipLock = opts.skipLock === true;
+  const fastCursor = mode === "fast" ? finiteInteger(opts.fastCursor, 0) : 0;
+
+  let lockToken = null;
+  if (!skipLock) {
+    const lockTtl = mode === "fast" ? Math.max(10, cfg.fastPollIntervalSeconds + 10) : cfg.lockSeconds;
+    lockToken = await acquireLock(env, cfg, lockTtl);
+    if (!lockToken) return { ok: true, skipped: true, reason: "locked", mode, storage: "cloudflare-kv" };
+  }
 
   let state = await loadState(env, cfg);
   try {
     if (state.backoffUntil && Date.parse(state.backoffUntil) > Date.now()) {
-      return { ok: true, skipped: true, reason: "backoff", backoffUntil: state.backoffUntil, storage: "cloudflare-kv" };
+      return { ok: true, skipped: true, reason: "backoff", mode, backoffUntil: state.backoffUntil, storage: "cloudflare-kv" };
     }
-    if (shouldSkipForInterval(state, cfg)) {
-      return { ok: true, skipped: true, reason: "interval", lastRunAt: state.lastRunAt, storage: "cloudflare-kv" };
+    if (!skipLock && mode === "full" && shouldSkipForInterval(state, cfg)) {
+      return { ok: true, skipped: true, reason: "interval", mode, lastRunAt: state.lastRunAt, storage: "cloudflare-kv" };
     }
 
-    const products = await fetchProducts(cfg, state);
     const previousSeen = state.seen || {};
     const previousActive = state.active || previousSeen;
     const previousMissing = state.missing || {};
+    const firstRun = Object.keys(previousSeen).length === 0;
+
+    let products;
+    let nextFastCursor = fastCursor;
+    let fastMeta = null;
+    if (mode === "fast") {
+      if (firstRun) {
+        return { ok: true, skipped: true, reason: "awaiting-baseline", mode, nextFastCursor: fastCursor, storage: "cloudflare-kv" };
+      }
+      const fast = await fastFetchProducts(cfg, state, fastCursor);
+      products = fast.products;
+      nextFastCursor = fast.nextFastCursor;
+      fastMeta = fast.meta;
+
+      if (fast.empty) {
+        return {
+          ok: true,
+          mode,
+          alerted: 0,
+          deferred: 0,
+          newPids: [],
+          productCount: fast.meta.pidUniverse,
+          fast: fast.meta,
+          nextFastCursor,
+          storage: "cloudflare-kv",
+          checkedAt: nowIso()
+        };
+      }
+    } else {
+      products = await fetchProducts(cfg, state);
+    }
+
     const newPids = Object.keys(products).filter(
       (pid) => !previousSeen[pid] || relistEligible(pid, previousSeen, previousActive, previousMissing, cfg)
     );
-    const firstRun = Object.keys(previousSeen).length === 0;
-    const baseline = firstRun && !cfg.notifyInitial;
+    const baseline = mode === "full" && firstRun && !cfg.notifyInitial;
     const candidates = baseline ? [] : newPids.map((pid) => products[pid]);
     const productsToAlert = candidates.slice(0, cfg.maxAlertsPerRun);
     const deferredProducts = candidates.slice(cfg.maxAlertsPerRun);
@@ -1481,27 +1590,34 @@ async function runMonitor(env, cfg = null) {
 
     const result = {
       ok: true,
+      mode,
       baseline,
       productCount: Object.keys(products).length,
       alerted: enriched.length,
       deferred: deferredProducts.length,
       newPids: productsToAlert.map((product) => product.pid),
-      discovery: cfg.discoveryRun || null,
+      discovery: mode === "full" ? cfg.discoveryRun || null : null,
+      fast: fastMeta,
+      nextFastCursor,
       storage: "cloudflare-kv",
       checkedAt: nowIso()
     };
 
-    await saveState(env, cfg, {
+    const nextState = {
       ...state,
-      ...buildCatalogState(products, state, baseline ? new Set() : deferredPids, cfg),
-      prospectiveCategoryCursor: cfg.discoveryRun?.nextProspectiveCategoryCursor ?? state.prospectiveCategoryCursor ?? 0,
+      ...buildCatalogState(products, state, baseline ? new Set() : deferredPids, cfg, { partial: mode === "fast" }),
       lastRunAt: nowIso(),
       lastResult: result,
       errorStreak: 0,
       backoffUntil: null,
       lastError: null,
       lastErrorAt: null
-    });
+    };
+    if (mode === "full") {
+      nextState.prospectiveCategoryCursor =
+        cfg.discoveryRun?.nextProspectiveCategoryCursor ?? state.prospectiveCategoryCursor ?? 0;
+    }
+    await saveState(env, cfg, nextState);
 
     return result;
   } catch (error) {
@@ -1511,9 +1627,11 @@ async function runMonitor(env, cfg = null) {
       ...backoff,
       lastError: error.message,
       lastErrorAt: nowIso(),
-      lastResult: { ok: false, error: error.message, checkedAt: nowIso() }
+      lastResult: { ok: false, mode, error: error.message, checkedAt: nowIso() }
     }).catch(() => {});
     throw error;
+  } finally {
+    await releaseLock(env, cfg, lockToken);
   }
 }
 
@@ -1775,6 +1893,13 @@ async function handleFetch(request, env) {
       seen: Object.keys(state.seen || {}).length,
       active: Object.keys(state.active || state.seen || {}).length,
       missing: Object.keys(state.missing || {}).length,
+      fastPoll: {
+        enabled: cfg.fastPollEnabled,
+        intervalSeconds: cfg.fastPollIntervalSeconds,
+        fullSweepEveryTicks: cfg.fullSweepEveryTicks,
+        fastCategoryShardSize: cfg.fastCategoryShardSize,
+        controller: await fastPollStatus(env)
+      },
       settings: {
         dashboardWebhook: Boolean(settings.discordWebhookUrl),
         checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
@@ -1791,11 +1916,23 @@ async function handleFetch(request, env) {
       lastResult: state.lastResult || null
     });
   }
+  if (url.pathname === "/do") {
+    if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
+    const stub = monitorStub(env);
+    if (!stub) return jsonResponse({ ok: false, error: "MONITOR Durable Object binding is not configured." }, 501);
+    const action = request.method === "POST" ? url.searchParams.get("action") || "ensure" : "status";
+    const doResponse = await stub.fetch(`https://monitor.internal/${action}`, { method: request.method });
+    return jsonResponse({ ok: true, action, controller: await doResponse.json() });
+  }
   if (url.pathname === "/api/cron" || url.pathname === "/run") {
     if (!["GET", "POST"].includes(request.method)) return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
     if (!isAuthorized(request, baseCfg)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
     try {
-      return jsonResponse(await runMonitor(env, await getRuntimeConfig(env)));
+      const cfg = await getRuntimeConfig(env);
+      const mode = url.searchParams.get("mode") === "fast" ? "fast" : "full";
+      const result = await runMonitor(env, cfg, { mode });
+      if (cfg.fastPollEnabled) await ensureFastPollLoop(env).catch(() => {});
+      return jsonResponse(result);
     } catch (error) {
       const status = error instanceof MonitorError ? error.statusCode : 500;
       return jsonResponse({ ok: false, error: error.message, details: error.details || {} }, status);
@@ -1804,15 +1941,138 @@ async function handleFetch(request, env) {
   return jsonResponse({ ok: false, error: "Not found" }, 404);
 }
 
+function monitorStub(env) {
+  if (!env.MONITOR || typeof env.MONITOR.idFromName !== "function") return null;
+  return env.MONITOR.get(env.MONITOR.idFromName(DO_SINGLETON_NAME));
+}
+
+async function ensureFastPollLoop(env) {
+  const stub = monitorStub(env);
+  if (!stub) return { armed: false, reason: "no-durable-object-binding" };
+  const response = await stub.fetch("https://monitor.internal/ensure", { method: "POST" });
+  return response.json();
+}
+
+async function fastPollStatus(env) {
+  const stub = monitorStub(env);
+  if (!stub) return { armed: false, reason: "no-durable-object-binding" };
+  try {
+    const response = await stub.fetch("https://monitor.internal/status");
+    return response.json();
+  } catch (error) {
+    return { armed: false, error: String(error?.message || error) };
+  }
+}
+
+class MonitorController {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async ensure() {
+    let cfg = null;
+    try {
+      cfg = await getRuntimeConfig(this.env);
+    } catch {
+      cfg = null;
+    }
+    if (!cfg || !cfg.fastPollEnabled) {
+      await this.state.storage.deleteAlarm().catch(() => {});
+      return { armed: false, reason: cfg ? "disabled" : "config-error" };
+    }
+    const existing = await this.state.storage.getAlarm();
+    if (existing === null || existing === undefined) {
+      await this.state.storage.setAlarm(Date.now() + 1000);
+      return { armed: true, scheduledInMs: 1000 };
+    }
+    return { armed: true, nextAlarm: new Date(existing).toISOString() };
+  }
+
+  async status() {
+    const alarm = await this.state.storage.getAlarm();
+    return {
+      tick: Number(await this.state.storage.get("tick")) || 0,
+      lastTickAt: (await this.state.storage.get("lastTickAt")) || null,
+      nextAlarm: alarm ? new Date(alarm).toISOString() : null,
+      fastCursor: Number(await this.state.storage.get("fastCursor")) || 0,
+      lastResult: (await this.state.storage.get("lastResult")) || null
+    };
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/ensure" || url.pathname === "/start") return Response.json(await this.ensure());
+    if (url.pathname === "/status") return Response.json(await this.status());
+    if (url.pathname === "/stop") {
+      await this.state.storage.deleteAlarm().catch(() => {});
+      return Response.json({ armed: false, stopped: true });
+    }
+    return new Response("Not found", { status: 404 });
+  }
+
+  async alarm() {
+    let cfg = null;
+    try {
+      cfg = await getRuntimeConfig(this.env);
+    } catch {
+      cfg = null;
+    }
+    if (!cfg || !cfg.fastPollEnabled) return;
+
+    const tick = (Number(await this.state.storage.get("tick")) || 0) + 1;
+    const everyTicks = Math.max(1, cfg.fullSweepEveryTicks);
+    const mode = tick % everyTicks === 0 ? "full" : "fast";
+
+    let result;
+    try {
+      const fastCursor = Number(await this.state.storage.get("fastCursor")) || 0;
+      result = await runMonitor(this.env, cfg, { mode, skipLock: true, fastCursor });
+      if (Number.isInteger(result?.nextFastCursor)) {
+        await this.state.storage.put("fastCursor", result.nextFastCursor);
+      }
+    } catch (error) {
+      result = { ok: false, mode, error: String(error?.message || error) };
+    }
+
+    await this.state.storage.put("tick", tick);
+    await this.state.storage.put("lastTickAt", nowIso());
+    await this.state.storage.put("lastResult", result);
+
+    const base = Math.max(5, cfg.fastPollIntervalSeconds) * 1000;
+    const jitter = Math.floor(Math.random() * 2500);
+    await this.state.storage.setAlarm(Date.now() + base + jitter);
+  }
+}
+
 export default {
   fetch: handleFetch,
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(
-      runMonitor(env).catch((error) => {
-        console.error(error);
-      })
+      (async () => {
+        let cfg = null;
+        try {
+          cfg = await getRuntimeConfig(env);
+        } catch {
+          cfg = null;
+        }
+        if (cfg && cfg.fastPollEnabled && monitorStub(env)) {
+          await ensureFastPollLoop(env).catch((error) => console.error(error));
+        } else {
+          await runMonitor(env, cfg || undefined).catch((error) => console.error(error));
+        }
+      })()
     );
   }
 };
 
-export { parseProducts, parseProductStockPage, parseProductVariationJson, runMonitor };
+export { MonitorController };
+export {
+  parseProducts,
+  parseProductStockPage,
+  parseProductVariationJson,
+  runMonitor,
+  extractGridPids,
+  fastFetchProducts,
+  buildCatalogState
+};

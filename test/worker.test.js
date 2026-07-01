@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import worker from "../src/worker.js";
+import worker, { extractGridPids } from "../src/worker.js";
 
 const STATE_KEY = "state";
 const LOCK_KEY = "lock";
@@ -103,6 +103,9 @@ function fakeKV(initialState = stateWithSeen([])) {
     },
     async put(key, value) {
       values.set(key, value);
+    },
+    async delete(key) {
+      values.delete(key);
     }
   };
 }
@@ -259,6 +262,17 @@ async function runWorkerOnce(testEnv) {
   const body = await response.json();
   assert.equal(response.status, 200, JSON.stringify(body));
   return body;
+}
+
+async function runWorkerFastOnce(testEnv) {
+  const response = await worker.fetch(new Request("https://monitor.test/api/cron?mode=fast", { headers: authHeaders() }), testEnv);
+  const body = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(body));
+  return body;
+}
+
+function fastEnv(overrides = {}, kv) {
+  return env({ FAST_CATEGORY_SHARD_SIZE: "0", PROSPECTIVE_CATEGORY_IDS: "", ...overrides }, kv);
 }
 
 test("Cloudflare Worker alerts a product that only appears in a sitemap-discovered category", async () => {
@@ -721,6 +735,74 @@ test("Worker dashboard rejects unsafe runtime settings without overwriting KV", 
   assert.equal(response.status, 400);
   assert.match(body.error, /maxAlertsPerRun|Discord webhook/);
   assert.deepEqual(JSON.parse(kv.values.get(SETTINGS_KEY)), { maxAlertsPerRun: 2, extraCategoryIds: ["hat"] });
+});
+
+test("extractGridPids pulls unique product IDs from grid HTML with a regex", () => {
+  const html = `${productTile("AAA111", "ALPHA", "shop", "Shop")}${productTile("BBB222", "BETA", "shop", "Shop")}`;
+  const pids = extractGridPids(html);
+  assert.deepEqual([...pids].sort(), ["AAA111", "BBB222"]);
+});
+
+test("Fast tick alerts a new root-grid product without marking unscanned items missing", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const fresh = productTile("FAST_NEW", "FAST NEW DROP", "shop", "Shop", "250.00");
+  const kv = fakeKV(
+    stateWithActive([
+      { pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" },
+      { pid: "GONE_SHOP", name: "GONE SHOP ITEM" }
+    ])
+  );
+  const mock = createChromeHeartsFetch({
+    root: `${keep}${fresh}`,
+    productDetails: { FAST_NEW: { name: "FAST NEW DROP", categoryName: "Shop", price: "250.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerFastOnce(fastEnv({}, kv));
+
+    assert.equal(result.mode, "fast");
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["FAST_NEW"]);
+
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.seen.FAST_NEW);
+    assert.ok(state.active.FAST_NEW);
+    assert.equal(state.missing.GONE_SHOP, undefined, "partial sweep must not flag unscanned items missing");
+    assert.ok(state.active.GONE_SHOP, "absent-from-shard product stays active on a partial sweep");
+    assert.equal(mock.discordPayloads.length, 1);
+    assert.equal(mock.discordPayloads[0].embeds[0].title, "FAST NEW DROP");
+  });
+});
+
+test("Fast tick with no new products sends nothing and skips the KV write", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const before = kv.values.get(STATE_KEY);
+  const mock = createChromeHeartsFetch({ root: keep });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerFastOnce(fastEnv({}, kv));
+
+    assert.equal(result.mode, "fast");
+    assert.equal(result.alerted, 0);
+    assert.deepEqual(result.newPids, []);
+    assert.equal(mock.discordPayloads.length, 0);
+    assert.equal(kv.values.get(STATE_KEY), before, "quiet fast tick must not rewrite catalog state");
+  });
+});
+
+test("Fast tick before any baseline defers instead of alerting the whole shard", async () => {
+  const fresh = productTile("FIRST_NEW", "FIRST NEW", "shop", "Shop", "250.00");
+  const kv = fakeKV(stateWithSeen([]));
+  const mock = createChromeHeartsFetch({ root: fresh });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerFastOnce(fastEnv({}, kv));
+
+    assert.equal(result.skipped, true);
+    assert.equal(result.reason, "awaiting-baseline");
+    assert.equal(mock.discordPayloads.length, 0);
+  });
 });
 
 test("Worker dashboard and health pages are private", async () => {

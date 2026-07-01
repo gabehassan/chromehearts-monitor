@@ -7,7 +7,11 @@ compatibility_flags = ["nodejs_compat"]
 enabled = true
 
 [vars]
-CHECK_MIN_INTERVAL_SECONDS = "50"
+FAST_POLL_ENABLED = "true"
+FAST_POLL_INTERVAL_SECONDS = "15"
+FULL_SWEEP_EVERY_TICKS = "4"
+FAST_CATEGORY_SHARD_SIZE = "6"
+CHECK_MIN_INTERVAL_SECONDS = "0"
 CATEGORY_FETCH_CONCURRENCY = "8"
 SETTINGS_KEY = "chrome-hearts:cloudflare:settings"
 EXACT_STOCK_PROBE_CONCURRENCY = "3"
@@ -37,3 +41,11 @@ crons = ["* * * * *"]
 binding = "STATE"
 id = "<your-kv-namespace-id>"
 preview_id = "<your-preview-kv-namespace-id>"
+
+[[durable_objects.bindings]]
+name = "MONITOR"
+class_name = "MonitorController"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MonitorController"]
