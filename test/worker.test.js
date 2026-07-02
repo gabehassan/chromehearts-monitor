@@ -151,6 +151,7 @@ function basicAuthHeaders(password = "secret") {
 function createChromeHeartsFetch({
   root = "",
   categories = {},
+  searches = {},
   sitemapCategories = [],
   sitemapProductUrls = [],
   homepageCategories = [],
@@ -162,6 +163,7 @@ function createChromeHeartsFetch({
   const discordPayloads = [];
   const discordUrls = [];
   const gridCategoryCalls = [];
+  const searchCalls = [];
 
   const fetchMock = async (input, init = {}) => {
     const url = new URL(String(input));
@@ -217,6 +219,11 @@ function createChromeHeartsFetch({
     }
 
     if (url.pathname.includes("/Search-UpdateGrid")) {
+      const q = url.searchParams.get("q");
+      if (q) {
+        searchCalls.push(q);
+        return new Response(searches[q] || "", { status: 200, headers: { "content-type": "text/html" } });
+      }
       const cgid = url.searchParams.get("cgid");
       gridCategoryCalls.push(cgid);
       return new Response(cgid === "root" ? root : categories[cgid] || "", {
@@ -244,7 +251,7 @@ function createChromeHeartsFetch({
     });
   };
 
-  return { fetchMock, discordPayloads, discordUrls, gridCategoryCalls };
+  return { fetchMock, discordPayloads, discordUrls, gridCategoryCalls, searchCalls };
 }
 
 async function withMockedFetch(fetchMock, fn) {
@@ -900,6 +907,65 @@ test("DO-managed quiet full sweep skips the KV write entirely", async () => {
     assert.equal(second.kvWrite, false, "unchanged catalog must not burn a KV write");
     assert.equal(kv.values.get(STATE_KEY), before);
     assert.equal(mock.discordPayloads.length, 0);
+  });
+});
+
+test("Full sweep alerts a product visible only via the cross-category search lane", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const hiddenDrop = productTile("SEARCH_ONLY", "SEARCH ONLY DROP", "mystery-category", "Mystery", "990.00");
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({
+    root: oldProduct,
+    searches: { chrome: `${oldProduct}${hiddenDrop}` },
+    productDetails: {
+      SEARCH_ONLY: { name: "SEARCH ONLY DROP", categoryName: "Mystery", price: "990.00" }
+    }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["SEARCH_ONLY"]);
+    assert.ok(mock.searchCalls.includes("chrome"));
+    assert.equal(result.sweep.newFromSearch, 1);
+    assert.equal(mock.discordPayloads[0].embeds[0].title, "SEARCH ONLY DROP");
+
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.knownCategoryIds.includes("mystery-category"));
+  });
+});
+
+test("Fast tick alerts a product visible only via the search lane", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const hiddenDrop = productTile("FAST_SEARCH_ONLY", "FAST SEARCH DROP", "mystery-category", "Mystery", "450.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({
+    root: keep,
+    searches: { hearts: hiddenDrop },
+    productDetails: {
+      FAST_SEARCH_ONLY: { name: "FAST SEARCH DROP", categoryName: "Mystery", price: "450.00" }
+    }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerFastOnce(fastEnv({}, kv));
+
+    assert.equal(result.mode, "fast");
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["FAST_SEARCH_ONLY"]);
+    assert.ok(mock.searchCalls.includes("hearts"));
+    assert.equal(mock.discordPayloads[0].embeds[0].title, "FAST SEARCH DROP");
   });
 });
 

@@ -343,6 +343,12 @@ function getConfig(env) {
     fastMaxCategories: intSetting(env, "FAST_MAX_CATEGORIES", 45, 2),
     subrequestHardCap: intSetting(env, "SUBREQUEST_HARD_CAP", 46, 0),
     discoveryEveryFullSweeps: intSetting(env, "DISCOVERY_EVERY_FULL_SWEEPS", 10, 1),
+    searchQueries: uniqueValues(
+      String(env.SEARCH_QUERIES === undefined ? "chrome,hearts" : env.SEARCH_QUERIES)
+        .split(/[\s,]+/)
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean)
+    ).slice(0, 5),
     // Structured run logging for debugging + data collection.
     logBufferSize: intSetting(env, "LOG_BUFFER_SIZE", 200, 0),
     logVerbose: boolSetting(env, "LOG_VERBOSE", true),
@@ -596,6 +602,23 @@ function productGridUrl(cgid, start, pageSize) {
   return url.toString();
 }
 
+function productSearchUrl(query, pageSize) {
+  const url = new URL(PRODUCT_GRID_BASE_URL);
+  url.searchParams.set("q", query);
+  url.searchParams.set("start", "0");
+  url.searchParams.set("sz", String(pageSize));
+  return url.toString();
+}
+
+async function fetchSearchHtmlSafe(query, cfg) {
+  try {
+    if (subrequestsLeft(cfg) <= 4) return "";
+    return await fetchHtml(productSearchUrl(query, cfg.pageSize), cfg);
+  } catch {
+    return "";
+  }
+}
+
 function categoryFromUrl(url) {
   try {
     const path = new URL(url).pathname.replace(/^\/+|\/+$/g, "");
@@ -761,7 +784,7 @@ async function productDiscoverySignals(cfg, state = {}) {
     ...homepage.categoryIds,
     ...cfg.extraCategoryIds
   ]);
-  const reserve = cfg.lightDiscoveryRun ? 0 : discoveryFetchReserve(cfg);
+  const reserve = (cfg.lightDiscoveryRun ? 0 : discoveryFetchReserve(cfg)) + (cfg.searchQueries?.length || 0);
   const maxCategoryFetches = Math.max(2, cfg.maxStorefrontSubrequests - reserve - cfg.maxDirectProductUrls);
   const categoryLimit = Math.min(cfg.maxCategoryIds, maxCategoryFetches);
   const prospectiveCursor = finiteInteger(state.prospectiveCategoryCursor, 0);
@@ -892,11 +915,26 @@ async function fetchProducts(cfg, state = {}) {
     if (product) allProducts[product.pid] = product;
   }
 
+  let newFromSearch = 0;
+  for (const query of cfg.searchQueries || []) {
+    const found = parseProducts(await fetchSearchHtmlSafe(query, cfg));
+    for (const [pid, product] of Object.entries(found)) {
+      if (!allProducts[pid]) {
+        newFromSearch += 1;
+        const categoryId = categoryIdFromUrl(product.url);
+        if (categoryId) activeCategoryIds.add(categoryId);
+      }
+      allProducts[pid] = product;
+    }
+  }
+
   cfg.sweepStats = {
     categoriesScanned: visitedCategoryIds.size,
     activeCategoryIds: [...activeCategoryIds],
     failedCategoryIds,
-    failedCategoryCount: failedCategoryIds.length
+    failedCategoryCount: failedCategoryIds.length,
+    searchQueryCount: (cfg.searchQueries || []).length,
+    newFromSearch
   };
 
   const count = Object.keys(allProducts).length;
@@ -931,14 +969,18 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
     : Array.isArray(state.activeCategoryIds)
     ? state.activeCategoryIds
     : [];
-  const cap = Math.max(2, cfg.fastMaxCategories);
+  const searchQueries = cfg.searchQueries || [];
+  const cap = Math.max(2, cfg.fastMaxCategories - searchQueries.length);
   const shardReserve = Math.min(10, cfg.fastCategoryShardSize);
   const head = uniqueValues(["root", "shop", ...knownCategoryIds]).slice(0, Math.max(2, cap - shardReserve));
   const shardRoom = Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
   const shard = rotatingSlice(pool, fastCursor, shardRoom);
   const cgids = uniqueValues([...head, ...shard]);
   const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
-  const combinedHtml = htmls.join("\n");
+  const searchHtmls = await mapWithConcurrency(searchQueries, cfg.categoryFetchConcurrency, (query) =>
+    fetchSearchHtmlSafe(query, cfg)
+  );
+  const combinedHtml = [...htmls, ...searchHtmls].join("\n");
   const pidUniverse = extractGridPids(combinedHtml);
 
   const previousSeen = state.seen || {};
@@ -954,6 +996,8 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
     cgidCount: cgids.length,
     activeCategoryCount: knownCategoryIds.length,
     shardSize: shard.length,
+    searchQueries: searchQueries.length,
+    searchFetched: searchHtmls.filter(Boolean).length,
     fetched: htmls.filter(Boolean).length,
     pidUniverse: pidUniverse.size,
     candidates: candidatePids.length,
@@ -1752,6 +1796,8 @@ function runLogEntry(mode, result, ms, cfg) {
     categoriesScanned: sweep?.categoriesScanned ?? result.fast?.cgidCount ?? null,
     activeCategories: sweep ? sweep.activeCategoryIds?.length ?? null : result.fast?.activeCategoryCount ?? null,
     failedCategories: sweep?.failedCategoryCount ?? 0,
+    searches: sweep?.searchQueryCount ?? result.fast?.searchQueries ?? 0,
+    newFromSearch: sweep?.newFromSearch ?? null,
     error: result.error || null
   };
 }
