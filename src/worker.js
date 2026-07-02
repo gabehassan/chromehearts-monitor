@@ -2370,7 +2370,7 @@ async function handleFetch(request, env) {
   if (url.pathname === "/internal/scan-grids") {
     if (request.method !== "POST") return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
     if (!isAuthorized(request, baseCfg)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
-    const cfg = await getRuntimeConfig(env);
+    const cfg = baseCfg;
     cfg.subrequestsUsed = 0;
     const body = await request.json().catch(() => ({}));
     const cgids = (Array.isArray(body.cgids) ? body.cgids : [])
