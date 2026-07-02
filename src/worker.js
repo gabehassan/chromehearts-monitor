@@ -1584,12 +1584,6 @@ function sizeLabels(product, inStock) {
     .filter(Boolean);
 }
 
-function stockSummary(product) {
-  if (!product.sizes || product.sizes.length === 0) return product.detailError ? "Unavailable" : "Awaiting size data";
-  if (product.inStockSizeCount > 0) return `${product.inStockSizeCount} of ${product.sizes.length} sizes available`;
-  return `0 of ${product.sizes.length} sizes available`;
-}
-
 function embedDescription(product, price) {
   const description = truncate(product.description || "", 4096);
   if (description) return description;
@@ -1650,10 +1644,8 @@ function buildProductEmbed(product) {
   const price = priceText(product.price) || "unknown";
   const inStock = compactList(sizeLabels(product, true)) || "none";
   const outOfStock = compactList(sizeLabels(product, false)) || "none";
-  const live = product.inStockSizeCount > 0;
   const fields = [
     { name: "Price", value: truncate(price, 1024), inline: true },
-    { name: "Availability", value: truncate(stockSummary(product), 1024), inline: true },
     { name: "Category", value: truncate(product.category || "unknown", 1024), inline: true },
     { name: "Available sizes", value: truncate(inStock, 1024), inline: false },
     { name: "Unavailable sizes", value: truncate(outOfStock, 1024), inline: false },
@@ -1673,7 +1665,7 @@ function buildProductEmbed(product) {
     title: truncate(product.name || product.pid, 256),
     url: product.url,
     description: embedDescription(product, price),
-    color: live ? 0xb8f3d4 : 0xb7b2ff,
+    color: 0xffffff,
     fields,
     footer: { text: "Chrome Hearts monitor - new item alert" },
     timestamp: nowIso()

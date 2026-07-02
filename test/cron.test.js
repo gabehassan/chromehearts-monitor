@@ -104,7 +104,7 @@ test("buildEmbeds limits Discord payload fields", () => {
   assert.equal(embeds.length, 1);
   assert.equal(embeds[0].title.length, 256);
   assert.equal(embeds[0].fields.find((field) => field.name === "Price").value, "$1,000");
-  assert.equal(embeds[0].fields.find((field) => field.name === "Availability").value, "Awaiting size data");
+  assert.equal(embeds[0].fields.find((field) => field.name === "Availability"), undefined);
   assert.equal(embeds[0].author.name, "Chrome Hearts Drop Monitor");
   assert.equal(/[✦✧✹✠☾✣◆◇†⌁]/.test(JSON.stringify(embeds[0])), false);
 });
@@ -140,7 +140,7 @@ test("buildProductEmbed includes PDP description, price, image, stock, and size 
   assert.equal(embed.description, "Black cotton fleece hoodie with Chrome Hearts sleeve print.\nMade in USA.");
   assert.equal(embed.image.url, "https://www.chromehearts.com/image.png");
   assert.equal(embed.fields.find((field) => field.name === "Price").value, "$750");
-  assert.equal(embed.fields.find((field) => field.name === "Availability").value, "2 of 3 sizes available");
+  assert.equal(embed.fields.find((field) => field.name === "Availability"), undefined);
   assert.equal(embed.fields.find((field) => field.name === "Available sizes").value, "XS, XXL");
   assert.equal(embed.fields.find((field) => field.name === "Unavailable sizes").value, "L");
   assert.equal(embed.fields.find((field) => field.name === "† Inventory"), undefined);
@@ -150,7 +150,7 @@ test("buildProductEmbed includes PDP description, price, image, stock, and size 
   assert.equal(embed.description.includes("//"), false);
   assert.equal(embed.description.includes("Silver signal"), false);
   assert.equal(/[✦✧✹✠☾✣◆◇†⌁]/.test(JSON.stringify(embed)), false);
-  assert.equal(embed.color, 0xb8f3d4);
+  assert.equal(embed.color, 0xffffff);
 });
 
 test("buildProductEmbed only shows inventory when exact stock is known", () => {

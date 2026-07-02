@@ -301,7 +301,14 @@ test("Cloudflare Worker alerts a product that only appears in a sitemap-discover
     assert.ok(mock.gridCategoryCalls.includes("root"));
     assert.ok(mock.gridCategoryCalls.includes("hat"));
     assert.equal(mock.discordPayloads.length, 1);
-    assert.equal(mock.discordPayloads[0].embeds[0].title, "NEW HAT");
+    const embed = mock.discordPayloads[0].embeds[0];
+    assert.equal(embed.title, "NEW HAT");
+    assert.equal(embed.color, 0xffffff, "embed accent bar is white");
+    assert.equal(
+      embed.fields.find((field) => field.name === "Availability"),
+      undefined,
+      "Availability field removed from alerts"
+    );
   });
 });
 
