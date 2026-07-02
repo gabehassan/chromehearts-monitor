@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import worker, { extractGridPids } from "../src/worker.js";
+import worker, { extractGridPids, runMonitor } from "../src/worker.js";
 
 const STATE_KEY = "state";
 const LOCK_KEY = "lock";
@@ -836,6 +836,69 @@ test("Fast tick before any baseline defers instead of alerting the whole shard",
 
     assert.equal(result.skipped, true);
     assert.equal(result.reason, "awaiting-baseline");
+    assert.equal(mock.discordPayloads.length, 0);
+  });
+});
+
+test("Alert still sends from grid data when the subrequest budget is exhausted", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const newProduct = productTile("BUDGET_NEW", "BUDGET DROP", "shop", "Shop", "450.00");
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({ root: `${oldProduct}${newProduct}` });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          SUBREQUEST_HARD_CAP: "0"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["BUDGET_NEW"]);
+    assert.equal(mock.discordPayloads.length, 1, "Discord send must never be sacrificed to the budget");
+    const embed = mock.discordPayloads[0].embeds[0];
+    assert.equal(embed.title, "BUDGET DROP");
+    const details = embed.fields.find((field) => field.name === "Details");
+    assert.match(details.value, /subrequest budget/);
+  });
+});
+
+test("DO-managed quiet full sweep skips the KV write entirely", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const testEnv = env(
+    {
+      DISCOVER_HOMEPAGE_CATEGORIES: "false",
+      DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+      DISCOVER_SITEMAP_CATEGORIES: "false",
+      DISCOVER_ROBOTS_PRODUCTS: "false",
+      MAX_DIRECT_PRODUCT_URLS: "0"
+    },
+    kv
+  );
+  const mock = createChromeHeartsFetch({ root: keep });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const first = await runMonitor(testEnv, null, { mode: "full", skipLock: true, prospectiveCursor: 0 });
+    assert.equal(first.kvWrite, true, "first sweep records lastRunAt/activeCategoryIds");
+    assert.ok(Number.isInteger(first.nextProspectiveCursor), "full sweep reports the DO-owned rotation cursor");
+
+    const before = kv.values.get(STATE_KEY);
+    const second = await runMonitor(testEnv, null, {
+      mode: "full",
+      skipLock: true,
+      prospectiveCursor: first.nextProspectiveCursor
+    });
+    assert.equal(second.kvWrite, false, "unchanged catalog must not burn a KV write");
+    assert.equal(kv.values.get(STATE_KEY), before);
     assert.equal(mock.discordPayloads.length, 0);
   });
 });

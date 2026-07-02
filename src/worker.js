@@ -341,6 +341,8 @@ function getConfig(env) {
     fullSweepEveryTicks: intSetting(env, "FULL_SWEEP_EVERY_TICKS", 4, 1),
     fastCategoryShardSize: intSetting(env, "FAST_CATEGORY_SHARD_SIZE", 40, 0),
     fastMaxCategories: intSetting(env, "FAST_MAX_CATEGORIES", 45, 2),
+    subrequestHardCap: intSetting(env, "SUBREQUEST_HARD_CAP", 46, 0),
+    discoveryEveryFullSweeps: intSetting(env, "DISCOVERY_EVERY_FULL_SWEEPS", 10, 1),
     // Structured run logging for debugging + data collection.
     logBufferSize: intSetting(env, "LOG_BUFFER_SIZE", 200, 0),
     logVerbose: boolSetting(env, "LOG_VERBOSE", true),
@@ -571,7 +573,17 @@ function fetchOptions(cfg, accept) {
   };
 }
 
-async function fetchWithTimeout(url, options, timeoutMs) {
+function spendSubrequest(cfg) {
+  if (cfg && typeof cfg === "object") cfg.subrequestsUsed = (cfg.subrequestsUsed || 0) + 1;
+}
+
+function subrequestsLeft(cfg) {
+  if (!cfg || !Number.isFinite(cfg.subrequestHardCap)) return Infinity;
+  return cfg.subrequestHardCap - (cfg.subrequestsUsed || 0);
+}
+
+async function fetchWithTimeout(url, options, timeoutMs, cfg = null) {
+  spendSubrequest(cfg);
   const signal = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(timeoutMs) : undefined;
   return fetch(url, { ...options, signal });
 }
@@ -597,7 +609,8 @@ async function fetchHtml(url, cfg) {
   const response = await fetchWithTimeout(
     url,
     fetchOptions(cfg, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-    cfg.requestTimeoutMs
+    cfg.requestTimeoutMs,
+    cfg
   );
   if (!response.ok) throw new MonitorError(`Chrome Hearts returned HTTP ${response.status}`, 502);
   return response.text();
@@ -675,7 +688,8 @@ async function fetchSitemapSignals(cfg) {
     const indexResponse = await fetchWithTimeout(
       cfg.sitemapIndexUrl,
       fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"),
-      cfg.requestTimeoutMs
+      cfg.requestTimeoutMs,
+      cfg
     );
     if (!indexResponse.ok) return empty;
 
@@ -683,7 +697,7 @@ async function fetchSitemapSignals(cfg) {
     const categoryIds = [];
     const productUrls = [];
     for (const sitemapUrl of sitemapUrls.slice(0, 5)) {
-      const response = await fetchWithTimeout(sitemapUrl, fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs);
+      const response = await fetchWithTimeout(sitemapUrl, fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs, cfg);
       if (!response.ok) continue;
       for (const loc of extractXmlLocations(await response.text())) {
         const categoryId = categoryIdFromUrl(loc);
@@ -716,7 +730,7 @@ async function fetchHomepageSignals(cfg) {
 async function fetchRobotsProductUrls(cfg) {
   if (!cfg.discoverRobotsProducts) return [];
   try {
-    const response = await fetchWithTimeout(ROBOTS_URL, fetchOptions(cfg, "text/plain,*/*;q=0.8"), cfg.requestTimeoutMs);
+    const response = await fetchWithTimeout(ROBOTS_URL, fetchOptions(cfg, "text/plain,*/*;q=0.8"), cfg.requestTimeoutMs, cfg);
     if (!response.ok) return [];
     return [...(await response.text()).matchAll(/(?:Allow|Disallow):\s*(\S+)/gi)]
       .map((match) => productUrlFromUrl(match[1]))
@@ -735,11 +749,10 @@ function discoveryFetchReserve(cfg) {
 }
 
 async function productDiscoverySignals(cfg, state = {}) {
-  const [sitemap, homepage, robotsProductUrls] = await Promise.all([
-    fetchSitemapSignals(cfg),
-    fetchHomepageSignals(cfg),
-    fetchRobotsProductUrls(cfg)
-  ]);
+  const emptySignals = { categoryIds: [], productUrls: [] };
+  const [sitemap, homepage, robotsProductUrls] = cfg.lightDiscoveryRun
+    ? [emptySignals, emptySignals, []]
+    : await Promise.all([fetchSitemapSignals(cfg), fetchHomepageSignals(cfg), fetchRobotsProductUrls(cfg)]);
   const baseCategoryIds = uniqueValues([
     "root",
     "shop",
@@ -748,7 +761,7 @@ async function productDiscoverySignals(cfg, state = {}) {
     ...homepage.categoryIds,
     ...cfg.extraCategoryIds
   ]);
-  const reserve = discoveryFetchReserve(cfg);
+  const reserve = cfg.lightDiscoveryRun ? 0 : discoveryFetchReserve(cfg);
   const maxCategoryFetches = Math.max(2, cfg.maxStorefrontSubrequests - reserve - cfg.maxDirectProductUrls);
   const categoryLimit = Math.min(cfg.maxCategoryIds, maxCategoryFetches);
   const prospectiveCursor = finiteInteger(state.prospectiveCategoryCursor, 0);
@@ -799,6 +812,7 @@ async function fetchProductsForCategory(cgid, cfg, maxPages) {
 
 async function fetchDirectProduct(productUrl, cfg) {
   try {
+    if (subrequestsLeft(cfg) <= 6) return null;
     const html = await fetchHtml(productUrl, cfg);
     const snapshot = parseProductStockPage(html, productUrl);
     const pid = snapshot.masterPid || snapshot.selectedVariantPid || productUrl.match(/\/([^/]+)\.html/)?.[1] || "";
@@ -918,7 +932,8 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
     ? state.activeCategoryIds
     : [];
   const cap = Math.max(2, cfg.fastMaxCategories);
-  const head = uniqueValues(["root", "shop", ...knownCategoryIds]).slice(0, cap);
+  const shardReserve = Math.min(10, cfg.fastCategoryShardSize);
+  const head = uniqueValues(["root", "shop", ...knownCategoryIds]).slice(0, Math.max(2, cap - shardReserve));
   const shardRoom = Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
   const shard = rotatingSlice(pool, fastCursor, shardRoom);
   const cgids = uniqueValues([...head, ...shard]);
@@ -1367,6 +1382,7 @@ async function probeExactStock(snapshot, cfg) {
   const nextSizes = await mapWithConcurrency(sizes, cfg.exactStockProbeConcurrency, async (size) => {
     if (!size.inStock) return { ...size, exactStockKnown: true, exactStock: 0 };
     if (!size.variationUrl) return size;
+    if (subrequestsLeft(cfg) <= 4) return { ...size, exactStockError: "subrequest budget reserved" };
 
     try {
       const response = await fetchWithTimeout(
@@ -1379,7 +1395,8 @@ async function probeExactStock(snapshot, cfg) {
           },
           cache: "no-store"
         },
-        cfg.requestTimeoutMs
+        cfg.requestTimeoutMs,
+        cfg
       );
       if (!response.ok) return { ...size, exactStockError: `HTTP ${response.status}` };
       const stock = exactStockFromProduct((await response.json())?.product || {});
@@ -1406,7 +1423,8 @@ async function fetchStockSnapshot(productUrl, cfg) {
   const response = await fetchWithTimeout(
     productUrl,
     fetchOptions(cfg, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-    cfg.requestTimeoutMs
+    cfg.requestTimeoutMs,
+    cfg
   );
   if (!response.ok) throw new MonitorError(`Chrome Hearts returned HTTP ${response.status}`, 502);
 
@@ -1415,7 +1433,7 @@ async function fetchStockSnapshot(productUrl, cfg) {
     throw new MonitorError("Product detail page did not contain product metadata");
   }
 
-  if (snapshot.variationUrl) {
+  if (snapshot.variationUrl && subrequestsLeft(cfg) > 4) {
     try {
       const variationResponse = await fetchWithTimeout(
         snapshot.variationUrl,
@@ -1427,7 +1445,8 @@ async function fetchStockSnapshot(productUrl, cfg) {
           },
           cache: "no-store"
         },
-        cfg.requestTimeoutMs
+        cfg.requestTimeoutMs,
+        cfg
       );
       if (variationResponse.ok) {
         snapshot = applyVariationStock(snapshot, parseProductVariationJson(await variationResponse.json(), snapshot.variationUrl));
@@ -1502,7 +1521,8 @@ function shouldSkipForInterval(state, cfg) {
 
 function computeBackoffUntil(state, cfg) {
   const streak = Math.max(1, Number(state.errorStreak || 0) + 1);
-  const seconds = Math.min(cfg.maxBackoffSeconds, Math.max(cfg.checkMinIntervalSeconds || 60, 2 ** Math.min(streak - 1, 8)));
+  const floorSeconds = Math.max(5, cfg.fastPollIntervalSeconds || cfg.checkMinIntervalSeconds || 60);
+  const seconds = Math.min(cfg.maxBackoffSeconds, Math.max(floorSeconds, 2 ** Math.min(streak - 1, 8)));
   return {
     errorStreak: streak,
     backoffUntil: new Date(Date.now() + seconds * 1000).toISOString()
@@ -1562,6 +1582,9 @@ function mergeProductDetail(product, detail) {
 
 async function enrichProduct(product, cfg) {
   try {
+    if (subrequestsLeft(cfg) <= 3) {
+      throw new MonitorError("subrequest budget reserved for alert delivery");
+    }
     return mergeProductDetail(product, await fetchStockSnapshot(product.url, cfg));
   } catch (error) {
     return {
@@ -1637,7 +1660,8 @@ async function sendDiscord(cfg, products) {
           body: JSON.stringify(payload),
           cache: "no-store"
         },
-        cfg.webhookTimeoutMs
+        cfg.webhookTimeoutMs,
+        cfg
       );
       if (response.ok) break;
       if (response.status === 429 && attempt < 3) {
@@ -1732,13 +1756,28 @@ function runLogEntry(mode, result, ms, cfg) {
   };
 }
 
+function catalogFingerprint(state) {
+  return JSON.stringify([
+    Object.keys(state.seen || {}).sort(),
+    Object.keys(state.active || state.seen || {}).sort(),
+    Object.entries(state.missing || {})
+      .map(([pid, entry]) => `${pid}:${entry?.count || 0}`)
+      .sort(),
+    state.knownCategoryIds || [],
+    state.activeCategoryIds || []
+  ]);
+}
+
 async function runMonitor(env, cfg = null, opts = {}) {
   if (!cfg) cfg = await getRuntimeConfig(env);
   const mode = opts.mode === "fast" ? "fast" : "full";
   const skipLock = opts.skipLock === true;
   const fastCursor = mode === "fast" ? finiteInteger(opts.fastCursor, 0) : 0;
+  const externalProspectiveCursor = Number.isInteger(opts.prospectiveCursor) ? opts.prospectiveCursor : null;
   const startedAt = Date.now();
   cfg.sweepStats = null;
+  cfg.subrequestsUsed = 0;
+  cfg.lightDiscoveryRun = opts.lightDiscovery === true;
   const done = (result) => {
     logRun(cfg, runLogEntry(mode, result, Date.now() - startedAt, cfg));
     return result;
@@ -1792,7 +1831,10 @@ async function runMonitor(env, cfg = null, opts = {}) {
         });
       }
     } else {
-      products = await fetchProducts(cfg, state);
+      products = await fetchProducts(
+        cfg,
+        externalProspectiveCursor === null ? state : { ...state, prospectiveCategoryCursor: externalProspectiveCursor }
+      );
     }
 
     const newPids = Object.keys(products).filter(
@@ -1826,6 +1868,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
       sweep,
       fast: fastMeta,
       nextFastCursor,
+      nextProspectiveCursor: mode === "full" ? cfg.discoveryRun?.nextProspectiveCategoryCursor ?? null : null,
+      subrequestsUsed: cfg.subrequestsUsed || 0,
       storage: "cloudflare-kv",
       checkedAt: nowIso()
     };
@@ -1844,8 +1888,10 @@ async function runMonitor(env, cfg = null, opts = {}) {
       lastErrorAt: null
     };
     if (mode === "full") {
-      nextState.prospectiveCategoryCursor =
-        cfg.discoveryRun?.nextProspectiveCategoryCursor ?? state.prospectiveCategoryCursor ?? 0;
+      if (externalProspectiveCursor === null) {
+        nextState.prospectiveCategoryCursor =
+          cfg.discoveryRun?.nextProspectiveCategoryCursor ?? state.prospectiveCategoryCursor ?? 0;
+      }
       if (sweep && !degraded) nextState.activeCategoryIds = sweep.activeCategoryIds;
       const learned = uniqueValues([
         ...(Array.isArray(state.knownCategoryIds) ? state.knownCategoryIds : []),
@@ -1856,7 +1902,19 @@ async function runMonitor(env, cfg = null, opts = {}) {
       ]).filter((cgid) => cgid && cgid !== "root" && cgid !== "shop");
       nextState.knownCategoryIds = learned.slice(-120);
     }
-    await saveState(env, cfg, nextState);
+
+    const quietFullSweep =
+      mode === "full" &&
+      externalProspectiveCursor !== null &&
+      !baseline &&
+      enriched.length === 0 &&
+      deferredProducts.length === 0 &&
+      Boolean(state.lastRunAt) &&
+      !state.lastError &&
+      !state.backoffUntil &&
+      catalogFingerprint(nextState) === catalogFingerprint(state);
+    result.kvWrite = !quietFullSweep;
+    if (!quietFullSweep) await saveState(env, cfg, nextState);
 
     return done(result);
   } catch (error) {
@@ -2278,6 +2336,8 @@ class MonitorController {
       lastTickAt: (await this.state.storage.get("lastTickAt")) || null,
       nextAlarm: alarm ? new Date(alarm).toISOString() : null,
       fastCursor: Number(await this.state.storage.get("fastCursor")) || 0,
+      prospectiveCursor: Number(await this.state.storage.get("prospectiveCursor")) || 0,
+      fullSweeps: Number(await this.state.storage.get("fullCount")) || 0,
       logCount: logs.length,
       lastResult: (await this.state.storage.get("lastResult")) || null
     };
@@ -2324,19 +2384,26 @@ class MonitorController {
     const startedAt = Date.now();
 
     let result;
+    const nextKeys = { tick, lastTickAt: nowIso() };
     try {
       const fastCursor = Number(await this.state.storage.get("fastCursor")) || 0;
-      result = await runMonitor(this.env, cfg, { mode, skipLock: true, fastCursor });
-      if (Number.isInteger(result?.nextFastCursor)) {
-        await this.state.storage.put("fastCursor", result.nextFastCursor);
+      const prospectiveCursor = Number(await this.state.storage.get("prospectiveCursor")) || 0;
+      const fullCount = (Number(await this.state.storage.get("fullCount")) || 0) + (mode === "full" ? 1 : 0);
+      const lightDiscovery = mode === "full" && fullCount % Math.max(1, cfg.discoveryEveryFullSweeps) !== 0;
+      result = await runMonitor(this.env, cfg, { mode, skipLock: true, fastCursor, prospectiveCursor, lightDiscovery });
+      if (mode === "fast" && Number.isInteger(result?.nextFastCursor)) {
+        nextKeys.fastCursor = result.nextFastCursor;
+      }
+      if (mode === "full") {
+        nextKeys.fullCount = fullCount;
+        if (Number.isInteger(result?.nextProspectiveCursor)) nextKeys.prospectiveCursor = result.nextProspectiveCursor;
       }
     } catch (error) {
       result = { ok: false, mode, error: String(error?.message || error) };
     }
 
-    await this.state.storage.put("tick", tick);
-    await this.state.storage.put("lastTickAt", nowIso());
-    await this.state.storage.put("lastResult", result);
+    nextKeys.lastResult = result;
+    await this.state.storage.put(nextKeys);
     // Ring buffer of recent ticks for the /logs endpoint.
     await this.record(
       {
