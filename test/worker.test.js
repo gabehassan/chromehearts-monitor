@@ -976,6 +976,69 @@ test("Fast tick alerts a product visible only via the search lane", async () => 
   });
 });
 
+test("Fast tick fans the whole category universe out through the SELF binding", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const deepDrop = productTile("DEEP_NEW", "DEEP UNIVERSE DROP", "deep-category", "Deep", "800.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const requestedCgids = [];
+  const self = {
+    async fetch(_url, init) {
+      const { cgids } = JSON.parse(init.body);
+      requestedCgids.push(...cgids);
+      const products = {};
+      if (cgids.includes("deep-category")) {
+        products.DEEP_NEW = {
+          pid: "DEEP_NEW",
+          name: "DEEP UNIVERSE DROP",
+          price: "800.00",
+          brand: "Chrome Hearts",
+          category: "Deep",
+          productType: "master",
+          url: "https://www.chromehearts.com/deep-category/deep-universe-drop/DEEP_NEW.html",
+          image: ""
+        };
+      }
+      return new Response(JSON.stringify({ ok: true, products, activeCgids: [], failed: [], scanned: cgids.length }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  };
+  const universe = [...Array.from({ length: 30 }, (_, index) => `filler-${index}`), "deep-category"].join(",");
+  const mock = createChromeHeartsFetch({
+    root: keep,
+    productDetails: { DEEP_NEW: { name: "DEEP UNIVERSE DROP", categoryName: "Deep", price: "800.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const testEnv = { ...env({ PROSPECTIVE_CATEGORY_IDS: universe, FAST_CATEGORY_SHARD_SIZE: "5" }, kv), SELF: self };
+    const response = await worker.fetch(new Request("https://monitor.test/api/cron?mode=fast", { headers: authHeaders() }), testEnv);
+    const result = await response.json();
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["DEEP_NEW"]);
+    assert.ok(requestedCgids.includes("deep-category"), "fan-out must cover the whole universe in one tick");
+    assert.equal(result.fast.fanoutSlices > 0, true);
+    assert.equal(mock.discordPayloads[0].embeds[0].title, "DEEP UNIVERSE DROP");
+  });
+});
+
+test("Fast tick falls back to shard rotation when the SELF binding is absent", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({ root: keep });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerFastOnce(
+      env({ PROSPECTIVE_CATEGORY_IDS: "cat-a,cat-b,cat-c,cat-d", FAST_CATEGORY_SHARD_SIZE: "2" }, kv)
+    );
+
+    assert.equal(result.fast.fanoutSlices, null);
+    assert.equal(result.fast.shardSize, 2);
+    assert.equal(result.nextFastCursor, 2, "cursor advances only in fallback rotation mode");
+  });
+});
+
 test("Worker dashboard and health pages are private", async () => {
   const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
   const testEnv = env({}, kv);

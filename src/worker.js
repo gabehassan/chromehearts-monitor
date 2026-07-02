@@ -343,6 +343,8 @@ function getConfig(env) {
     fastMaxCategories: intSetting(env, "FAST_MAX_CATEGORIES", 45, 2),
     subrequestHardCap: intSetting(env, "SUBREQUEST_HARD_CAP", 46, 0),
     discoveryEveryFullSweeps: intSetting(env, "DISCOVERY_EVERY_FULL_SWEEPS", 10, 1),
+    fanoutEnabled: boolSetting(env, "FANOUT_ENABLED", true),
+    fanoutSliceSize: intSetting(env, "FANOUT_SLICE_SIZE", 30, 5),
     searchQueries: uniqueValues(
       String(env.SEARCH_QUERIES === undefined ? "chrome,hearts" : env.SEARCH_QUERIES)
         .split(/[\s,]+/)
@@ -962,7 +964,63 @@ async function fetchGridHtmlSafe(cgid, cfg) {
   }
 }
 
-async function fastFetchProducts(cfg, state, fastCursor = 0) {
+async function selfScanGrids(env, cfg, cgids) {
+  if (!cfg.fanoutEnabled || !env?.SELF || typeof env.SELF.fetch !== "function" || !cgids.length) return null;
+  const sliceSize = Math.max(5, cfg.fanoutSliceSize);
+  const slices = [];
+  for (let index = 0; index < cgids.length; index += sliceSize) {
+    slices.push(cgids.slice(index, index + sliceSize));
+  }
+
+  const results = await mapWithConcurrency(slices, 6, async (slice) => {
+    try {
+      spendSubrequest(cfg);
+      const response = await env.SELF.fetch("https://monitor.internal/internal/scan-grids", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${cfg.cronSecret}` },
+        body: JSON.stringify({ cgids: slice })
+      });
+      if (!response.ok) return null;
+      const body = await response.json();
+      return body && body.ok ? body : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const okResults = results.filter(Boolean);
+  if (!okResults.length) return null;
+  const merged = { products: {}, activeCgids: [], failed: [], slices: slices.length, slicesOk: okResults.length, scanned: 0 };
+  for (const result of okResults) {
+    Object.assign(merged.products, result.products || {});
+    merged.activeCgids.push(...(result.activeCgids || []));
+    merged.failed.push(...(result.failed || []));
+    merged.scanned += result.scanned || 0;
+  }
+  results.forEach((result, index) => {
+    if (!result) merged.failed.push(...slices[index]);
+  });
+  return merged;
+}
+
+async function scanGridsSlice(env, cfg, cgids) {
+  const products = {};
+  const activeCgids = [];
+  const failed = [];
+  const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
+  htmls.forEach((html, index) => {
+    if (!html) {
+      failed.push(cgids[index]);
+      return;
+    }
+    const found = parseProducts(html);
+    if (Object.keys(found).length) activeCgids.push(cgids[index]);
+    Object.assign(products, found);
+  });
+  return { ok: true, products, activeCgids, failed, scanned: cgids.length };
+}
+
+async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
   const pool = uniqueValues([...cfg.extraCategoryIds, ...cfg.prospectiveCategoryIds]);
   const knownCategoryIds = Array.isArray(state.knownCategoryIds)
     ? state.knownCategoryIds
@@ -973,7 +1031,11 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
   const cap = Math.max(2, cfg.fastMaxCategories - searchQueries.length);
   const shardReserve = Math.min(10, cfg.fastCategoryShardSize);
   const head = uniqueValues(["root", "shop", ...knownCategoryIds]).slice(0, Math.max(2, cap - shardReserve));
-  const shardRoom = Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
+
+  const remainder = pool.filter((cgid) => !head.includes(cgid));
+  const fanout = await selfScanGrids(env, cfg, remainder);
+
+  const shardRoom = fanout ? 0 : Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
   const shard = rotatingSlice(pool, fastCursor, shardRoom);
   const cgids = uniqueValues([...head, ...shard]);
   const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
@@ -982,6 +1044,7 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
   );
   const combinedHtml = [...htmls, ...searchHtmls].join("\n");
   const pidUniverse = extractGridPids(combinedHtml);
+  for (const pid of Object.keys(fanout?.products || {})) pidUniverse.add(pid);
 
   const previousSeen = state.seen || {};
   const previousActive = state.active || previousSeen;
@@ -993,9 +1056,12 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
   const nextFastCursor = pool.length ? (fastCursor + shard.length) % pool.length : 0;
   const meta = {
     mode: "fast",
-    cgidCount: cgids.length,
+    cgidCount: cgids.length + (fanout?.scanned || 0),
     activeCategoryCount: knownCategoryIds.length,
     shardSize: shard.length,
+    fanoutSlices: fanout ? fanout.slices : null,
+    fanoutSlicesOk: fanout ? fanout.slicesOk : null,
+    fanoutFailed: fanout ? fanout.failed.length : null,
     searchQueries: searchQueries.length,
     searchFetched: searchHtmls.filter(Boolean).length,
     fetched: htmls.filter(Boolean).length,
@@ -1009,7 +1075,7 @@ async function fastFetchProducts(cfg, state, fastCursor = 0) {
     return { products: {}, meta, nextFastCursor, empty: true };
   }
 
-  return { products: parseProducts(combinedHtml), meta, nextFastCursor, empty: false };
+  return { products: { ...parseProducts(combinedHtml), ...(fanout?.products || {}) }, meta, nextFastCursor, empty: false };
 }
 
 function collectProductImages($) {
@@ -1849,7 +1915,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
       if (firstRun) {
         return done({ ok: true, skipped: true, reason: "awaiting-baseline", mode, nextFastCursor: fastCursor, storage: "cloudflare-kv" });
       }
-      const fast = await fastFetchProducts(cfg, state, fastCursor);
+      const fast = await fastFetchProducts(env, cfg, state, fastCursor);
       products = fast.products;
       nextFastCursor = fast.nextFastCursor;
       fastMeta = fast.meta;
@@ -2300,6 +2366,18 @@ async function handleFetch(request, env) {
     const action = request.method === "POST" ? url.searchParams.get("action") || "ensure" : "status";
     const doResponse = await stub.fetch(`https://monitor.internal/${action}`, { method: request.method });
     return jsonResponse({ ok: true, action, controller: await doResponse.json() });
+  }
+  if (url.pathname === "/internal/scan-grids") {
+    if (request.method !== "POST") return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
+    if (!isAuthorized(request, baseCfg)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
+    const cfg = await getRuntimeConfig(env);
+    cfg.subrequestsUsed = 0;
+    const body = await request.json().catch(() => ({}));
+    const cgids = (Array.isArray(body.cgids) ? body.cgids : [])
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter((value) => /^[a-z0-9_-]+$/.test(value))
+      .slice(0, 40);
+    return jsonResponse(await scanGridsSlice(env, cfg, cgids));
   }
   if (url.pathname === "/api/cron" || url.pathname === "/run") {
     if (!["GET", "POST"].includes(request.method)) return jsonResponse({ ok: false, error: "Method not allowed" }, 405);

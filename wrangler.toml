@@ -43,6 +43,10 @@ DASHBOARD_USERNAME = "chrome-hearts"
 [triggers]
 crons = ["* * * * *"]
 
+[[services]]
+binding = "SELF"
+service = "chrome-hearts-monitor"
+
 [[kv_namespaces]]
 binding = "STATE"
 id = "<your-kv-namespace-id>"
