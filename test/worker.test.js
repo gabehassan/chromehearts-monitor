@@ -686,14 +686,15 @@ test("Cloudflare Worker alerts a same PID relist after confirmed absence", async
   });
 });
 
-test("Worker dashboard saves runtime settings and applies a write-only webhook", async () => {
+test("Worker dashboard saves multiple webhooks and alerts every server", async () => {
   const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
   const newProduct = productTile("NEW_SHOP", "NEW SHOP ITEM", "shop", "Shop", "200.00");
   const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
   const testEnv = env({}, kv);
   const webhookUrl = "https://discord.com/api/webhooks/1234567890/runtime-secret-token";
+  const webhookUrl2 = "https://discord.com/api/webhooks/9876543210/second-server-token";
   const form = new URLSearchParams({
-    discordWebhookUrl: webhookUrl,
+    discordWebhookUrls: `${webhookUrl}\n${webhookUrl2}`,
     categoryFetchConcurrency: "3",
     checkMinIntervalSeconds: "0",
     maxAlertsPerRun: "1",
@@ -725,7 +726,8 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
   assert.equal(saveResponse.headers.get("location"), "/?saved=1");
 
   const savedSettings = JSON.parse(kv.values.get(SETTINGS_KEY));
-  assert.equal(savedSettings.discordWebhookUrl, webhookUrl);
+  assert.deepEqual(savedSettings.discordWebhookUrls, [webhookUrl, webhookUrl2]);
+  assert.equal(savedSettings.discordWebhookUrl, undefined, "legacy single-URL key is migrated away");
   assert.equal(savedSettings.categoryFetchConcurrency, 3);
   assert.equal(savedSettings.maxAlertsPerRun, 1);
   assert.equal(savedSettings.maxDirectProductUrls, 4);
@@ -739,9 +741,9 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
   const dashboardResponse = await worker.fetch(new Request("https://monitor.test/?saved=1", { headers: basicAuthHeaders() }), testEnv);
   const dashboardHtml = await dashboardResponse.text();
   assert.equal(dashboardResponse.status, 200);
-  assert.match(dashboardHtml, /Dashboard webhook saved/);
+  assert.match(dashboardHtml, /2 webhooks active \(dashboard-managed\)/);
   assert.match(dashboardHtml, /Settings saved/);
-  assert.equal(dashboardHtml.includes(webhookUrl), false);
+  assert.equal(dashboardHtml.includes(webhookUrl), false, "webhook URLs are never rendered back");
 
   const mock = createChromeHeartsFetch({ root: `${oldProduct}${newProduct}` });
   await withMockedFetch(mock.fetchMock, async () => {
@@ -749,8 +751,44 @@ test("Worker dashboard saves runtime settings and applies a write-only webhook",
 
     assert.equal(result.alerted, 1);
     assert.deepEqual(result.newPids, ["NEW_SHOP"]);
-    assert.equal(mock.discordUrls[0], webhookUrl);
-    assert.equal(mock.discordPayloads[0].embeds.length, 1);
+    // The alert fires to BOTH Discord servers.
+    assert.deepEqual(new Set(mock.discordUrls), new Set([webhookUrl, webhookUrl2]));
+    assert.equal(mock.discordPayloads.length, 2);
+  });
+});
+
+test("A dead webhook among several does not block delivery to the others", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const newProduct = productTile("NEW_SHOP", "NEW SHOP ITEM", "shop", "Shop", "200.00");
+  const goodHook = "https://discord.com/api/webhooks/111/good-token";
+  const deadHook = "https://discord.com/api/webhooks/222/dead-token";
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({ root: `${oldProduct}${newProduct}` });
+  // Override the mock so the dead webhook always 500s.
+  const baseFetch = mock.fetchMock;
+  const fetchMock = async (input, init = {}) => {
+    if (String(input) === deadHook) return new Response("boom", { status: 500 });
+    return baseFetch(input, init);
+  };
+
+  await withMockedFetch(fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCORD_WEBHOOK_URL: `${goodHook} ${deadHook}`,
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 1);
+    assert.ok(mock.discordUrls.includes(goodHook));
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.seen.NEW_SHOP, "a successful delivery still commits the item as seen");
   });
 });
 

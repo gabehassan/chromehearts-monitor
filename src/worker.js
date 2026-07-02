@@ -288,14 +288,16 @@ function boolSetting(env, name, fallback = false) {
 
 function getConfig(env) {
   if (!env.STATE) throw new MonitorError("Missing STATE KV binding.");
-  if (!env.DISCORD_WEBHOOK_URL) throw new MonitorError("Missing DISCORD_WEBHOOK_URL secret.");
+  if (!env.DISCORD_WEBHOOK_URL && !env.DISCORD_WEBHOOK_URLS) {
+    throw new MonitorError("Missing DISCORD_WEBHOOK_URL secret.");
+  }
 
   const checkMinIntervalSeconds = intSetting(env, "CHECK_MIN_INTERVAL_SECONDS", 50, 0);
   return {
     stateKey: env.STATE_KEY || DEFAULT_STATE_KEY,
     lockKey: env.LOCK_KEY || DEFAULT_LOCK_KEY,
     settingsKey: env.SETTINGS_KEY || DEFAULT_SETTINGS_KEY,
-    discordWebhookUrl: env.DISCORD_WEBHOOK_URL,
+    discordWebhookUrls: parseWebhookUrls(`${env.DISCORD_WEBHOOK_URL || ""} ${env.DISCORD_WEBHOOK_URLS || ""}`),
     cronSecret: env.CRON_SECRET || "",
     dashboardUsername: env.DASHBOARD_USERNAME || "chrome-hearts",
     dashboardPassword: env.DASHBOARD_PASSWORD || env.CRON_SECRET || "",
@@ -386,8 +388,12 @@ function applyRuntimeSettings(cfg, settings) {
   if (Array.isArray(settings.extraProductUrls)) {
     next.extraProductUrls = settings.extraProductUrls.map((value) => productUrlFromUrl(value)).filter(Boolean);
   }
-  if (typeof settings.discordWebhookUrl === "string" && settings.discordWebhookUrl.startsWith("https://")) {
-    next.discordWebhookUrl = settings.discordWebhookUrl;
+  if (Array.isArray(settings.discordWebhookUrls)) {
+    const list = settings.discordWebhookUrls.filter((url) => typeof url === "string" && isValidDiscordWebhookUrl(url));
+    if (list.length) next.discordWebhookUrls = uniqueValues(list);
+  } else if (typeof settings.discordWebhookUrl === "string" && isValidDiscordWebhookUrl(settings.discordWebhookUrl)) {
+    // Back-compat with the old single-webhook setting.
+    next.discordWebhookUrls = [settings.discordWebhookUrl];
   }
   return next;
 }
@@ -425,20 +431,54 @@ function parseProductUrls(value) {
   ).slice(0, INT_SETTING_LIMITS.maxDirectProductUrls[1]);
 }
 
+function maskWebhook(webhookUrl) {
+  try {
+    const url = new URL(webhookUrl);
+    const parts = url.pathname.split("/").filter(Boolean); // api webhooks <id> <token>
+    const id = parts[2] || "";
+    return `${url.host}/…/${id}/****`;
+  } catch {
+    return "invalid-url";
+  }
+}
+
+function parseWebhookUrls(value) {
+  return uniqueValues(
+    String(value || "")
+      .split(/[\s,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  );
+}
+
+function isValidDiscordWebhookUrl(raw) {
+  let url;
+  try {
+    url = new URL(String(raw || "").trim());
+  } catch {
+    return false;
+  }
+  const validHost = url.hostname === "discord.com" || url.hostname.endsWith(".discord.com") || url.hostname === "discordapp.com";
+  return url.protocol === "https:" && validHost && url.pathname.startsWith("/api/webhooks/");
+}
+
 function validateDiscordWebhookUrl(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new MonitorError("Discord webhook must be a valid URL.", 400);
-  }
-  const validHost = url.hostname === "discord.com" || url.hostname.endsWith(".discord.com") || url.hostname === "discordapp.com";
-  if (url.protocol !== "https:" || !validHost || !url.pathname.startsWith("/api/webhooks/")) {
+  if (!isValidDiscordWebhookUrl(raw)) {
     throw new MonitorError("Discord webhook must be an https://discord.com/api/webhooks/... URL.", 400);
   }
-  return url.toString();
+  return new URL(raw).toString();
+}
+
+function validateDiscordWebhookList(value) {
+  const urls = parseWebhookUrls(value);
+  for (const url of urls) {
+    if (!isValidDiscordWebhookUrl(url)) {
+      throw new MonitorError(`Not a valid Discord webhook URL: ${truncate(url, 60)}`, 400);
+    }
+  }
+  return uniqueValues(urls.map((url) => new URL(url).toString()));
 }
 
 async function saveSettingsFromRequest(request, env, cfg) {
@@ -465,11 +505,17 @@ async function saveSettingsFromRequest(request, env, cfg) {
     next[key] = formData.get(key) === "on";
   }
 
-  const webhookUrl = validateDiscordWebhookUrl(formData.get("discordWebhookUrl"));
+  delete next.discordWebhookUrl; // migrate off the legacy single-URL key
+  const submitted = validateDiscordWebhookList(formData.get("discordWebhookUrls") || formData.get("discordWebhookUrl"));
   if (formData.get("clearDiscordWebhook") === "on") {
-    delete next.discordWebhookUrl;
-  } else if (webhookUrl) {
-    next.discordWebhookUrl = webhookUrl;
+    delete next.discordWebhookUrls;
+  } else if (formData.get("webhookMode") === "add") {
+    const existing = Array.isArray(current.discordWebhookUrls) ? current.discordWebhookUrls : [];
+    if (submitted.length) next.discordWebhookUrls = uniqueValues([...existing, ...submitted]);
+  } else if (submitted.length) {
+    next.discordWebhookUrls = submitted;
+  } else if (Array.isArray(current.discordWebhookUrls)) {
+    next.discordWebhookUrls = current.discordWebhookUrls;
   }
 
   await env.STATE.put(cfg.settingsKey, JSON.stringify(next));
@@ -1744,36 +1790,56 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function sendDiscord(cfg, products) {
-  for (let index = 0; index < products.length; index += 10) {
-    const chunk = products.slice(index, index + 10);
-    const payload = {
-      username: "Chrome Hearts Monitor",
-      content: chunk.length === 1 ? "New Chrome Hearts item loaded" : `${chunk.length} new Chrome Hearts items loaded`,
-      embeds: chunk.map(buildProductEmbed)
-    };
-
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const response = await fetchWithTimeout(
-        cfg.discordWebhookUrl,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
-          body: JSON.stringify(payload),
-          cache: "no-store"
-        },
-        cfg.webhookTimeoutMs,
-        cfg
-      );
-      if (response.ok) break;
-      if (response.status === 429 && attempt < 3) {
-        const retryAfter = Number.parseFloat(response.headers.get("retry-after") || "1");
-        await sleep(Math.max(1, retryAfter) * 1000);
-        continue;
-      }
-      throw new MonitorError(`Discord webhook returned HTTP ${response.status}`, 502);
+async function postToWebhook(cfg, webhookUrl, payload) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const response = await fetchWithTimeout(
+      webhookUrl,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
+        body: JSON.stringify(payload),
+        cache: "no-store"
+      },
+      cfg.webhookTimeoutMs,
+      cfg
+    );
+    if (response.ok) return true;
+    if (response.status === 429 && attempt < 3) {
+      const retryAfter = Number.parseFloat(response.headers.get("retry-after") || "1");
+      await sleep(Math.max(1, retryAfter) * 1000);
+      continue;
     }
+    return false;
   }
+  return false;
+}
+
+async function sendDiscord(cfg, products) {
+  const webhookUrls = (cfg.discordWebhookUrls || []).filter(Boolean);
+  if (!webhookUrls.length) throw new MonitorError("No Discord webhook configured.", 500);
+
+  const failures = [];
+  for (const webhookUrl of webhookUrls) {
+    let delivered = true;
+    for (let index = 0; index < products.length; index += 10) {
+      const chunk = products.slice(index, index + 10);
+      const payload = {
+        username: "Chrome Hearts Monitor",
+        content: chunk.length === 1 ? "New Chrome Hearts item loaded" : `${chunk.length} new Chrome Hearts items loaded`,
+        embeds: chunk.map(buildProductEmbed)
+      };
+      if (!(await postToWebhook(cfg, webhookUrl, payload))) {
+        delivered = false;
+        break;
+      }
+    }
+    if (!delivered) failures.push(webhookUrl);
+  }
+
+  if (failures.length === webhookUrls.length) {
+    throw new MonitorError(`All ${failures.length} Discord webhook(s) failed`, 502);
+  }
+  return { delivered: webhookUrls.length - failures.length, failed: failures.length };
 }
 
 function productStateRecord(product, previousRecord, now) {
@@ -2110,7 +2176,11 @@ function dashboard(state, cfg, settings = {}, saved = false) {
   const updated = state.updatedAt || state.createdAt || nowIso();
   const extraCategoryIds = cfg.extraCategoryIds.join(", ");
   const extraProductUrls = cfg.extraProductUrls.join("\n");
-  const webhookStatus = settings.discordWebhookUrl ? "Dashboard webhook saved" : "Worker secret";
+  const webhookCount = (cfg.discordWebhookUrls || []).length;
+  const dashboardWebhookCount = Array.isArray(settings.discordWebhookUrls) ? settings.discordWebhookUrls.length : 0;
+  const webhookStatus = dashboardWebhookCount
+    ? `${webhookCount} webhook${webhookCount === 1 ? "" : "s"} active (dashboard-managed)`
+    : `${webhookCount} webhook${webhookCount === 1 ? "" : "s"} active (from Worker secret)`;
 
   return `<!doctype html>
 <html lang="en">
@@ -2176,8 +2246,10 @@ function dashboard(state, cfg, settings = {}, saved = false) {
         </div>
         <div class="form-grid">
           <div class="field">
-            <label for="discordWebhookUrl">Discord webhook</label>
-            <input id="discordWebhookUrl" name="discordWebhookUrl" type="url" autocomplete="off" placeholder="Paste a new webhook URL">
+            <label for="discordWebhookUrls">Discord webhooks (one URL per line — one per server)</label>
+            <textarea id="discordWebhookUrls" name="discordWebhookUrls" autocomplete="off" placeholder="https://discord.com/api/webhooks/AAA/token&#10;https://discord.com/api/webhooks/BBB/token"></textarea>
+            <label class="check"><input name="webhookMode" type="radio" value="replace" checked> Replace saved list</label>
+            <label class="check"><input name="webhookMode" type="radio" value="add"> Add to saved list</label>
           </div>
           <div class="field">
             <label for="checkMinIntervalSeconds">Minimum interval seconds</label>
@@ -2227,7 +2299,7 @@ function dashboard(state, cfg, settings = {}, saved = false) {
             <label for="extraProductUrls">Extra product URLs</label>
             <textarea id="extraProductUrls" name="extraProductUrls" placeholder="https://www.chromehearts.com/category/item/PID.html">${escapeHtml(extraProductUrls)}</textarea>
           </div>
-          <label class="check"><input name="clearDiscordWebhook" type="checkbox"> Use Worker secret webhook</label>
+          <label class="check"><input name="clearDiscordWebhook" type="checkbox"> Clear dashboard webhooks (revert to Worker secret)</label>
         </div>
         <div class="checks">
           <label class="check"><input name="discoverSitemapCategories" type="checkbox"${checked(cfg.discoverSitemapCategories)}> Sitemap categories</label>
@@ -2307,7 +2379,8 @@ async function handleFetch(request, env) {
         controller: await fastPollStatus(env)
       },
       settings: {
-        dashboardWebhook: Boolean(settings.discordWebhookUrl),
+        webhookCount: (cfg.discordWebhookUrls || []).length,
+        dashboardManagedWebhooks: Array.isArray(settings.discordWebhookUrls) ? settings.discordWebhookUrls.length : 0,
         checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
         categoryFetchConcurrency: cfg.categoryFetchConcurrency,
         maxAlertsPerRun: cfg.maxAlertsPerRun,
@@ -2334,30 +2407,41 @@ async function handleFetch(request, env) {
     if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
     const settings = await loadSettings(env, baseCfg);
     const cfg = applyRuntimeSettings(baseCfg, settings);
-    try {
-      await sendDiscord(cfg, [
-        {
-          pid: "SELFTEST",
-          name: "Monitor self-test",
-          price: "0",
-          category: "diagnostic",
-          brand: "Chrome Hearts Monitor",
-          url: BASE_URL,
-          image: "",
-          description: `Webhook delivery test at ${nowIso()}. If you can read this in Discord, alerts work.`,
-          sizes: [],
-          inStockSizeCount: 0
-        }
-      ]);
-      return jsonResponse({
-        ok: true,
-        sent: true,
-        webhookSource: settings.discordWebhookUrl ? "dashboard" : "worker-secret",
-        at: nowIso()
-      });
-    } catch (error) {
-      return jsonResponse({ ok: false, sent: false, error: error.message }, 502);
+    const testProduct = {
+      pid: "SELFTEST",
+      name: "Monitor self-test",
+      price: "0",
+      category: "diagnostic",
+      brand: "Chrome Hearts Monitor",
+      url: BASE_URL,
+      image: "",
+      description: `Webhook delivery test at ${nowIso()}. If you can read this in Discord, alerts work.`,
+      sizes: [],
+      inStockSizeCount: 0
+    };
+    const payload = { username: "Chrome Hearts Monitor", content: "Monitor self-test", embeds: [buildProductEmbed(testProduct)] };
+    const results = [];
+    for (const webhookUrl of cfg.discordWebhookUrls || []) {
+      let ok = false;
+      try {
+        ok = await postToWebhook(cfg, webhookUrl, payload);
+      } catch (error) {
+        ok = false;
+      }
+      results.push({ webhook: maskWebhook(webhookUrl), delivered: ok });
     }
+    const deliveredCount = results.filter((entry) => entry.delivered).length;
+    return jsonResponse(
+      {
+        ok: deliveredCount > 0,
+        sent: deliveredCount,
+        total: results.length,
+        source: Array.isArray(settings.discordWebhookUrls) ? "dashboard" : "worker-secret",
+        results,
+        at: nowIso()
+      },
+      deliveredCount > 0 ? 200 : 502
+    );
   }
   if (url.pathname === "/do") {
     if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
