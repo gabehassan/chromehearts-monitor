@@ -58,6 +58,14 @@ const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
   "rollingstones",
   "plus7",
   "nude-rib-sports",
+  "denims",
+  "jewelry-roll",
+  "ch-flannel",
+  "chopsticks",
+  "general",
+  "99-eyes",
+  "angel-medal",
+  "hand-spray",
   "optical",
   "frames",
   "readers",
@@ -407,7 +415,14 @@ const DEFAULT_SEARCH_QUERY_TERMS = [
   "pin",
   "lacquer",
   "hotel",
-  "slipper"
+  "slipper",
+  "jean",
+  "denims",
+  "chopsticks",
+  "roll",
+  "spray",
+  "medal",
+  "eyes"
 ];
 
 const INT_SETTING_LIMITS = {
@@ -534,7 +549,7 @@ function getConfig(env) {
         .filter((value) => /^[a-z0-9-]+$/.test(value))
     ).slice(0, 200),
     // Structured run logging for debugging + data collection.
-    logBufferSize: intSetting(env, "LOG_BUFFER_SIZE", 200, 0),
+    logBufferSize: intSetting(env, "LOG_BUFFER_SIZE", 600, 0),
     logVerbose: boolSetting(env, "LOG_VERBOSE", true),
     userAgent: env.MONITOR_USER_AGENT || DEFAULT_USER_AGENT
   };
@@ -1280,6 +1295,12 @@ function categoryStatusTransitions(previous = {}, current = {}) {
     transitions.push({ cgid, from, to });
   }
   return transitions;
+}
+
+function discoveredCategories(previous = {}, current = {}) {
+  return Object.entries(current)
+    .filter(([cgid, status]) => previous[cgid] === undefined && status >= 200 && status < 400)
+    .map(([cgid, status]) => ({ cgid, status }));
 }
 
 function interestingCategoryTransition(transition) {
@@ -2172,6 +2193,8 @@ function runLogEntry(mode, result, ms, cfg) {
     failedCategories: sweep?.failedCategoryCount ?? 0,
     searches: sweep?.searchQueryCount ?? result.fast?.searchQueries ?? 0,
     newFromSearch: sweep?.newFromSearch ?? null,
+    enrichMs: result.enrichMs || 0,
+    sendMs: result.sendMs || 0,
     error: result.error || null
   };
 }
@@ -2266,6 +2289,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
     const deferredProducts = candidates.slice(cfg.maxAlertsPerRun);
     const deferredPids = new Set(deferredProducts.map((product) => product.pid));
 
+    const enrichStartedAt = Date.now();
     const enriched = productsToAlert.length
       ? await mapWithConcurrency(
           productsToAlert,
@@ -2273,7 +2297,10 @@ async function runMonitor(env, cfg = null, opts = {}) {
           (product) => enrichProduct(product, cfg)
         )
       : [];
+    const enrichMs = productsToAlert.length ? Date.now() - enrichStartedAt : 0;
+    const sendStartedAt = Date.now();
     if (enriched.length) await sendDiscord(cfg, enriched);
+    const sendMs = enriched.length ? Date.now() - sendStartedAt : 0;
 
     const sweep = cfg.sweepStats || null;
     const result = {
@@ -2290,6 +2317,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
       nextFastCursor,
       nextProspectiveCursor: mode === "full" ? cfg.discoveryRun?.nextProspectiveCategoryCursor ?? null : null,
       subrequestsUsed: cfg.subrequestsUsed || 0,
+      enrichMs,
+      sendMs,
       storage: "cloudflare-kv",
       checkedAt: nowIso()
     };
@@ -2650,7 +2679,8 @@ async function handleFetch(request, env) {
     const stub = monitorStub(env);
     if (!stub) return jsonResponse({ ok: false, error: "MONITOR Durable Object binding is not configured." }, 501);
     const limit = Math.min(500, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100));
-    const doResponse = await stub.fetch(`https://monitor.internal/logs?limit=${limit}`);
+    const type = url.searchParams.get("type") === "alerts" ? "&type=alerts" : "";
+    const doResponse = await stub.fetch(`https://monitor.internal/logs?limit=${limit}${type}`);
     return jsonResponse({ ok: true, ...(await doResponse.json()) });
   }
   if (url.pathname === "/selftest") {
@@ -2838,12 +2868,22 @@ class MonitorController {
     }
 
     const transitions = categoryStatusTransitions(previous, current).filter(interestingCategoryTransition);
-    logRun(cfg, { at: nowIso(), mode: "catstatus", tracked: Object.keys(current).length, transitions: transitions.length });
-    if (!transitions.length) return;
+    const discovered = discoveredCategories(previous, current);
+    logRun(cfg, {
+      at: nowIso(),
+      mode: "catstatus",
+      tracked: Object.keys(current).length,
+      transitions: transitions.length,
+      discovered: discovered.length
+    });
+    if (!transitions.length && !discovered.length) return;
 
-    const lines = transitions.map(
-      (transition) => `- [/${transition.cgid}](${BASE_URL}/${transition.cgid}) — HTTP ${transition.from} -> ${transition.to}`
-    );
+    const lines = [
+      ...transitions.map(
+        (transition) => `- [/${transition.cgid}](${BASE_URL}/${transition.cgid}) — HTTP ${transition.from} -> ${transition.to}`
+      ),
+      ...discovered.map((entry) => `- [/${entry.cgid}](${BASE_URL}/${entry.cgid}) — NEW category discovered (HTTP ${entry.status})`)
+    ];
     const payload = {
       username: "Chrome Hearts Monitor",
       content: "Category signal — possible drop prep",
@@ -2878,6 +2918,10 @@ class MonitorController {
     if (url.pathname === "/ensure" || url.pathname === "/start") return Response.json(await this.ensure());
     if (url.pathname === "/status") return Response.json(await this.status());
     if (url.pathname === "/logs") {
+      if (url.searchParams.get("type") === "alerts") {
+        const alerts = (await this.state.storage.get("alertLog")) || [];
+        return Response.json({ count: alerts.length, alerts: alerts.slice().reverse() });
+      }
       return Response.json(await this.logs(Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100));
     }
     if (url.pathname === "/stop") {
@@ -2900,6 +2944,8 @@ class MonitorController {
     const everyTicks = Math.max(1, cfg.fullSweepEveryTicks);
     const mode = tick % everyTicks === 0 ? "full" : "fast";
     const startedAt = Date.now();
+    const previousTickAt = Date.parse((await this.state.storage.get("lastTickAt")) || "") || null;
+    const tickGapMs = previousTickAt ? startedAt - previousTickAt : null;
 
     let result;
     const nextKeys = { tick, lastTickAt: nowIso() };
@@ -2937,6 +2983,7 @@ class MonitorController {
         tick,
         mode: result.mode || mode,
         ms: Date.now() - startedAt,
+        tickGapMs,
         ok: result.ok !== false,
         reason: result.reason || null,
         productCount: result.productCount ?? null,
@@ -2944,10 +2991,27 @@ class MonitorController {
         newPids: result.newPids || [],
         activeCategories: result.sweep?.activeCategoryIds?.length ?? result.fast?.activeCategoryCount ?? null,
         failedCategories: result.sweep?.failedCategoryCount ?? 0,
+        enrichMs: result.enrichMs || 0,
+        sendMs: result.sendMs || 0,
         error: result.error || null
       },
       cfg.logBufferSize
     );
+
+    if ((result.alerted || 0) > 0) {
+      const alerts = (await this.state.storage.get("alertLog")) || [];
+      alerts.push({
+        at: nowIso(),
+        tick,
+        mode: result.mode || mode,
+        pids: result.newPids || [],
+        totalMs: Date.now() - startedAt,
+        enrichMs: result.enrichMs || 0,
+        sendMs: result.sendMs || 0,
+        tickGapMs
+      });
+      await this.state.storage.put("alertLog", alerts.slice(-300));
+    }
 
     const base = Math.max(5, cfg.fastPollIntervalSeconds) * 1000;
     const jitter = Math.floor(Math.random() * 2500);
@@ -2988,5 +3052,6 @@ export {
   productUrlFromUrl,
   isPidLikeSegment,
   categoryStatusTransitions,
-  interestingCategoryTransition
+  interestingCategoryTransition,
+  discoveredCategories
 };

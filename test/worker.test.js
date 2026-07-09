@@ -5,7 +5,8 @@ import worker, {
   runMonitor,
   productUrlFromUrl,
   categoryStatusTransitions,
-  interestingCategoryTransition
+  interestingCategoryTransition,
+  discoveredCategories
 } from "../src/worker.js";
 
 const STATE_KEY = "state";
@@ -1171,6 +1172,10 @@ test("Category status transitions flag creation and activation, not noise", () =
   assert.deepEqual(interesting, ["goggles", "hat", "silichrome"]);
   assert.equal(transitions.some((t) => t.cgid === "flaky"), false, "failed probes are not transitions");
   assert.equal(transitions.some((t) => t.cgid === "brandnew"), false, "first sighting is baseline");
+
+  const discovered = discoveredCategories(previous, current);
+  assert.deepEqual(discovered, [{ cgid: "brandnew", status: 301 }]);
+  assert.equal(discoveredCategories(previous, { deadnew: 404 }).length, 0, "dead first-sightings stay silent");
 });
 
 test("Worker dashboard and health pages are private", async () => {
