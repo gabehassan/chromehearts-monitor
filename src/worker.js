@@ -1221,7 +1221,7 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
     slices.push(items.slice(index, index + sliceSize));
   }
 
-  const results = await mapWithConcurrency(slices, 6, async (slice) => {
+  const results = await mapWithConcurrency(slices, 10, async (slice) => {
     try {
       spendSubrequest(cfg);
       const response = await env.SELF.fetch("https://monitor.internal/internal/scan-grids", {
@@ -1262,7 +1262,7 @@ async function fetchCategoryStatuses(env, cfg, cgids) {
   for (let index = 0; index < cgids.length; index += sliceSize) {
     slices.push(cgids.slice(index, index + sliceSize));
   }
-  const results = await mapWithConcurrency(slices, 6, async (slice) => {
+  const results = await mapWithConcurrency(slices, 10, async (slice) => {
     try {
       spendSubrequest(cfg);
       const response = await env.SELF.fetch("https://monitor.internal/internal/scan-grids", {
@@ -1350,15 +1350,20 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
 
   const remainder = pool.filter((cgid) => !head.includes(cgid));
   const queryPool = (cfg.searchQueryTerms || []).filter((term) => !searchQueries.includes(term));
-  const fanout = await selfScanGrids(env, cfg, remainder, queryPool);
+
+  const [fanout, headHtmls, searchHtmls] = await Promise.all([
+    selfScanGrids(env, cfg, remainder, queryPool),
+    mapWithConcurrency(head, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg)),
+    mapWithConcurrency(searchQueries, cfg.categoryFetchConcurrency, (query) => fetchSearchHtmlSafe(query, cfg))
+  ]);
 
   const shardRoom = fanout ? 0 : Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
   const shard = rotatingSlice(pool, fastCursor, shardRoom);
+  const shardHtmls = shard.length
+    ? await mapWithConcurrency(shard, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg))
+    : [];
   const cgids = uniqueValues([...head, ...shard]);
-  const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
-  const searchHtmls = await mapWithConcurrency(searchQueries, cfg.categoryFetchConcurrency, (query) =>
-    fetchSearchHtmlSafe(query, cfg)
-  );
+  const htmls = [...headHtmls, ...shardHtmls];
   const combinedHtml = [...htmls, ...searchHtmls].join("\n");
   const pidUniverse = extractGridPids(combinedHtml);
   for (const pid of Object.keys(fanout?.products || {})) pidUniverse.add(pid);
@@ -2943,6 +2948,9 @@ class MonitorController {
     const everyTicks = Math.max(1, cfg.fullSweepEveryTicks);
     const mode = tick % everyTicks === 0 ? "full" : "fast";
     const startedAt = Date.now();
+    const intervalMs = Math.max(5, cfg.fastPollIntervalSeconds) * 1000;
+    const jitterMs = Math.floor(Math.random() * 1500);
+    await this.state.storage.setAlarm(startedAt + intervalMs + jitterMs);
     const previousTickAt = Date.parse((await this.state.storage.get("lastTickAt")) || "") || null;
     const tickGapMs = previousTickAt ? startedAt - previousTickAt : null;
 
@@ -3012,9 +3020,10 @@ class MonitorController {
       await this.state.storage.put("alertLog", alerts.slice(-300));
     }
 
-    const base = Math.max(5, cfg.fastPollIntervalSeconds) * 1000;
-    const jitter = Math.floor(Math.random() * 2500);
-    await this.state.storage.setAlarm(Date.now() + base + jitter);
+    const pending = await this.state.storage.getAlarm();
+    if (pending === null || pending === undefined || pending < Date.now()) {
+      await this.state.storage.setAlarm(Date.now() + 100);
+    }
   }
 }
 
