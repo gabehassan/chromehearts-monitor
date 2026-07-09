@@ -34,6 +34,13 @@ const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
   "sunglasses",
   "glasses",
   "eyeglasses",
+  "silichrome",
+  "rib-tank",
+  "goggles",
+  "sweatbands",
+  "dipped-in-blue",
+  "bandana",
+  "bandanas",
   "optical",
   "frames",
   "readers",
@@ -349,7 +356,32 @@ const DEFAULT_SEARCH_QUERY_TERMS = [
   "plated",
   "cashmere",
   "suede",
-  "fur"
+  "fur",
+  "silichrome",
+  "crossball",
+  "bandana",
+  "goggles",
+  "sweatband",
+  "sweatbands",
+  "checkmate",
+  "deadly",
+  "doll",
+  "dipped",
+  "dib",
+  "tiger",
+  "flannel",
+  "rib",
+  "silk",
+  "watch",
+  "math",
+  "ceiling",
+  "hairy",
+  "work",
+  "school",
+  "tart",
+  "lowrider",
+  "blueher",
+  "edenbox"
 ];
 
 const INT_SETTING_LIMITS = {
@@ -462,6 +494,7 @@ function getConfig(env) {
     discoveryEveryFullSweeps: intSetting(env, "DISCOVERY_EVERY_FULL_SWEEPS", 10, 1),
     fanoutEnabled: boolSetting(env, "FANOUT_ENABLED", true),
     fanoutSliceSize: intSetting(env, "FANOUT_SLICE_SIZE", 30, 5),
+    categoryStatusEveryTicks: intSetting(env, "CATEGORY_STATUS_EVERY_TICKS", 20, 0),
     searchQueries: uniqueValues(
       String(env.SEARCH_QUERIES === undefined ? "chrome,hearts" : env.SEARCH_QUERIES)
         .split(/[\s,]+/)
@@ -860,13 +893,18 @@ function categoryIdFromUrl(value) {
   }
 }
 
+function isPidLikeSegment(segment) {
+  return /^\d{4,}[a-z0-9_]*(?:-\d+)?$/i.test(String(segment || "").replace(/\.html$/i, ""));
+}
+
 function productUrlFromUrl(value) {
   try {
     const url = new URL(value, BASE_URL);
     if (url.origin !== BASE_URL) return "";
     const pathSegments = url.pathname.split("/").filter(Boolean);
-    if (pathSegments.length < 3 || !url.pathname.endsWith(".html")) return "";
+    if (!url.pathname.endsWith(".html")) return "";
     if (RESERVED_CATEGORY_IDS.has(pathSegments[0])) return "";
+    if (pathSegments.length < 3 && !(pathSegments.length === 2 && isPidLikeSegment(pathSegments[1]))) return "";
     return url.toString();
   } catch {
     return "";
@@ -1174,6 +1212,56 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
     if (!result) merged.failed.push(...slices[index].map((item) => (item.kind === "q" ? `q:${item.value}` : item.value)));
   });
   return merged;
+}
+
+async function fetchCategoryStatuses(env, cfg, cgids) {
+  if (!env?.SELF || typeof env.SELF.fetch !== "function" || !cgids.length) return null;
+  const sliceSize = Math.max(5, cfg.fanoutSliceSize);
+  const slices = [];
+  for (let index = 0; index < cgids.length; index += sliceSize) {
+    slices.push(cgids.slice(index, index + sliceSize));
+  }
+  const results = await mapWithConcurrency(slices, 6, async (slice) => {
+    try {
+      spendSubrequest(cfg);
+      const response = await env.SELF.fetch("https://monitor.internal/internal/scan-grids", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${cfg.cronSecret}` },
+        body: JSON.stringify({ statusCgids: slice })
+      });
+      if (!response.ok) return null;
+      return await response.json();
+    } catch {
+      return null;
+    }
+  });
+  const statuses = {};
+  let anyOk = false;
+  for (const result of results) {
+    if (result && result.statuses) {
+      anyOk = true;
+      Object.assign(statuses, result.statuses);
+    }
+  }
+  return anyOk ? statuses : null;
+}
+
+function categoryStatusTransitions(previous = {}, current = {}) {
+  const transitions = [];
+  for (const [cgid, to] of Object.entries(current)) {
+    const from = previous[cgid];
+    if (from === undefined || from === to || to === 0 || from === 0) continue;
+    transitions.push({ cgid, from, to });
+  }
+  return transitions;
+}
+
+function interestingCategoryTransition(transition) {
+  const { from, to } = transition;
+  if (from === 404 && to >= 200 && to < 400) return true;
+  if (to === 200 && from !== 200) return true;
+  if (from === 301 && to === 302) return true;
+  return false;
 }
 
 async function scanGridsSlice(env, cfg, cgids, queries = []) {
@@ -2598,6 +2686,24 @@ async function handleFetch(request, env) {
         .map((value) => String(value || "").trim().toLowerCase())
         .filter((value) => /^[a-z0-9_-]+$/.test(value))
         .slice(0, 40);
+    const statusCgids = cleanList(body.statusCgids);
+    if (statusCgids.length) {
+      const statuses = {};
+      await mapWithConcurrency(statusCgids, cfg.categoryFetchConcurrency, async (cgid) => {
+        try {
+          const response = await fetchWithTimeout(
+            `${BASE_URL}/${cgid}`,
+            { ...fetchOptions(cfg, "text/html,*/*;q=0.8"), redirect: "manual" },
+            cfg.requestTimeoutMs,
+            cfg
+          );
+          statuses[cgid] = response.status;
+        } catch {
+          statuses[cgid] = 0;
+        }
+      });
+      return jsonResponse({ ok: true, statuses });
+    }
     return jsonResponse(await scanGridsSlice(env, cfg, cleanList(body.cgids), cleanList(body.queries)));
   }
   if (url.pathname === "/api/cron" || url.pathname === "/run") {
@@ -2675,6 +2781,7 @@ class MonitorController {
       fastCursor: Number(await this.state.storage.get("fastCursor")) || 0,
       prospectiveCursor: Number(await this.state.storage.get("prospectiveCursor")) || 0,
       fullSweeps: Number(await this.state.storage.get("fullCount")) || 0,
+      categoryStatusesTracked: Object.keys((await this.state.storage.get("catStatus")) || {}).length,
       logCount: logs.length,
       lastResult: (await this.state.storage.get("lastResult")) || null
     };
@@ -2683,6 +2790,54 @@ class MonitorController {
   async logs(limit = 100) {
     const logs = (await this.state.storage.get("logs")) || [];
     return { count: logs.length, runs: logs.slice(-limit).reverse() };
+  }
+
+  async categoryStatusSweep(cfg) {
+    let knownCategoryIds = [];
+    try {
+      const state = await loadState(this.env, cfg);
+      knownCategoryIds = Array.isArray(state.knownCategoryIds) ? state.knownCategoryIds : [];
+    } catch {
+      knownCategoryIds = [];
+    }
+    const universe = uniqueValues([...cfg.prospectiveCategoryIds, ...cfg.extraCategoryIds, ...knownCategoryIds]);
+    const current = await fetchCategoryStatuses(this.env, cfg, universe);
+    if (!current) return;
+
+    const previous = (await this.state.storage.get("catStatus")) || null;
+    await this.state.storage.put("catStatus", current);
+    if (!previous) {
+      logRun(cfg, { at: nowIso(), mode: "catstatus-baseline", tracked: Object.keys(current).length });
+      return;
+    }
+
+    const transitions = categoryStatusTransitions(previous, current).filter(interestingCategoryTransition);
+    logRun(cfg, { at: nowIso(), mode: "catstatus", tracked: Object.keys(current).length, transitions: transitions.length });
+    if (!transitions.length) return;
+
+    const lines = transitions.map(
+      (transition) => `- [/${transition.cgid}](${BASE_URL}/${transition.cgid}) — HTTP ${transition.from} -> ${transition.to}`
+    );
+    const payload = {
+      username: "Chrome Hearts Monitor",
+      content: "Category signal — possible drop prep",
+      embeds: [
+        {
+          author: { name: "Chrome Hearts Drop Monitor", url: BASE_URL },
+          title: "Category status changed",
+          description: truncate(lines.join("\n"), 4096),
+          color: 0xffffff,
+          footer: { text: "Chrome Hearts monitor - category signal" },
+          timestamp: nowIso()
+        }
+      ]
+    };
+    for (const webhookUrl of cfg.discordWebhookUrls || []) {
+      try {
+        await postToWebhook(cfg, webhookUrl, payload);
+      } catch {
+      }
+    }
   }
 
   async record(entry, bufferSize) {
@@ -2741,6 +2896,14 @@ class MonitorController {
 
     nextKeys.lastResult = result;
     await this.state.storage.put(nextKeys);
+
+    if (cfg.categoryStatusEveryTicks > 0 && tick % cfg.categoryStatusEveryTicks === 0) {
+      try {
+        await this.categoryStatusSweep(cfg);
+      } catch (error) {
+        console.error("catstatus sweep failed:", error);
+      }
+    }
     // Ring buffer of recent ticks for the /logs endpoint.
     await this.record(
       {
@@ -2795,5 +2958,9 @@ export {
   runMonitor,
   extractGridPids,
   fastFetchProducts,
-  buildCatalogState
+  buildCatalogState,
+  productUrlFromUrl,
+  isPidLikeSegment,
+  categoryStatusTransitions,
+  interestingCategoryTransition
 };

@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import worker, { extractGridPids, runMonitor } from "../src/worker.js";
+import worker, {
+  extractGridPids,
+  runMonitor,
+  productUrlFromUrl,
+  categoryStatusTransitions,
+  interestingCategoryTransition
+} from "../src/worker.js";
 
 const STATE_KEY = "state";
 const LOCK_KEY = "lock";
@@ -1119,6 +1125,50 @@ test("Fast tick falls back to shard rotation when the SELF binding is absent", a
     assert.equal(result.fast.shardSize, 2);
     assert.equal(result.nextFastCursor, 2, "cursor advances only in fallback rotation mode");
   });
+});
+
+test("productUrlFromUrl accepts every real product URL shape other monitors caught", () => {
+  const accepted = [
+    "https://www.chromehearts.com/silichrome/silichrome-cross-pendant-and-earring/175364_214824.html",
+    "https://www.chromehearts.com/dipped-in-blue/ch-dib-orange-tiger/207213_207214-1.html",
+    "https://www.chromehearts.com/scarf/ch-scarf/075372A7TXXX007.html",
+    "https://www.chromehearts.com/eyewear/blueher/21762020UE53D14.html",
+    "https://www.chromehearts.com/sweatbands/053669BLKOSZD62.html",
+    "https://www.chromehearts.com/after-school-flannel-shorts/213616AZJXSM00D.html"
+  ];
+  for (const url of accepted) {
+    assert.equal(productUrlFromUrl(url), url, `must accept ${url}`);
+  }
+  // Non-product 2-segment pages must stay rejected
+  assert.equal(productUrlFromUrl("https://www.chromehearts.com/customer-service/faq.html"), "");
+  assert.equal(productUrlFromUrl("https://www.chromehearts.com/legal/privacy.html"), "");
+});
+
+test("Category status transitions flag creation and activation, not noise", () => {
+  const previous = {
+    scarf: 302,
+    goggles: 404,
+    silichrome: 301,
+    hat: 301,
+    socks: 200,
+    flaky: 301,
+    newone: undefined
+  };
+  const current = {
+    scarf: 302, // unchanged -> no transition
+    goggles: 301, // 404 -> 301: category CREATED -> alert
+    silichrome: 302, // 301 -> 302: dormant ACTIVATED -> alert
+    hat: 200, // 301 -> 200: went public -> alert
+    socks: 404, // 200 -> 404: removed -> transition but not interesting
+    flaky: 0, // probe failed -> never a transition
+    brandnew: 301 // first sighting -> baseline, no transition
+  };
+
+  const transitions = categoryStatusTransitions(previous, current);
+  const interesting = transitions.filter(interestingCategoryTransition).map((t) => t.cgid).sort();
+  assert.deepEqual(interesting, ["goggles", "hat", "silichrome"]);
+  assert.equal(transitions.some((t) => t.cgid === "flaky"), false, "failed probes are not transitions");
+  assert.equal(transitions.some((t) => t.cgid === "brandnew"), false, "first sighting is baseline");
 });
 
 test("Worker dashboard and health pages are private", async () => {
