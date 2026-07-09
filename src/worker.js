@@ -2874,26 +2874,24 @@ class MonitorController {
       mode: "catstatus",
       tracked: Object.keys(current).length,
       transitions: transitions.length,
-      discovered: discovered.length
+      discovered: discovered.length,
+      transitionCgids: transitions.map((transition) => transition.cgid)
     });
-    if (!transitions.length && !discovered.length) return;
+    if (!discovered.length) return;
 
-    const lines = [
-      ...transitions.map(
-        (transition) => `- [/${transition.cgid}](${BASE_URL}/${transition.cgid}) — HTTP ${transition.from} -> ${transition.to}`
-      ),
-      ...discovered.map((entry) => `- [/${entry.cgid}](${BASE_URL}/${entry.cgid}) — NEW category discovered (HTTP ${entry.status})`)
-    ];
+    const lines = discovered.map(
+      (entry) => `- [/${entry.cgid}](${BASE_URL}/${entry.cgid}) — new category (HTTP ${entry.status})`
+    );
     const payload = {
       username: "Chrome Hearts Monitor",
-      content: "Category signal — possible drop prep",
+      content: discovered.length === 1 ? "New Chrome Hearts category" : `${discovered.length} new Chrome Hearts categories`,
       embeds: [
         {
           author: { name: "Chrome Hearts Drop Monitor", url: BASE_URL },
-          title: "Category status changed",
+          title: "New category found",
           description: truncate(lines.join("\n"), 4096),
           color: 0xffffff,
-          footer: { text: "Chrome Hearts monitor - category signal" },
+          footer: { text: "Chrome Hearts monitor - new category" },
           timestamp: nowIso()
         }
       ]
@@ -2902,6 +2900,7 @@ class MonitorController {
       try {
         await postToWebhook(cfg, webhookUrl, payload);
       } catch {
+        // never let a webhook failure break the loop
       }
     }
   }
