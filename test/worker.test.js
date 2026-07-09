@@ -1134,7 +1134,9 @@ test("productUrlFromUrl accepts every real product URL shape other monitors caug
     "https://www.chromehearts.com/scarf/ch-scarf/075372A7TXXX007.html",
     "https://www.chromehearts.com/eyewear/blueher/21762020UE53D14.html",
     "https://www.chromehearts.com/sweatbands/053669BLKOSZD62.html",
-    "https://www.chromehearts.com/after-school-flannel-shorts/213616AZJXSM00D.html"
+    "https://www.chromehearts.com/after-school-flannel-shorts/213616AZJXSM00D.html",
+    // 1-segment root product from the Internet Archive
+    "https://www.chromehearts.com/035699_035701.html"
   ];
   for (const url of accepted) {
     assert.equal(productUrlFromUrl(url), url, `must accept ${url}`);

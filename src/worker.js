@@ -41,6 +41,23 @@ const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
   "dipped-in-blue",
   "bandana",
   "bandanas",
+  "bbq",
+  "sexrecords",
+  "stencil-denim",
+  "match-point",
+  "oddities",
+  "oddities-lighter",
+  "winter",
+  "hoodie-sweats",
+  "sports-mesh",
+  "slo-ride",
+  "safety-pin-set",
+  "safety-pin",
+  "1988",
+  "hotel-slippers",
+  "rollingstones",
+  "plus7",
+  "nude-rib-sports",
   "optical",
   "frames",
   "readers",
@@ -381,7 +398,16 @@ const DEFAULT_SEARCH_QUERY_TERMS = [
   "tart",
   "lowrider",
   "blueher",
-  "edenbox"
+  "edenbox",
+  "oddities",
+  "bbq",
+  "stencil",
+  "mesh",
+  "safety",
+  "pin",
+  "lacquer",
+  "hotel",
+  "slipper"
 ];
 
 const INT_SETTING_LIMITS = {
@@ -904,7 +930,7 @@ function productUrlFromUrl(value) {
     const pathSegments = url.pathname.split("/").filter(Boolean);
     if (!url.pathname.endsWith(".html")) return "";
     if (RESERVED_CATEGORY_IDS.has(pathSegments[0])) return "";
-    if (pathSegments.length < 3 && !(pathSegments.length === 2 && isPidLikeSegment(pathSegments[1]))) return "";
+    if (pathSegments.length < 3 && !isPidLikeSegment(pathSegments[pathSegments.length - 1])) return "";
     return url.toString();
   } catch {
     return "";
