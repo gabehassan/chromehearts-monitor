@@ -237,6 +237,121 @@ const DEFAULT_PROSPECTIVE_CATEGORY_IDS = [
   "clothing",
   "apparel"
 ];
+const DEFAULT_SEARCH_QUERY_TERMS = [
+  // Brand words
+  "chrome",
+  "hearts",
+  "ch",
+  // Motifs / lines
+  "cross",
+  "dagger",
+  "cemetery",
+  "keeper",
+  "fleur",
+  "star",
+  "heart",
+  "horseshoe",
+  "matty",
+  "boy",
+  "hollywood",
+  "foti",
+  "trucker",
+  "baccarat",
+  // Apparel nouns
+  "scarf",
+  "hat",
+  "cap",
+  "beanie",
+  "hoodie",
+  "sweatshirt",
+  "sweatpants",
+  "sweatshorts",
+  "tee",
+  "shirt",
+  "crew",
+  "sleeve",
+  "pocket",
+  "thermal",
+  "jersey",
+  "sweater",
+  "cardigan",
+  "flannel",
+  "denim",
+  "jeans",
+  "pants",
+  "shorts",
+  "leggings",
+  "jacket",
+  "coat",
+  "vest",
+  "parka",
+  "dress",
+  "skirt",
+  "robe",
+  "socks",
+  "boxer",
+  "boxers",
+  "briefs",
+  "bra",
+  "tank",
+  "polo",
+  // Jewelry nouns
+  "ring",
+  "band",
+  "bracelet",
+  "necklace",
+  "pendant",
+  "chain",
+  "charm",
+  "earring",
+  "cuff",
+  "stud",
+  "hoop",
+  // Eyewear nouns
+  "eyewear",
+  "sunglasses",
+  "glasses",
+  "frame",
+  "optical",
+  // Accessories nouns
+  "wallet",
+  "belt",
+  "bag",
+  "tote",
+  "backpack",
+  "pouch",
+  "keychain",
+  "gloves",
+  "tie",
+  "case",
+  "lighter",
+  "ashtray",
+  "flask",
+  "deck",
+  "cards",
+  "dice",
+  // Home / fragrance nouns
+  "candle",
+  "parfum",
+  "perfume",
+  "cologne",
+  "eau",
+  "blanket",
+  "pillow",
+  "towel",
+  "rug",
+  "mug",
+  "glassware",
+  // Materials
+  "leather",
+  "silver",
+  "gold",
+  "plated",
+  "cashmere",
+  "suede",
+  "fur"
+];
+
 const INT_SETTING_LIMITS = {
   categoryFetchConcurrency: [1, 24],
   checkMinIntervalSeconds: [0, 3600],
@@ -353,6 +468,12 @@ function getConfig(env) {
         .map((value) => value.trim().toLowerCase())
         .filter(Boolean)
     ).slice(0, 5),
+    searchQueryTerms: uniqueValues(
+      String(env.SEARCH_QUERY_TERMS === undefined ? DEFAULT_SEARCH_QUERY_TERMS.join(",") : env.SEARCH_QUERY_TERMS)
+        .split(/[\s,]+/)
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => /^[a-z0-9-]+$/.test(value))
+    ).slice(0, 200),
     // Structured run logging for debugging + data collection.
     logBufferSize: intSetting(env, "LOG_BUFFER_SIZE", 200, 0),
     logVerbose: boolSetting(env, "LOG_VERBOSE", true),
@@ -1010,12 +1131,15 @@ async function fetchGridHtmlSafe(cgid, cfg) {
   }
 }
 
-async function selfScanGrids(env, cfg, cgids) {
-  if (!cfg.fanoutEnabled || !env?.SELF || typeof env.SELF.fetch !== "function" || !cgids.length) return null;
+async function selfScanGrids(env, cfg, cgids, queries = []) {
+  if (!cfg.fanoutEnabled || !env?.SELF || typeof env.SELF.fetch !== "function" || (!cgids.length && !queries.length)) {
+    return null;
+  }
   const sliceSize = Math.max(5, cfg.fanoutSliceSize);
+  const items = [...cgids.map((value) => ({ kind: "c", value })), ...queries.map((value) => ({ kind: "q", value }))];
   const slices = [];
-  for (let index = 0; index < cgids.length; index += sliceSize) {
-    slices.push(cgids.slice(index, index + sliceSize));
+  for (let index = 0; index < items.length; index += sliceSize) {
+    slices.push(items.slice(index, index + sliceSize));
   }
 
   const results = await mapWithConcurrency(slices, 6, async (slice) => {
@@ -1024,7 +1148,10 @@ async function selfScanGrids(env, cfg, cgids) {
       const response = await env.SELF.fetch("https://monitor.internal/internal/scan-grids", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${cfg.cronSecret}` },
-        body: JSON.stringify({ cgids: slice })
+        body: JSON.stringify({
+          cgids: slice.filter((item) => item.kind === "c").map((item) => item.value),
+          queries: slice.filter((item) => item.kind === "q").map((item) => item.value)
+        })
       });
       if (!response.ok) return null;
       const body = await response.json();
@@ -1044,12 +1171,12 @@ async function selfScanGrids(env, cfg, cgids) {
     merged.scanned += result.scanned || 0;
   }
   results.forEach((result, index) => {
-    if (!result) merged.failed.push(...slices[index]);
+    if (!result) merged.failed.push(...slices[index].map((item) => (item.kind === "q" ? `q:${item.value}` : item.value)));
   });
   return merged;
 }
 
-async function scanGridsSlice(env, cfg, cgids) {
+async function scanGridsSlice(env, cfg, cgids, queries = []) {
   const products = {};
   const activeCgids = [];
   const failed = [];
@@ -1063,7 +1190,15 @@ async function scanGridsSlice(env, cfg, cgids) {
     if (Object.keys(found).length) activeCgids.push(cgids[index]);
     Object.assign(products, found);
   });
-  return { ok: true, products, activeCgids, failed, scanned: cgids.length };
+  const queryHtmls = await mapWithConcurrency(queries, cfg.categoryFetchConcurrency, (query) => fetchSearchHtmlSafe(query, cfg));
+  queryHtmls.forEach((html, index) => {
+    if (!html) {
+      failed.push(`q:${queries[index]}`);
+      return;
+    }
+    Object.assign(products, parseProducts(html));
+  });
+  return { ok: true, products, activeCgids, failed, scanned: cgids.length + queries.length };
 }
 
 async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
@@ -1079,7 +1214,8 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
   const head = uniqueValues(["root", "shop", ...knownCategoryIds]).slice(0, Math.max(2, cap - shardReserve));
 
   const remainder = pool.filter((cgid) => !head.includes(cgid));
-  const fanout = await selfScanGrids(env, cfg, remainder);
+  const queryPool = (cfg.searchQueryTerms || []).filter((term) => !searchQueries.includes(term));
+  const fanout = await selfScanGrids(env, cfg, remainder, queryPool);
 
   const shardRoom = fanout ? 0 : Math.max(0, Math.min(cfg.fastCategoryShardSize, cap - head.length));
   const shard = rotatingSlice(pool, fastCursor, shardRoom);
@@ -2457,11 +2593,12 @@ async function handleFetch(request, env) {
     const cfg = baseCfg;
     cfg.subrequestsUsed = 0;
     const body = await request.json().catch(() => ({}));
-    const cgids = (Array.isArray(body.cgids) ? body.cgids : [])
-      .map((value) => String(value || "").trim().toLowerCase())
-      .filter((value) => /^[a-z0-9_-]+$/.test(value))
-      .slice(0, 40);
-    return jsonResponse(await scanGridsSlice(env, cfg, cgids));
+    const cleanList = (values) =>
+      (Array.isArray(values) ? values : [])
+        .map((value) => String(value || "").trim().toLowerCase())
+        .filter((value) => /^[a-z0-9_-]+$/.test(value))
+        .slice(0, 40);
+    return jsonResponse(await scanGridsSlice(env, cfg, cleanList(body.cgids), cleanList(body.queries)));
   }
   if (url.pathname === "/api/cron" || url.pathname === "/run") {
     if (!["GET", "POST"].includes(request.method)) return jsonResponse({ ok: false, error: "Method not allowed" }, 405);

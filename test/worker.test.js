@@ -1061,6 +1061,50 @@ test("Fast tick fans the whole category universe out through the SELF binding", 
   });
 });
 
+test("Fan-out query terms catch a product whose category grid is empty (CH SCARF case)", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const requestedQueries = [];
+  const self = {
+    async fetch(_url, init) {
+      const { cgids = [], queries = [] } = JSON.parse(init.body);
+      requestedQueries.push(...queries);
+      const products = {};
+      if (queries.includes("scarf")) {
+        products.SCARF_NEW = {
+          pid: "SCARF_NEW",
+          name: "CH SCARF",
+          price: "1200.00",
+          brand: "Chrome Hearts",
+          category: "scarf",
+          productType: "master",
+          url: "https://www.chromehearts.com/scarf/ch-scarf/SCARF_NEW.html",
+          image: ""
+        };
+      }
+      return new Response(JSON.stringify({ ok: true, products, activeCgids: [], failed: [], scanned: cgids.length + queries.length }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+  };
+  const mock = createChromeHeartsFetch({
+    root: keep,
+    productDetails: { SCARF_NEW: { name: "CH SCARF", categoryName: "scarf", price: "1200.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const testEnv = { ...env({ PROSPECTIVE_CATEGORY_IDS: "scarf,hat" }, kv), SELF: self };
+    const response = await worker.fetch(new Request("https://monitor.test/api/cron?mode=fast", { headers: authHeaders() }), testEnv);
+    const result = await response.json();
+
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, ["SCARF_NEW"]);
+    assert.ok(requestedQueries.includes("scarf"), "the whole-word query universe must be fanned out");
+    assert.equal(mock.discordPayloads[0].embeds[0].title, "CH SCARF");
+  });
+});
+
 test("Fast tick falls back to shard rotation when the SELF binding is absent", async () => {
   const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
   const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
