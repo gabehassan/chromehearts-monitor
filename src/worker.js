@@ -700,6 +700,13 @@ async function saveSettingsFromRequest(request, env, cfg) {
     next[key] = formData.get(key) === "on";
   }
 
+  applyWebhookForm(next, current, formData);
+
+  await env.STATE.put(cfg.settingsKey, JSON.stringify(next));
+  return next;
+}
+
+function applyWebhookForm(next, current, formData) {
   delete next.discordWebhookUrl; // migrate off the legacy single-URL key
   const submitted = validateDiscordWebhookList(formData.get("discordWebhookUrls") || formData.get("discordWebhookUrl"));
   if (formData.get("clearDiscordWebhook") === "on") {
@@ -712,7 +719,13 @@ async function saveSettingsFromRequest(request, env, cfg) {
   } else if (Array.isArray(current.discordWebhookUrls)) {
     next.discordWebhookUrls = current.discordWebhookUrls;
   }
+  return next;
+}
 
+async function saveWebhooksFromRequest(request, env, cfg) {
+  const current = await loadSettings(env, cfg);
+  const formData = await request.formData();
+  const next = applyWebhookForm({ ...current, updatedAt: nowIso() }, current, formData);
   await env.STATE.put(cfg.settingsKey, JSON.stringify(next));
   return next;
 }
@@ -2448,7 +2461,9 @@ function checked(value) {
   return value ? " checked" : "";
 }
 
-function dashboard(state, cfg, settings = {}, saved = false) {
+function dashboard(state, cfg, settings = {}, flags = {}) {
+  const saved = flags.saved === true;
+  const webhooksSaved = flags.webhooksSaved ?? null;
   const last = state.lastResult || {};
   const seenCount = Object.keys(state.seen || {}).length;
   const activeCount = Object.keys(state.active || state.seen || {}).length;
@@ -2462,9 +2477,10 @@ function dashboard(state, cfg, settings = {}, saved = false) {
   const extraProductUrls = cfg.extraProductUrls.join("\n");
   const webhookCount = (cfg.discordWebhookUrls || []).length;
   const dashboardWebhookCount = Array.isArray(settings.discordWebhookUrls) ? settings.discordWebhookUrls.length : 0;
-  const webhookStatus = dashboardWebhookCount
-    ? `${webhookCount} webhook${webhookCount === 1 ? "" : "s"} active (dashboard-managed)`
-    : `${webhookCount} webhook${webhookCount === 1 ? "" : "s"} active (from Worker secret)`;
+  const webhookSource = dashboardWebhookCount ? "dashboard-managed" : "from Worker secret";
+  const webhookStatus = `${webhookCount} webhook${webhookCount === 1 ? "" : "s"} active (${webhookSource})`;
+  const webhookMasked = (cfg.discordWebhookUrls || []).map((url) => maskWebhook(url));
+  const cadenceSeconds = cfg.fastPollEnabled ? cfg.fastPollIntervalSeconds : 60;
 
   return `<!doctype html>
 <html lang="en">
@@ -2500,6 +2516,18 @@ function dashboard(state, cfg, settings = {}, saved = false) {
     .note { color: var(--muted); margin: 0; }
     .saved { color: var(--mint); }
     a { color: var(--blue); }
+    h2 { margin: 0 0 2px; font-size: 20px; }
+    .mint { color: var(--mint); }
+    section.webhooks { border: 1px solid var(--mint); border-radius: 10px; background: var(--panel); padding: 18px; margin: 22px 0; display: grid; gap: 12px; }
+    section.webhooks form { gap: 12px; }
+    .hooklist { border: 1px solid var(--line); border-radius: 8px; background: var(--field); padding: 10px 14px; }
+    .hooklist ul { margin: 8px 0 0; padding-left: 18px; }
+    .hooklist li { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+    section.webhooks .checks { grid-template-columns: 1fr; }
+    details.help { border-top: 1px solid var(--line); padding-top: 10px; }
+    details.help summary { cursor: pointer; color: var(--blue); }
+    details.help ol { color: var(--muted); margin: 10px 0 0; padding-left: 20px; line-height: 1.7; }
+    details.help li { margin-bottom: 4px; }
     @media (max-width: 860px) { header { display: block; } .pill { display: inline-block; margin-top: 14px; } .grid, .form-grid, .checks { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     @media (max-width: 560px) { .grid, .form-grid, .checks { grid-template-columns: 1fr; } }
   </style>
@@ -2519,22 +2547,63 @@ function dashboard(state, cfg, settings = {}, saved = false) {
       <div class="card"><div class="label">Missing watch</div><div class="value">${missingCount}</div></div>
       <div class="card"><div class="label">Cadence</div><div class="value">${escapeHtml(next)}</div></div>
     </div>
+
+    <section class="webhooks">
+      <div class="actions">
+        <div>
+          <h2>Discord webhooks</h2>
+          <p class="note">
+            <strong class="mint">${escapeHtml(webhookStatus)}</strong>${
+    webhooksSaved !== null ? ` <span class="saved">Saved — ${escapeHtml(webhooksSaved)} active. Live within ~${escapeHtml(cadenceSeconds)}s.</span>` : ""
+  }
+          </p>
+        </div>
+      </div>
+      <p class="note">Alerts fire to <em>every</em> webhook below (one per Discord server). Changes take effect on the next check — about <strong>${escapeHtml(cadenceSeconds)} seconds</strong>, no redeploy.</p>
+      ${
+        webhookMasked.length
+          ? `<div class="hooklist"><div class="label">Currently active (${webhookMasked.length})</div><ul>${webhookMasked
+              .map((h) => `<li>${escapeHtml(h)}</li>`)
+              .join("")}</ul></div>`
+          : `<p class="note">No webhooks configured — alerts have nowhere to go until you add one.</p>`
+      }
+      <form action="/webhooks" method="post">
+        <div class="field">
+          <label for="discordWebhookUrls">Webhook URLs — one per line</label>
+          <textarea id="discordWebhookUrls" name="discordWebhookUrls" autocomplete="off" placeholder="https://discord.com/api/webhooks/AAA/token&#10;https://discord.com/api/webhooks/BBB/token"></textarea>
+        </div>
+        <div class="checks">
+          <label class="check"><input name="webhookMode" type="radio" value="add" checked> <strong>Add</strong> these to the current list</label>
+          <label class="check"><input name="webhookMode" type="radio" value="replace"> <strong>Replace</strong> the whole list with these</label>
+          <label class="check"><input name="clearDiscordWebhook" type="checkbox"> <strong>Remove all</strong> (revert to the Worker-secret webhook)</label>
+        </div>
+        <div class="actions">
+          <button type="submit">Save webhooks</button>
+          <p class="note"><a href="/selftest">Send a test alert</a> to every webhook to confirm delivery.</p>
+        </div>
+      </form>
+      <details class="help">
+        <summary>How to add or remove a webhook</summary>
+        <ol>
+          <li><strong>Get a URL:</strong> in Discord → <em>Server Settings → Integrations → Webhooks → New Webhook</em>, pick a channel, then <em>Copy Webhook URL</em>.</li>
+          <li><strong>Add a server:</strong> paste the URL, choose <em>Add</em>, and Save. Do this once per server.</li>
+          <li><strong>Remove one:</strong> choose <em>Replace</em> and paste only the URLs you want to keep (leave out the one to drop), then Save.</li>
+          <li><strong>Remove all:</strong> tick <em>Remove all</em> and Save — the monitor falls back to the Worker-secret webhook.</li>
+          <li><strong>Is it live?</strong> Yes — saved webhooks apply on the next check (~${escapeHtml(cadenceSeconds)}s). The "Currently active" list above always reflects what's in effect right now. Use <em>Send a test alert</em> to confirm.</li>
+        </ol>
+      </details>
+    </section>
+
     <section>
       <form action="/settings" method="post">
         <div class="actions">
           <div>
             <div class="label">Runtime settings</div>
-            <p class="note">${escapeHtml(webhookStatus)}${saved ? ' <span class="saved">Settings saved.</span>' : ""}</p>
+            <p class="note">Tuning only — webhooks are managed above.${saved ? ' <span class="saved">Settings saved.</span>' : ""}</p>
           </div>
           <button type="submit">Save settings</button>
         </div>
         <div class="form-grid">
-          <div class="field">
-            <label for="discordWebhookUrls">Discord webhooks (one URL per line — one per server)</label>
-            <textarea id="discordWebhookUrls" name="discordWebhookUrls" autocomplete="off" placeholder="https://discord.com/api/webhooks/AAA/token&#10;https://discord.com/api/webhooks/BBB/token"></textarea>
-            <label class="check"><input name="webhookMode" type="radio" value="replace" checked> Replace saved list</label>
-            <label class="check"><input name="webhookMode" type="radio" value="add"> Add to saved list</label>
-          </div>
           <div class="field">
             <label for="checkMinIntervalSeconds">Minimum interval seconds</label>
             <input id="checkMinIntervalSeconds" name="checkMinIntervalSeconds" type="number" min="0" max="3600" value="${escapeHtml(cfg.checkMinIntervalSeconds)}">
@@ -2583,7 +2652,6 @@ function dashboard(state, cfg, settings = {}, saved = false) {
             <label for="extraProductUrls">Extra product URLs</label>
             <textarea id="extraProductUrls" name="extraProductUrls" placeholder="https://www.chromehearts.com/category/item/PID.html">${escapeHtml(extraProductUrls)}</textarea>
           </div>
-          <label class="check"><input name="clearDiscordWebhook" type="checkbox"> Clear dashboard webhooks (revert to Worker secret)</label>
         </div>
         <div class="checks">
           <label class="check"><input name="discoverSitemapCategories" type="checkbox"${checked(cfg.discoverSitemapCategories)}> Sitemap categories</label>
@@ -2627,7 +2695,12 @@ async function handleFetch(request, env) {
     if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
     const settings = await loadSettings(env, baseCfg);
     const cfg = applyRuntimeSettings(baseCfg, settings);
-    return htmlResponse(dashboard(await loadState(env, cfg), cfg, settings, url.searchParams.get("saved") === "1"));
+    return htmlResponse(
+      dashboard(await loadState(env, cfg), cfg, settings, {
+        saved: url.searchParams.get("saved") === "1",
+        webhooksSaved: url.searchParams.has("webhooks") ? url.searchParams.get("webhooks") : null
+      })
+    );
   }
   if (url.pathname === "/settings") {
     if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
@@ -2635,6 +2708,18 @@ async function handleFetch(request, env) {
     try {
       await saveSettingsFromRequest(request, env, baseCfg);
       return redirectResponse("/?saved=1");
+    } catch (error) {
+      const status = error instanceof MonitorError ? error.statusCode : 500;
+      return jsonResponse({ ok: false, error: error.message }, status);
+    }
+  }
+  if (url.pathname === "/webhooks") {
+    if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
+    if (request.method !== "POST") return redirectResponse("/");
+    try {
+      const saved = await saveWebhooksFromRequest(request, env, baseCfg);
+      const count = Array.isArray(saved.discordWebhookUrls) ? saved.discordWebhookUrls.length : 0;
+      return redirectResponse(`/?webhooks=${count}`);
     } catch (error) {
       const status = error instanceof MonitorError ? error.statusCode : 500;
       return jsonResponse({ ok: false, error: error.message }, status);

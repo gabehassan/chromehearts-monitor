@@ -764,6 +764,69 @@ test("Worker dashboard saves multiple webhooks and alerts every server", async (
   });
 });
 
+test("Dedicated /webhooks route adds, replaces, and clears without any numeric fields", async () => {
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const testEnv = env({}, kv);
+  const hookA = "https://discord.com/api/webhooks/1/aaa";
+  const hookB = "https://discord.com/api/webhooks/2/bbb";
+  const hookC = "https://discord.com/api/webhooks/3/ccc";
+  const postWebhooks = async (params) => {
+    const response = await worker.fetch(
+      new Request("https://monitor.test/webhooks", {
+        method: "POST",
+        headers: { ...basicAuthHeaders(), "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams(params)
+      }),
+      testEnv
+    );
+    return response;
+  };
+
+  let response = await postWebhooks({ discordWebhookUrls: `${hookA}\n${hookB}`, webhookMode: "replace" });
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get("location"), "/?webhooks=2");
+  assert.deepEqual(JSON.parse(kv.values.get(SETTINGS_KEY)).discordWebhookUrls, [hookA, hookB]);
+
+  // Add a third (append, not replace).
+  response = await postWebhooks({ discordWebhookUrls: hookC, webhookMode: "add" });
+  assert.equal(response.headers.get("location"), "/?webhooks=3");
+  assert.deepEqual(JSON.parse(kv.values.get(SETTINGS_KEY)).discordWebhookUrls, [hookA, hookB, hookC]);
+
+  // Remove one by replacing with the survivors.
+  response = await postWebhooks({ discordWebhookUrls: `${hookA}\n${hookC}`, webhookMode: "replace" });
+  assert.deepEqual(JSON.parse(kv.values.get(SETTINGS_KEY)).discordWebhookUrls, [hookA, hookC]);
+
+  response = await postWebhooks({ clearDiscordWebhook: "on" });
+  assert.equal(response.headers.get("location"), "/?webhooks=0");
+  assert.equal(JSON.parse(kv.values.get(SETTINGS_KEY)).discordWebhookUrls, undefined);
+
+  // A bad URL is rejected without corrupting the saved list.
+  await postWebhooks({ discordWebhookUrls: hookA, webhookMode: "replace" });
+  const bad = await postWebhooks({ discordWebhookUrls: "https://example.com/not-discord", webhookMode: "replace" });
+  assert.equal(bad.status, 400);
+  assert.deepEqual(JSON.parse(kv.values.get(SETTINGS_KEY)).discordWebhookUrls, [hookA]);
+});
+
+test("Dashboard shows the active webhook list (masked) and a live-status note", async () => {
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  kv.values.set(
+    SETTINGS_KEY,
+    JSON.stringify({ discordWebhookUrls: ["https://discord.com/api/webhooks/424242/supersecrettoken"] })
+  );
+  const testEnv = env({ FAST_POLL_INTERVAL_SECONDS: "12" }, kv);
+
+  const response = await worker.fetch(new Request("https://monitor.test/?webhooks=1", { headers: basicAuthHeaders() }), testEnv);
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, /Discord webhooks/);
+  assert.match(html, /1 webhook active \(dashboard-managed\)/);
+  assert.match(html, /Currently active \(1\)/);
+  assert.match(html, /discord\.com\/…\/424242\/\*\*\*\*/, "webhook id shown, token masked");
+  assert.equal(html.includes("supersecrettoken"), false, "token never rendered");
+  assert.match(html, /Live within ~12s/);
+  assert.match(html, /How to add or remove a webhook/);
+});
+
 test("A dead webhook among several does not block delivery to the others", async () => {
   const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
   const newProduct = productTile("NEW_SHOP", "NEW SHOP ITEM", "shop", "Shop", "200.00");
