@@ -7,6 +7,11 @@ compatibility_flags = ["nodejs_compat"]
 enabled = true
 
 [vars]
+WORKERS_PLAN = "free"
+STAGING_LANE_ENABLED = "true"
+HOT_WATCH_LIMIT = "12"
+PING_FIRST_ALERTS = "true"
+FRESH_MISSING_GRACE_MINUTES = "30"
 FAST_POLL_ENABLED = "true"
 FAST_POLL_INTERVAL_SECONDS = "12"
 FULL_SWEEP_EVERY_TICKS = "4"

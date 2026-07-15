@@ -551,7 +551,27 @@ function getConfig(env) {
     // Structured run logging for debugging + data collection.
     logBufferSize: intSetting(env, "LOG_BUFFER_SIZE", 600, 0),
     logVerbose: boolSetting(env, "LOG_VERBOSE", true),
+    workersPlan: String(env.WORKERS_PLAN || "free").toLowerCase() === "paid" ? "paid" : "free",
+    stagingLaneEnabled: boolSetting(env, "STAGING_LANE_ENABLED", true),
+    hotWatchLimit: intSetting(env, "HOT_WATCH_LIMIT", 12, 0),
+    pingFirstAlerts: boolSetting(env, "PING_FIRST_ALERTS", true),
+    freshMissingGraceMinutes: intSetting(env, "FRESH_MISSING_GRACE_MINUTES", 30, 0),
     userAgent: env.MONITOR_USER_AGENT || DEFAULT_USER_AGENT
+  };
+}
+
+function applyPlanPreset(cfg) {
+  if (cfg.workersPlan !== "paid") return cfg;
+  return {
+    ...cfg,
+    fastPollIntervalSeconds: Math.min(cfg.fastPollIntervalSeconds, 6),
+    fastMaxCategories: Math.max(cfg.fastMaxCategories, 220),
+    maxStorefrontSubrequests: Math.max(cfg.maxStorefrontSubrequests, 260),
+    subrequestHardCap: Math.max(cfg.subrequestHardCap, 950),
+    maxCategoryIds: Math.max(cfg.maxCategoryIds, 260),
+    categoryFetchConcurrency: Math.max(cfg.categoryFetchConcurrency, 20),
+    discoveryEveryFullSweeps: Math.min(cfg.discoveryEveryFullSweeps, 5),
+    hotWatchLimit: Math.max(cfg.hotWatchLimit, 24)
   };
 }
 
@@ -595,7 +615,7 @@ function applyRuntimeSettings(cfg, settings) {
 
 async function getRuntimeConfig(env) {
   const cfg = getConfig(env);
-  return applyRuntimeSettings(cfg, await loadSettings(env, cfg));
+  return applyPlanPreset(applyRuntimeSettings(cfg, await loadSettings(env, cfg)));
 }
 
 function parseFormInt(formData, key) {
@@ -1024,6 +1044,282 @@ async function fetchRobotsProductUrls(cfg) {
   }
 }
 
+function pidFromProductUrl(value) {
+  try {
+    const url = new URL(value, BASE_URL);
+    const segment = url.pathname.split("/").filter(Boolean).pop() || "";
+    const pid = segment.replace(/\.html$/i, "");
+    return isPidLikeSegment(pid) ? pid : "";
+  } catch {
+    return "";
+  }
+}
+
+function stagedNameFromUrl(value) {
+  try {
+    const segments = new URL(value, BASE_URL).pathname.split("/").filter(Boolean);
+    const slug = segments.length >= 2 ? segments[segments.length - 2] : "";
+    if (!slug || slug.includes(".")) return "";
+    return slug.replaceAll("-", " ").toUpperCase();
+  } catch {
+    return "";
+  }
+}
+
+async function fetchSitemapDelta(cfg, previousLastmod = "") {
+  const unchanged = { lastmod: previousLastmod, changed: false, categoryIds: [], productUrls: [] };
+  if (!cfg.discoverSitemapCategories) return unchanged;
+  try {
+    const indexResponse = await fetchWithTimeout(
+      cfg.sitemapIndexUrl,
+      fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"),
+      cfg.requestTimeoutMs,
+      cfg
+    );
+    if (!indexResponse.ok) return unchanged;
+    const indexXml = await indexResponse.text();
+    const lastmod =
+      [...indexXml.matchAll(/<lastmod>\s*([^<]+?)\s*<\/lastmod>/gi)].map((match) => match[1].trim()).sort().pop() || "";
+    if (lastmod && lastmod === previousLastmod) return { lastmod, changed: false, categoryIds: [], productUrls: [] };
+
+    const categoryIds = [];
+    const productUrls = [];
+    let fetchedAny = false;
+    for (const sitemapUrl of extractXmlLocations(indexXml)
+      .filter((url) => url.endsWith(".xml"))
+      .slice(0, 3)) {
+      const response = await fetchWithTimeout(sitemapUrl, fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs, cfg);
+      if (!response.ok) continue;
+      fetchedAny = true;
+      for (const loc of extractXmlLocations(await response.text())) {
+        const categoryId = categoryIdFromUrl(loc);
+        if (categoryId) categoryIds.push(categoryId);
+        const productUrl = productUrlFromUrl(loc);
+        if (productUrl) productUrls.push(productUrl);
+      }
+    }
+    if (!fetchedAny) return unchanged;
+    return { lastmod, changed: true, categoryIds: uniqueValues(categoryIds).sort(), productUrls };
+  } catch {
+    return unchanged;
+  }
+}
+
+function parseHotWatchProbe(body, pid) {
+  const product = body?.product || {};
+  const variation = parseProductVariationJson(body);
+  const priceValue = product?.price?.sales?.value ?? product?.price?.list?.value ?? null;
+  const purchasable = Boolean(
+    priceValue !== null && (variation.productAvailable || variation.readyToOrder || variation.inStockSizeCount > 0)
+  );
+  const imageGroups = product?.images || {};
+  const imageUrl =
+    ["large", "hiRes", "hi-res", "medium", "small"]
+      .map((key) => imageGroups?.[key]?.[0]?.url || imageGroups?.[key]?.[0]?.absURL)
+      .find(Boolean) || "";
+  return {
+    ok: true,
+    pid,
+    masterPid: variation.masterPid || pid,
+    name: String(product.productName || "").trim(),
+    price: priceValue === null ? "" : String(priceValue),
+    image: imageUrl ? absoluteUrl(imageUrl) : "",
+    purchasable,
+    sizes: variation.sizes,
+    inStockSizeCount: variation.inStockSizeCount,
+    availabilityMessages: variation.availabilityMessages
+  };
+}
+
+async function probeHotWatchPids(cfg, pids) {
+  const probes = {};
+  const cleanPids = (Array.isArray(pids) ? pids : []).map((value) => String(value || "").trim()).filter(isPidLikeSegment);
+  await mapWithConcurrency(cleanPids, 4, async (pid) => {
+    if (subrequestsLeft(cfg) <= 4) return;
+    try {
+      const response = await fetchWithTimeout(
+        productVariationUrl(pid, 1),
+        {
+          headers: {
+            accept: "application/json, text/javascript, */*; q=0.01",
+            "user-agent": cfg.userAgent,
+            "x-requested-with": "XMLHttpRequest"
+          },
+          cache: "no-store"
+        },
+        cfg.requestTimeoutMs,
+        cfg
+      );
+      if (!response.ok) {
+        probes[pid] = { ok: false, status: response.status };
+        return;
+      }
+      probes[pid] = parseHotWatchProbe(await response.json(), pid);
+    } catch (error) {
+      probes[pid] = { ok: false, error: error.message };
+    }
+  });
+  return probes;
+}
+
+async function stagingScan(cfg, opts = {}) {
+  const [robotsUrls, homepage, sitemap, probes] = await Promise.all([
+    fetchRobotsProductUrls(cfg),
+    fetchHomepageSignals(cfg),
+    fetchSitemapDelta(cfg, String(opts.sitemapLastmod || "")),
+    probeHotWatchPids(cfg, opts.hotWatchPids || [])
+  ]);
+  const stagedUrls = [];
+  const stagedPids = new Set();
+  for (const { url, source } of [
+    ...robotsUrls.map((url) => ({ url, source: "robots.txt" })),
+    ...(sitemap.productUrls || []).map((url) => ({ url, source: "sitemap" })),
+    ...(homepage.productUrls || []).map((url) => ({ url, source: "homepage" }))
+  ]) {
+    const pid = pidFromProductUrl(url);
+    if (!pid || stagedPids.has(pid)) continue;
+    stagedPids.add(pid);
+    stagedUrls.push({ url, source });
+  }
+  return {
+    stagedUrls,
+    sitemap: { lastmod: sitemap.lastmod, changed: sitemap.changed, categoryIds: sitemap.categoryIds },
+    probes
+  };
+}
+
+async function collectStagingSignals(env, cfg, opts) {
+  if (cfg.fanoutEnabled && env?.SELF && typeof env.SELF.fetch === "function") {
+    try {
+      spendSubrequest(cfg);
+      const response = await env.SELF.fetch("https://monitor.internal/internal/scan-grids", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${cfg.cronSecret}` },
+        body: JSON.stringify({ staging: opts })
+      });
+      if (response.ok) {
+        const body = await response.json();
+        if (body?.ok && body.staging) return body.staging;
+      }
+    } catch {
+      // fall through to the local path
+    }
+  }
+  if (subrequestsLeft(cfg) <= 12) return null;
+  try {
+    return await stagingScan(cfg, opts);
+  } catch {
+    return null;
+  }
+}
+
+const HOT_WATCH_EXPIRY_MS = 21 * 24 * 3600 * 1000;
+
+async function runStagingLane(env, cfg, state) {
+  const seen = state.seen || {};
+  const previousHotWatch =
+    state.hotWatch && typeof state.hotWatch === "object" && !Array.isArray(state.hotWatch) ? state.hotWatch : {};
+  const hotWatchPids = Object.keys(previousHotWatch)
+    .filter((pid) => !previousHotWatch[pid]?.dormant)
+    .slice(0, cfg.hotWatchLimit);
+  const signals = await collectStagingSignals(env, cfg, {
+    hotWatchPids,
+    sitemapLastmod: state.sitemapIndexLastmod || ""
+  });
+  if (!signals) return null;
+
+  const baselined = Boolean(state.stagingBaselinedAt);
+  const now = nowIso();
+  const hotWatch = {};
+  let dirty = !baselined;
+
+  for (const [pid, entry] of Object.entries(previousHotWatch)) {
+    const stagedAtMs = Date.parse(entry?.firstStagedAt || "");
+    if (Number.isFinite(stagedAtMs) && Date.now() - stagedAtMs > HOT_WATCH_EXPIRY_MS) {
+      dirty = true;
+      continue;
+    }
+    hotWatch[pid] = entry;
+  }
+
+  const discoveries = [];
+  for (const staged of signals.stagedUrls || []) {
+    const pid = pidFromProductUrl(staged.url);
+    if (!pid || seen[pid] || hotWatch[pid]) continue;
+    if (Object.keys(hotWatch).length >= cfg.hotWatchLimit) break;
+    hotWatch[pid] = { pid, url: staged.url, source: staged.source, name: stagedNameFromUrl(staged.url), firstStagedAt: now };
+    discoveries.push(hotWatch[pid]);
+    dirty = true;
+  }
+
+  const liveProducts = {};
+  let probedCount = 0;
+  for (const [pid, probe] of Object.entries(signals.probes || {})) {
+    probedCount += 1;
+    const entry = hotWatch[pid];
+    if (!entry || !probe || probe.ok === false) continue;
+    if (probe.masterPid && probe.masterPid !== pid && (seen[probe.masterPid] || hotWatch[probe.masterPid])) {
+      if (!entry.dormant) {
+        hotWatch[pid] = { ...entry, dormant: true, masterPid: probe.masterPid };
+        dirty = true;
+      }
+      continue;
+    }
+    if (!probe.purchasable) continue;
+    liveProducts[pid] = {
+      pid,
+      name: probe.name || entry.name || pid,
+      price: probe.price || "",
+      brand: "Chrome Hearts",
+      category: categoryFromUrl(entry.url) || "staged",
+      productType: "hotwatch",
+      url: entry.url,
+      image: probe.image || "",
+      sizes: probe.sizes || [],
+      inStockSizeCount: probe.inStockSizeCount ?? 0
+    };
+  }
+
+  const previousCategories = Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : null;
+  let sitemapCategoryIds = null;
+  const addedCategories = [];
+  let sitemapLastmod;
+  if (signals.sitemap?.changed && Array.isArray(signals.sitemap.categoryIds)) {
+    sitemapCategoryIds = uniqueValues(signals.sitemap.categoryIds).sort();
+    sitemapLastmod = signals.sitemap.lastmod || "";
+    if (previousCategories) {
+      for (const cgid of sitemapCategoryIds) {
+        if (!previousCategories.includes(cgid)) addedCategories.push(cgid);
+      }
+    }
+    const lastmodChanged = sitemapLastmod !== (state.sitemapIndexLastmod || "");
+    const categoriesChanged = !previousCategories || previousCategories.join(",") !== sitemapCategoryIds.join(",");
+    if (lastmodChanged || categoriesChanged) dirty = true;
+  }
+
+  if (baselined) {
+    const lines = [
+      ...discoveries.map(
+        (entry) =>
+          `👀 **STAGED ITEM** ${entry.name || entry.pid} — <${entry.url}> — found in ${entry.source}, not yet purchasable. Hot-watching every tick.`
+      ),
+      ...addedCategories.map((cgid) => `📁 **SITEMAP** category \`/${cgid}\` just appeared — possible drop prep.`)
+    ];
+    if (lines.length) await sendStagingPings(cfg, lines);
+  }
+
+  return {
+    hotWatch,
+    liveProducts,
+    discoveries,
+    probedCount,
+    dirty,
+    baselined,
+    sitemapIndexLastmod: sitemapLastmod,
+    sitemapCategoryIds
+  };
+}
+
 function discoveryFetchReserve(cfg) {
   let reserve = 0;
   if (cfg.discoverSitemapCategories) reserve += 6;
@@ -1350,7 +1646,11 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
 }
 
 async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
-  const pool = uniqueValues([...cfg.extraCategoryIds, ...cfg.prospectiveCategoryIds]);
+  const pool = uniqueValues([
+    ...cfg.extraCategoryIds,
+    ...cfg.prospectiveCategoryIds,
+    ...(Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : [])
+  ]);
   const knownCategoryIds = Array.isArray(state.knownCategoryIds)
     ? state.knownCategoryIds
     : Array.isArray(state.activeCategoryIds)
@@ -2033,8 +2333,8 @@ async function enrichProduct(product, cfg) {
       description: product.description || "",
       exactStockKnown: false,
       totalStock: null,
-      inStockSizeCount: 0,
-      sizes: [],
+      inStockSizeCount: product.inStockSizeCount ?? 0,
+      sizes: product.sizes || [],
       detailError: error.message,
       enrichedAt: nowIso()
     };
@@ -2108,27 +2408,50 @@ async function sendDiscord(cfg, products) {
   if (!webhookUrls.length) throw new MonitorError("No Discord webhook configured.", 500);
 
   const failures = [];
-  for (const webhookUrl of webhookUrls) {
-    let delivered = true;
-    for (let index = 0; index < products.length; index += 10) {
-      const chunk = products.slice(index, index + 10);
-      const payload = {
-        username: "Chrome Hearts Monitor",
-        content: chunk.length === 1 ? "New Chrome Hearts item loaded" : `${chunk.length} new Chrome Hearts items loaded`,
-        embeds: chunk.map(buildProductEmbed)
-      };
-      if (!(await postToWebhook(cfg, webhookUrl, payload))) {
-        delivered = false;
-        break;
+  await Promise.all(
+    webhookUrls.map(async (webhookUrl) => {
+      for (let index = 0; index < products.length; index += 10) {
+        const chunk = products.slice(index, index + 10);
+        const payload = {
+          username: "Chrome Hearts Monitor",
+          content: chunk.length === 1 ? "New Chrome Hearts item loaded" : `${chunk.length} new Chrome Hearts items loaded`,
+          embeds: chunk.map(buildProductEmbed)
+        };
+        if (!(await postToWebhook(cfg, webhookUrl, payload))) {
+          failures.push(webhookUrl);
+          return;
+        }
       }
-    }
-    if (!delivered) failures.push(webhookUrl);
-  }
+    })
+  );
 
   if (failures.length === webhookUrls.length) {
     throw new MonitorError(`All ${failures.length} Discord webhook(s) failed`, 502);
   }
   return { delivered: webhookUrls.length - failures.length, failed: failures.length };
+}
+
+async function sendInstantPing(cfg, products) {
+  try {
+    const lines = products
+      .slice(0, 10)
+      .map((product) => `🚨 **${truncate(product.name || product.pid, 120)}** — ${priceText(product.price) || "price unknown"} — <${product.url}>`);
+    if (!lines.length) return;
+    const payload = { username: "Chrome Hearts Monitor", content: lines.join("\n") };
+    await Promise.all((cfg.discordWebhookUrls || []).map((webhookUrl) => postToWebhook(cfg, webhookUrl, payload).catch(() => false)));
+  } catch {
+    // never let the bonus ping break the alert path
+  }
+}
+
+async function sendStagingPings(cfg, lines) {
+  try {
+    if (!lines.length) return;
+    const payload = { username: "Chrome Hearts Monitor", content: lines.slice(0, 6).join("\n") };
+    await Promise.all((cfg.discordWebhookUrls || []).map((webhookUrl) => postToWebhook(cfg, webhookUrl, payload).catch(() => false)));
+  } catch {
+    // best-effort
+  }
 }
 
 function productStateRecord(product, previousRecord, now) {
@@ -2169,8 +2492,12 @@ function buildCatalogState(products, state, deferredPids, cfg, { partial = false
 
   if (partial) return { seen, active, missing };
 
+  const graceMs = Math.max(0, (cfg.freshMissingGraceMinutes || 0) * 60000);
+
   for (const pid of Object.keys(previousActive)) {
     if (currentPids.has(pid)) continue;
+    const firstSeenMs = Date.parse(seen[pid]?.firstSeenAt || "");
+    if (graceMs && Number.isFinite(firstSeenMs) && Date.now() - firstSeenMs < graceMs) continue;
     const previous = previousMissing[pid] || {};
     const count = Number(previous.count || 0) + 1;
     missing[pid] = {
@@ -2211,6 +2538,7 @@ function runLogEntry(mode, result, ms, cfg) {
     failedCategories: sweep?.failedCategoryCount ?? 0,
     searches: sweep?.searchQueryCount ?? result.fast?.searchQueries ?? 0,
     newFromSearch: sweep?.newFromSearch ?? null,
+    staging: result.staging || null,
     enrichMs: result.enrichMs || 0,
     sendMs: result.sendMs || 0,
     error: result.error || null
@@ -2225,7 +2553,12 @@ function catalogFingerprint(state) {
       .map(([pid, entry]) => `${pid}:${entry?.count || 0}`)
       .sort(),
     state.knownCategoryIds || [],
-    state.activeCategoryIds || []
+    state.activeCategoryIds || [],
+    Object.entries(state.hotWatch || {})
+      .map(([pid, entry]) => `${pid}:${entry?.dormant ? 1 : 0}`)
+      .sort(),
+    state.sitemapIndexLastmod || "",
+    state.sitemapCategoryIds || []
   ]);
 }
 
@@ -2265,19 +2598,26 @@ async function runMonitor(env, cfg = null, opts = {}) {
     const previousMissing = state.missing || {};
     const firstRun = Object.keys(previousSeen).length === 0;
 
+    const stagingPromise =
+      cfg.stagingLaneEnabled && !firstRun ? runStagingLane(env, cfg, state).catch(() => null) : Promise.resolve(null);
+
     let products;
+    let staging = null;
     let nextFastCursor = fastCursor;
     let fastMeta = null;
     if (mode === "fast") {
       if (firstRun) {
+        await stagingPromise;
         return done({ ok: true, skipped: true, reason: "awaiting-baseline", mode, nextFastCursor: fastCursor, storage: "cloudflare-kv" });
       }
-      const fast = await fastFetchProducts(env, cfg, state, fastCursor);
+      const [fast, stagingResult] = await Promise.all([fastFetchProducts(env, cfg, state, fastCursor), stagingPromise]);
+      staging = stagingResult;
       products = fast.products;
       nextFastCursor = fast.nextFastCursor;
       fastMeta = fast.meta;
 
-      if (fast.empty) {
+      const stagingLiveCount = staging ? Object.keys(staging.liveProducts || {}).length : 0;
+      if (fast.empty && !stagingLiveCount && !staging?.dirty) {
         return done({
           ok: true,
           mode,
@@ -2286,16 +2626,25 @@ async function runMonitor(env, cfg = null, opts = {}) {
           newPids: [],
           productCount: fast.meta.pidUniverse,
           fast: fast.meta,
+          staging: staging ? { probed: staging.probedCount, hotWatch: Object.keys(staging.hotWatch).length } : null,
           nextFastCursor,
           storage: "cloudflare-kv",
           checkedAt: nowIso()
         });
       }
     } else {
-      products = await fetchProducts(
-        cfg,
-        externalProspectiveCursor === null ? state : { ...state, prospectiveCategoryCursor: externalProspectiveCursor }
-      );
+      const [full, stagingResult] = await Promise.all([
+        fetchProducts(cfg, externalProspectiveCursor === null ? state : { ...state, prospectiveCategoryCursor: externalProspectiveCursor }),
+        stagingPromise
+      ]);
+      products = full;
+      staging = stagingResult;
+    }
+
+    if (staging) {
+      for (const [pid, product] of Object.entries(staging.liveProducts || {})) {
+        if (!products[pid]) products[pid] = product;
+      }
     }
 
     const newPids = Object.keys(products).filter(
@@ -2307,6 +2656,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
     const deferredProducts = candidates.slice(cfg.maxAlertsPerRun);
     const deferredPids = new Set(deferredProducts.map((product) => product.pid));
 
+    const pingPromise = cfg.pingFirstAlerts && productsToAlert.length ? sendInstantPing(cfg, productsToAlert) : null;
+
     const enrichStartedAt = Date.now();
     const enriched = productsToAlert.length
       ? await mapWithConcurrency(
@@ -2316,6 +2667,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
         )
       : [];
     const enrichMs = productsToAlert.length ? Date.now() - enrichStartedAt : 0;
+    if (pingPromise) await pingPromise;
     const sendStartedAt = Date.now();
     if (enriched.length) await sendDiscord(cfg, enriched);
     const sendMs = enriched.length ? Date.now() - sendStartedAt : 0;
@@ -2329,9 +2681,18 @@ async function runMonitor(env, cfg = null, opts = {}) {
       alerted: enriched.length,
       deferred: deferredProducts.length,
       newPids: productsToAlert.map((product) => product.pid),
+      pinged: pingPromise ? productsToAlert.length : 0,
       discovery: mode === "full" ? cfg.discoveryRun || null : null,
       sweep,
       fast: fastMeta,
+      staging: staging
+        ? {
+            discoveries: staging.discoveries.length,
+            probed: staging.probedCount,
+            live: Object.keys(staging.liveProducts || {}).length,
+            hotWatch: Object.keys(staging.hotWatch).length
+          }
+        : null,
       nextFastCursor,
       nextProspectiveCursor: mode === "full" ? cfg.discoveryRun?.nextProspectiveCategoryCursor ?? null : null,
       subrequestsUsed: cfg.subrequestsUsed || 0,
@@ -2368,6 +2729,18 @@ async function runMonitor(env, cfg = null, opts = {}) {
           .filter(Boolean)
       ]).filter((cgid) => cgid && cgid !== "root" && cgid !== "shop");
       nextState.knownCategoryIds = learned.slice(-120);
+    }
+
+    if (staging) {
+      const nextHotWatch = { ...staging.hotWatch };
+      for (const product of enriched) {
+        delete nextHotWatch[product.pid];
+        if (product.masterPid) delete nextHotWatch[product.masterPid];
+      }
+      nextState.hotWatch = nextHotWatch;
+      if (staging.sitemapIndexLastmod !== undefined) nextState.sitemapIndexLastmod = staging.sitemapIndexLastmod;
+      if (staging.sitemapCategoryIds) nextState.sitemapCategoryIds = staging.sitemapCategoryIds;
+      if (!state.stagingBaselinedAt) nextState.stagingBaselinedAt = nowIso();
     }
 
     const quietFullSweep =
@@ -2739,6 +3112,14 @@ async function handleFetch(request, env) {
       universeSize: cfg.prospectiveCategoryIds.length,
       activeCategories: Array.isArray(state.activeCategoryIds) ? state.activeCategoryIds : [],
       knownCategories: Array.isArray(state.knownCategoryIds) ? state.knownCategoryIds : [],
+      workersPlan: cfg.workersPlan,
+      staging: {
+        enabled: cfg.stagingLaneEnabled,
+        baselinedAt: state.stagingBaselinedAt || null,
+        hotWatch: Object.keys(state.hotWatch || {}),
+        sitemapIndexLastmod: state.sitemapIndexLastmod || null,
+        sitemapCategories: Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : []
+      },
       fastPoll: {
         enabled: cfg.fastPollEnabled,
         intervalSeconds: cfg.fastPollIntervalSeconds,
@@ -2824,9 +3205,17 @@ async function handleFetch(request, env) {
   if (url.pathname === "/internal/scan-grids") {
     if (request.method !== "POST") return jsonResponse({ ok: false, error: "Method not allowed" }, 405);
     if (!isAuthorized(request, baseCfg)) return jsonResponse({ ok: false, error: "Unauthorized" }, 401);
-    const cfg = baseCfg;
+    const cfg = applyPlanPreset(baseCfg);
     cfg.subrequestsUsed = 0;
     const body = await request.json().catch(() => ({}));
+    if (body && body.staging && typeof body.staging === "object") {
+      const hotWatchPids = (Array.isArray(body.staging.hotWatchPids) ? body.staging.hotWatchPids : [])
+        .map((value) => String(value || "").trim())
+        .filter(isPidLikeSegment)
+        .slice(0, 24);
+      const staging = await stagingScan(cfg, { hotWatchPids, sitemapLastmod: String(body.staging.sitemapLastmod || "") });
+      return jsonResponse({ ok: true, staging });
+    }
     const cleanList = (values) =>
       (Array.isArray(values) ? values : [])
         .map((value) => String(value || "").trim().toLowerCase())
@@ -3034,7 +3423,7 @@ class MonitorController {
     const mode = tick % everyTicks === 0 ? "full" : "fast";
     const startedAt = Date.now();
     const intervalMs = Math.max(5, cfg.fastPollIntervalSeconds) * 1000;
-    const jitterMs = Math.floor(Math.random() * 1500);
+    const jitterMs = Math.floor(Math.random() * 400);
     await this.state.storage.setAlarm(startedAt + intervalMs + jitterMs);
     const previousTickAt = Date.parse((await this.state.storage.get("lastTickAt")) || "") || null;
     const tickGapMs = previousTickAt ? startedAt - previousTickAt : null;
@@ -3083,6 +3472,8 @@ class MonitorController {
         newPids: result.newPids || [],
         activeCategories: result.sweep?.activeCategoryIds?.length ?? result.fast?.activeCategoryCount ?? null,
         failedCategories: result.sweep?.failedCategoryCount ?? 0,
+        staged: result.staging?.discoveries ?? 0,
+        hotWatch: result.staging?.hotWatch ?? null,
         enrichMs: result.enrichMs || 0,
         sendMs: result.sendMs || 0,
         error: result.error || null
@@ -3146,5 +3537,11 @@ export {
   isPidLikeSegment,
   categoryStatusTransitions,
   interestingCategoryTransition,
-  discoveredCategories
+  discoveredCategories,
+  pidFromProductUrl,
+  stagedNameFromUrl,
+  parseHotWatchProbe,
+  applyPlanPreset,
+  runStagingLane,
+  stagingScan
 };

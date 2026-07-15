@@ -6,7 +6,12 @@ import worker, {
   productUrlFromUrl,
   categoryStatusTransitions,
   interestingCategoryTransition,
-  discoveredCategories
+  discoveredCategories,
+  pidFromProductUrl,
+  stagedNameFromUrl,
+  parseHotWatchProbe,
+  applyPlanPreset,
+  buildCatalogState
 } from "../src/worker.js";
 
 const STATE_KEY = "state";
@@ -70,7 +75,7 @@ function variationJson(pid) {
 }
 
 function stateWithSeen(products) {
-  const now = new Date().toISOString();
+  const now = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
   return {
     seen: Object.fromEntries(
       products.map((product) => [
@@ -140,10 +145,21 @@ function env(overrides = {}, kv = fakeKV()) {
     MIN_PRODUCTS: "1",
     PAGE_SIZE: "200",
     PROBE_EXACT_STOCK: "false",
+    PING_FIRST_ALERTS: "false",
     REQUEST_TIMEOUT_MS: "1000",
     PROSPECTIVE_CATEGORY_SHARD_SIZE: "24",
     WEBHOOK_TIMEOUT_MS: "1000",
     ...overrides
+  };
+}
+
+function withStagingBaseline(state) {
+  return {
+    ...state,
+    stagingBaselinedAt: state.createdAt,
+    hotWatch: {},
+    sitemapIndexLastmod: "",
+    sitemapCategoryIds: []
   };
 }
 
@@ -165,7 +181,8 @@ function createChromeHeartsFetch({
   homepageProductUrls = [],
   robotsProductUrls = [],
   robotsExtraLines = [],
-  productDetails = {}
+  productDetails = {},
+  productVariations = {}
 }) {
   const discordPayloads = [];
   const discordUrls = [];
@@ -240,7 +257,8 @@ function createChromeHeartsFetch({
     }
 
     if (url.pathname.includes("/Product-Variation")) {
-      return new Response(JSON.stringify(variationJson(url.searchParams.get("pid") || "UNKNOWN")), {
+      const variationPid = url.searchParams.get("pid") || "UNKNOWN";
+      return new Response(JSON.stringify(productVariations[variationPid] || variationJson(variationPid)), {
         status: 200,
         headers: { "content-type": "application/json" }
       });
@@ -933,7 +951,7 @@ test("Fast tick alerts a new root-grid product without marking unscanned items m
 
 test("Fast tick with no new products sends nothing and skips the KV write", async () => {
   const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
-  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }])));
   const before = kv.values.get(STATE_KEY);
   const mock = createChromeHeartsFetch({ root: keep });
 
@@ -1254,4 +1272,317 @@ test("Worker dashboard and health pages are private", async () => {
   assert.equal(authorized.status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.seen, 1);
+});
+
+// ---- Staging watch / hot-watch lane ----
+
+function stagedVariation(pid, { live = false, name = "CORD SLIPPERS" } = {}) {
+  return {
+    product: {
+      id: pid,
+      masterProductId: pid,
+      productName: name,
+      productType: "master",
+      available: live,
+      readyToOrder: live,
+      price: { sales: { value: live ? 1155 : null, currency: live ? "USD" : null } },
+      availability: { messages: live ? ["In Stock"] : [] },
+      variationAttributes: [{ id: "size", values: [{ id: "OSZ", displayValue: "OS", selectable: live }] }],
+      images: live ? { large: [{ url: "/dw/image/v2/slippers.png" }] } : {}
+    }
+  };
+}
+
+test("pidFromProductUrl and stagedNameFromUrl parse robots-staged hidden product URLs", () => {
+  const stagedUrl = "https://www.chromehearts.com/t-shirt/short-sleeve-pocket-crew/129111BLKXXX756.html?fadeIn=true&dwvar_129111BLKXXX756_size=XSM";
+  assert.equal(pidFromProductUrl(stagedUrl), "129111BLKXXX756");
+  assert.equal(stagedNameFromUrl(stagedUrl), "SHORT SLEEVE POCKET CREW");
+  assert.equal(pidFromProductUrl("https://www.chromehearts.com/slippers/cord-slippers/180539C4CXXX593.html"), "180539C4CXXX593");
+  assert.equal(pidFromProductUrl("https://www.chromehearts.com/shop"), "", "non-PDP paths are not PIDs");
+  assert.equal(pidFromProductUrl("https://www.chromehearts.com/scents/spirit.html"), "", "non-PID-like segments rejected");
+});
+
+test("parseHotWatchProbe treats staged and sold-out products as not purchasable", () => {
+  const pid = "180539C4CXXX593";
+  const staged = parseHotWatchProbe(stagedVariation(pid, { live: false }), pid);
+  assert.equal(staged.purchasable, false, "no price + not orderable = staged, not buyable");
+
+  const live = parseHotWatchProbe(stagedVariation(pid, { live: true }), pid);
+  assert.equal(live.purchasable, true);
+  assert.equal(live.name, "CORD SLIPPERS");
+  assert.equal(live.price, "1155");
+  assert.match(live.image, /slippers\.png/);
+  assert.equal(live.inStockSizeCount, 1);
+
+  const soldOut = stagedVariation(pid, { live: true });
+  soldOut.product.available = false;
+  soldOut.product.readyToOrder = false;
+  soldOut.product.variationAttributes[0].values[0].selectable = false;
+  assert.equal(parseHotWatchProbe(soldOut, pid).purchasable, false);
+});
+
+test("applyPlanPreset retunes cadence and budgets for Workers Paid, never for free", () => {
+  const freeCfg = {
+    workersPlan: "free",
+    fastPollIntervalSeconds: 12,
+    fastMaxCategories: 36,
+    maxStorefrontSubrequests: 40,
+    subrequestHardCap: 46,
+    maxCategoryIds: 250,
+    categoryFetchConcurrency: 20,
+    discoveryEveryFullSweeps: 10,
+    hotWatchLimit: 12
+  };
+  assert.equal(applyPlanPreset(freeCfg), freeCfg, "free plan passes through untouched");
+
+  const paid = applyPlanPreset({ ...freeCfg, workersPlan: "paid" });
+  assert.equal(paid.fastPollIntervalSeconds, 6);
+  assert.equal(paid.fastMaxCategories, 220);
+  assert.equal(paid.maxStorefrontSubrequests, 260);
+  assert.equal(paid.subrequestHardCap, 950);
+  assert.equal(paid.hotWatchLimit, 24);
+});
+
+test("buildCatalogState gives freshly-seen products an index-lag grace before missing", () => {
+  const cfg = { relistAfterAbsentRuns: 2, freshMissingGraceMinutes: 30 };
+  const fresh = new Date().toISOString();
+  const old = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  const state = {
+    seen: {
+      FRESH_PID: { pid: "FRESH_PID", firstSeenAt: fresh },
+      OLD_PID: { pid: "OLD_PID", firstSeenAt: old }
+    },
+    active: {
+      FRESH_PID: { pid: "FRESH_PID", firstSeenAt: fresh },
+      OLD_PID: { pid: "OLD_PID", firstSeenAt: old }
+    },
+    missing: {}
+  };
+
+  const next = buildCatalogState({}, state, new Set(), cfg, { partial: false });
+  assert.equal(next.missing.FRESH_PID, undefined, "a just-alerted product must not count absence during index lag");
+  assert.ok(next.missing.OLD_PID, "established products still track absence normally");
+});
+
+test("Staging lane hot-watches a robots-staged product and alerts the instant it turns purchasable", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const pid = "180539C4CXXX593";
+  const stagedUrl = `https://www.chromehearts.com/slippers/cord-slippers/${pid}.html`;
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const stagingEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0"
+  };
+
+  const baselineMock = createChromeHeartsFetch({
+    root: keep,
+    robotsProductUrls: [stagedUrl],
+    productVariations: { [pid]: stagedVariation(pid, { live: false }) }
+  });
+  await withMockedFetch(baselineMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 0);
+    assert.equal(result.staging.discoveries, 1);
+    assert.equal(baselineMock.discordPayloads.length, 0, "baseline discoveries must not ping");
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.hotWatch[pid], "staged PID enters the hot-watch map");
+    assert.ok(state.stagingBaselinedAt);
+    assert.equal(state.seen[pid], undefined, "staged-but-unbuyable products stay out of seen");
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const waitingMock = createChromeHeartsFetch({
+    root: keep,
+    robotsProductUrls: [stagedUrl],
+    productVariations: { [pid]: stagedVariation(pid, { live: false }) }
+  });
+  await withMockedFetch(waitingMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 0);
+    assert.equal(result.staging.probed, 1, "hot-watch PID is probed via Product-Variation");
+    assert.equal(result.staging.live, 0);
+    assert.equal(waitingMock.discordPayloads.length, 0);
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const liveMock = createChromeHeartsFetch({
+    root: keep,
+    robotsProductUrls: [stagedUrl],
+    productVariations: { [pid]: stagedVariation(pid, { live: true }) },
+    productDetails: { [pid]: { name: "CORD SLIPPERS", categoryName: "Slippers", price: "1155.00" } }
+  });
+  await withMockedFetch(liveMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, [pid]);
+    assert.equal(result.staging.live, 1);
+    assert.equal(liveMock.discordPayloads.length, 1);
+    assert.equal(liveMock.discordPayloads[0].embeds[0].title, "CORD SLIPPERS");
+
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.seen[pid], "alerted hot-watch product is now seen");
+    assert.equal(state.hotWatch[pid], undefined, "alerted product graduates out of the hot-watch map");
+  });
+});
+
+test("Staging lane pings new staged discoveries after baseline, once", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const pid = "175364BLKXXX001";
+  const stagedUrl = `https://www.chromehearts.com/hoodie/deadly-doll-hoodie/${pid}.html`;
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }])));
+  const stagingEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0"
+  };
+
+  const mock = createChromeHeartsFetch({
+    root: keep,
+    robotsProductUrls: [stagedUrl],
+    productVariations: { [pid]: stagedVariation(pid, { live: false, name: "DEADLY DOLL HOODIE" }) }
+  });
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 0);
+    assert.equal(result.staging.discoveries, 1);
+    assert.equal(mock.discordPayloads.length, 1, "post-baseline staged discovery pings once");
+    assert.match(mock.discordPayloads[0].content, /STAGED ITEM/);
+    assert.match(mock.discordPayloads[0].content, /DEADLY DOLL HOODIE/);
+    assert.equal(mock.discordPayloads[0].embeds, undefined, "staged ping is content-only");
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const repeatMock = createChromeHeartsFetch({
+    root: keep,
+    robotsProductUrls: [stagedUrl],
+    productVariations: { [pid]: stagedVariation(pid, { live: false, name: "DEADLY DOLL HOODIE" }) }
+  });
+  await withMockedFetch(repeatMock.fetchMock, async () => {
+    await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(repeatMock.discordPayloads.length, 0, "no duplicate staged pings");
+  });
+});
+
+test("Staging lane pings a sitemap category addition and feeds it to the scan pool", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const stagingEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0"
+  };
+
+  // Run 1 baselines the current sitemap category set.
+  const baselineMock = createChromeHeartsFetch({ root: keep, sitemapCategories: ["shop"] });
+  await withMockedFetch(baselineMock.fetchMock, async () => {
+    await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(baselineMock.discordPayloads.length, 0);
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.deepEqual(state.sitemapCategoryIds, ["shop"]);
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const hatMock = createChromeHeartsFetch({ root: keep, sitemapCategories: ["shop", "hat"] });
+  await withMockedFetch(hatMock.fetchMock, async () => {
+    await runWorkerOnce(env(stagingEnv, kv));
+    const pings = hatMock.discordPayloads.filter((payload) => /SITEMAP/.test(payload.content || ""));
+    assert.equal(pings.length, 1, "sitemap category addition pings once");
+    assert.match(pings[0].content, /\/hat/);
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.sitemapCategoryIds.includes("hat"), "new sitemap category persists into the scan pool");
+  });
+});
+
+test("Ping-first alert fires a compact link ping alongside the rich embed", async () => {
+  const oldProduct = productTile("OLD_SHOP", "OLD SHOP ITEM", "shop", "Shop", "100.00");
+  const newProduct = productTile("PING_NEW", "PING DROP", "shop", "Shop", "450.00");
+  const kv = fakeKV(withStagingBaseline(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }])));
+  const mock = createChromeHeartsFetch({
+    root: `${oldProduct}${newProduct}`,
+    productDetails: { PING_NEW: { name: "PING DROP", categoryName: "Shop", price: "450.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          PING_FIRST_ALERTS: "true",
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0"
+        },
+        kv
+      )
+    );
+
+    assert.equal(result.alerted, 1);
+    assert.equal(result.pinged, 1);
+    assert.equal(mock.discordPayloads.length, 2, "one instant ping + one rich embed");
+    const ping = mock.discordPayloads.find((payload) => !payload.embeds);
+    const rich = mock.discordPayloads.find((payload) => payload.embeds);
+    assert.match(ping.content, /PING DROP/);
+    assert.match(ping.content, /\$450/);
+    assert.match(ping.content, /PING_NEW\.html/);
+    assert.equal(rich.embeds[0].title, "PING DROP");
+  });
+});
+
+test("A staged size-variant of an already-seen master goes dormant instead of flapping", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const masterPid = "129111BLKXXX756";
+  const variantPid = "129111BLKXSM756";
+  const variantUrl = `https://www.chromehearts.com/t-shirt/short-sleeve-pocket-crew/${variantPid}.html`;
+  const kv = fakeKV(
+    withStagingBaseline(
+      stateWithActive([
+        { pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" },
+        { pid: masterPid, name: "SHORT SLEEVE POCKET CREW" }
+      ])
+    )
+  );
+  const stagingEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0"
+  };
+  const variantPv = stagedVariation(variantPid, { live: false, name: "SHORT SLEEVE POCKET CREW" });
+  variantPv.product.masterProductId = masterPid;
+
+  const makeMock = () =>
+    createChromeHeartsFetch({
+      root: keep,
+      robotsProductUrls: [variantUrl],
+      productVariations: { [variantPid]: variantPv }
+    });
+
+  const first = makeMock();
+  await withMockedFetch(first.fetchMock, async () => {
+    await runWorkerOnce(env(stagingEnv, kv));
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const second = makeMock();
+  await withMockedFetch(second.fetchMock, async () => {
+    await runWorkerOnce(env(stagingEnv, kv));
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.equal(state.hotWatch[variantPid].dormant, true, "variant tombstones instead of deleting");
+  });
+  kv.values.delete(LOCK_KEY);
+
+  for (let run = 0; run < 2; run += 1) {
+    const repeat = makeMock();
+    await withMockedFetch(repeat.fetchMock, async () => {
+      const result = await runWorkerOnce(env(stagingEnv, kv));
+      assert.equal(result.staging.discoveries, 0, "dormant tombstone blocks re-discovery");
+      assert.equal(result.staging.probed, 0, "dormant entries are not probed");
+      assert.equal(repeat.discordPayloads.length, 0, "no ping loop");
+    });
+    kv.values.delete(LOCK_KEY);
+  }
 });
