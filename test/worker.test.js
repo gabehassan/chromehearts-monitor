@@ -14,7 +14,8 @@ import worker, {
   buildCatalogState,
   parsePidParts,
   minePidCandidates,
-  enumerationCandidates
+  enumerationCandidates,
+  updateStyleRegistry
 } from "../src/worker.js";
 
 const STATE_KEY = "state";
@@ -185,7 +186,8 @@ function createChromeHeartsFetch({
   robotsProductUrls = [],
   robotsExtraLines = [],
   productDetails = {},
-  productVariations = {}
+  productVariations = {},
+  unknownPidsReturn500 = false
 }) {
   const discordPayloads = [];
   const discordUrls = [];
@@ -261,10 +263,13 @@ function createChromeHeartsFetch({
 
     if (url.pathname.includes("/Product-Variation")) {
       const variationPid = url.searchParams.get("pid") || "UNKNOWN";
-      return new Response(JSON.stringify(productVariations[variationPid] || variationJson(variationPid)), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
+      if (productVariations[variationPid]) {
+        return new Response(JSON.stringify(productVariations[variationPid]), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (unknownPidsReturn500) {
+        return new Response("<html>error</html>", { status: 500, headers: { "content-type": "text/html" } });
+      }
+      return new Response(JSON.stringify(variationJson(variationPid)), { status: 200, headers: { "content-type": "application/json" } });
     }
 
     const pid = url.pathname.match(/\/([^/]+)\.html$/)?.[1] || "UNKNOWN";
@@ -1798,5 +1803,132 @@ test("Restock cooldown blocks a just-alerted product from re-probing into a loop
     assert.equal(result.alerted, 0, "cooldown suppresses the restock re-alert");
     assert.equal(result.staging.probed, 0, "cooldown removes the PID from the probe plan entirely");
     assert.equal(mock.discordPayloads.length, 0);
+  });
+});
+
+test("updateStyleRegistry accumulates colorways per style across sweeps", () => {
+  const r1 = updateStyleRegistry(
+    { "180539C4CXXX593": { name: "CORD SLIPPERS" } },
+    {},
+    "2026-07-01T00:00:00.000Z"
+  );
+  const key = "180539|XXX|593";
+  assert.deepEqual(r1[key].colors, ["C4C"]);
+  assert.equal(r1[key].name, "CORD SLIPPERS");
+
+  const r2 = updateStyleRegistry({ "180539ABDXXX593": { name: "CORD SLIPPERS" } }, r1, "2026-07-15T00:00:00.000Z");
+  assert.deepEqual(r2[key].colors.sort(), ["ABD", "C4C"]);
+  assert.equal(r2[key].lastSeenAt, "2026-07-15T00:00:00.000Z");
+});
+
+test("enumerationCandidates covers the WHOLE permanent registry, not just recent styles", () => {
+  const cfg = { enumerationEnabled: true, enumerationRecentDays: 14 };
+  const state = {
+    seen: {},
+    hotWatch: {},
+    styleRegistry: {
+      "180539|XXX|593": { style: "180539", size: "XXX", suffix: "593", colors: ["C4C"], lastSeenAt: "2026-01-01T00:00:00.000Z" }
+    }
+  };
+  const { registrySiblings } = enumerationCandidates(cfg, state);
+  assert.ok(registrySiblings.includes("180539ABDXXX593"), "historical style's other colorways stay enumerable forever");
+  assert.ok(!registrySiblings.includes("180539C4CXXX593"), "the already-known colorway is excluded");
+});
+
+test("A new colorway of a registry-known style alerts index-free, no fresh seed", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const knownPid = "180539C4CXXX593"; // seen weeks ago
+  const newColorway = "180539BLKXXX593"; // never seen, no staging signal anywhere
+  const base = stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]);
+  base.seen[knownPid] = {
+    pid: knownPid,
+    name: "CORD SLIPPERS",
+    price: "1155.00",
+    category: "Slippers",
+    url: `https://www.chromehearts.com/slippers/cord-slippers/${knownPid}.html`,
+    image: "",
+    firstSeenAt: "2026-01-01T00:00:00.000Z"
+  };
+  base.active[knownPid] = structuredClone(base.seen[knownPid]);
+  base.styleRegistry = {
+    "180539|XXX|593": { style: "180539", size: "XXX", suffix: "593", colors: ["C4C"], name: "CORD SLIPPERS", lastSeenAt: "2026-01-01T00:00:00.000Z" }
+  };
+  const kv = fakeKV(withStagingBaseline(base));
+  const stagingEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    DISCOVER_ROBOTS_PRODUCTS: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    PROBE_BUDGET_PER_TICK: "60"
+  };
+
+  const liveMock = createChromeHeartsFetch({
+    root: keep,
+    productVariations: { [newColorway]: stagedVariation(newColorway, { live: true, name: "CORD SLIPPERS" }) },
+    productDetails: { [newColorway]: { name: "CORD SLIPPERS", categoryName: "Slippers", price: "1155.00" } },
+    unknownPidsReturn500: true
+  });
+  await withMockedFetch(liveMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 1, "registry-enumerated colorway alerts with no fresh seed");
+    assert.deepEqual(result.newPids, [newColorway]);
+    assert.equal(result.alertLanes[newColorway], "hotwatch");
+    assert.equal(liveMock.discordPayloads[0].embeds[0].title, "CORD SLIPPERS");
+  });
+});
+
+test("A drop signal opens a burst window that the DO alarm uses to shorten cadence", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const fresh = productTile("BURST_NEW", "BURST DROP", "shop", "Shop", "250.00");
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }])));
+  const mock = createChromeHeartsFetch({
+    root: `${keep}${fresh}`,
+    productDetails: { BURST_NEW: { name: "BURST DROP", categoryName: "Shop", price: "250.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          ENUMERATION_ENABLED: "false",
+          BURST_WINDOW_SECONDS: "180"
+        },
+        kv
+      )
+    );
+    assert.equal(result.alerted, 1);
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.burstUntil, "a new-PID drop opens a burst window");
+    assert.ok(Date.parse(state.burstUntil) > Date.now(), "burst window is in the future");
+    assert.ok(state.styleRegistry, "style registry persisted");
+  });
+});
+
+test("Burst window does not open on an ordinary quiet tick", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }])));
+  const mock = createChromeHeartsFetch({ root: keep });
+  await withMockedFetch(mock.fetchMock, async () => {
+    await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          ENUMERATION_ENABLED: "false"
+        },
+        kv
+      )
+    );
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.equal(state.burstUntil, undefined, "no drop signal, no burst");
   });
 });

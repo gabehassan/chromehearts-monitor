@@ -559,6 +559,9 @@ function getConfig(env) {
     enumerationRecentDays: intSetting(env, "ENUMERATION_RECENT_DAYS", 14, 0),
     enumRetryHours: intSetting(env, "ENUM_RETRY_HOURS", 6, 1),
     restockCooldownHours: intSetting(env, "RESTOCK_COOLDOWN_HOURS", 12, 0),
+    burstWindowSeconds: intSetting(env, "BURST_WINDOW_SECONDS", 180, 0),
+    burstIntervalSeconds: intSetting(env, "BURST_INTERVAL_SECONDS", 5, 3),
+    burstProbeBudget: intSetting(env, "BURST_PROBE_BUDGET", 80, 0),
     probeBudgetPerTick: intSetting(env, "PROBE_BUDGET_PER_TICK", 26, 0),
     pingFirstAlerts: boolSetting(env, "PING_FIRST_ALERTS", true),
     freshMissingGraceMinutes: intSetting(env, "FRESH_MISSING_GRACE_MINUTES", 30, 0),
@@ -1078,40 +1081,79 @@ function minePidCandidates(text) {
   return [...found];
 }
 
+function styleKeyOf(parts) {
+  return `${parts.style}|${parts.size}|${parts.suffix}`;
+}
+
+function updateStyleRegistry(products, previousRegistry, now = nowIso()) {
+  const registry = { ...(previousRegistry && typeof previousRegistry === "object" ? previousRegistry : {}) };
+  for (const [pid, product] of Object.entries(products || {})) {
+    const parts = parsePidParts(pid);
+    if (!parts) continue;
+    const key = styleKeyOf(parts);
+    const entry = registry[key] || { style: parts.style, size: parts.size, suffix: parts.suffix, colors: [], name: "", lastSeenAt: now };
+    if (!entry.colors.includes(parts.color)) entry.colors = [...entry.colors, parts.color];
+    entry.name = product?.name || entry.name;
+    entry.lastSeenAt = now;
+    registry[key] = entry;
+  }
+  return registry;
+}
+
+function boundStyleRegistry(registry, limit = 400) {
+  const entries = Object.entries(registry);
+  if (entries.length <= limit) return registry;
+  return Object.fromEntries(entries.sort((a, b) => String(b[1].lastSeenAt).localeCompare(String(a[1].lastSeenAt))).slice(0, limit));
+}
+
 function enumerationCandidates(cfg, state) {
-  if (!cfg.enumerationEnabled) return { mined: [], siblings: [] };
+  if (!cfg.enumerationEnabled) return { mined: [], siblings: [], registrySiblings: [] };
   const seen = state.seen || {};
   const hotWatch = state.hotWatch || {};
+  const registry = state.styleRegistry && typeof state.styleRegistry === "object" ? state.styleRegistry : {};
   const mined = minePidCandidates(
     Object.values(seen)
       .map((record) => `${record?.image || ""} ${record?.url || ""}`)
       .join("\n")
   );
 
+  const colorVocab = uniqueValues([
+    ...DEFAULT_COLOR_CODES,
+    ...[...Object.keys(seen), ...Object.keys(hotWatch)].map((pid) => parsePidParts(pid)?.color).filter(Boolean),
+    ...Object.values(registry).flatMap((entry) => entry?.colors || [])
+  ]);
+  const excluded = (pid) => seen[pid] || hotWatch[pid];
+  const siblingsFrom = (parts, knownColors) => {
+    const out = [];
+    for (const color of colorVocab) {
+      if (color === parts.color || (knownColors && knownColors.includes(color))) continue;
+      out.push(`${parts.style}${color}${parts.size}${parts.suffix}`);
+    }
+    return out;
+  };
+
   const recentMs = cfg.enumerationRecentDays * 86400000;
-  const seedPids = uniqueValues([
+  const hotSeeds = uniqueValues([
     ...Object.keys(hotWatch).filter((pid) => !hotWatch[pid]?.dormant),
     ...Object.values(seen)
       .filter((record) => recentMs > 0 && Date.parse(record?.firstSeenAt || "") > Date.now() - recentMs)
       .map((record) => record?.pid)
   ]);
-  const colorVocab = uniqueValues([
-    ...DEFAULT_COLOR_CODES,
-    ...[...Object.keys(seen), ...Object.keys(hotWatch)].map((pid) => parsePidParts(pid)?.color).filter(Boolean)
-  ]);
   const siblings = [];
-  for (const seedPid of seedPids) {
+  for (const seedPid of hotSeeds) {
     const parts = parsePidParts(seedPid);
-    if (!parts) continue;
-    for (const color of colorVocab) {
-      if (color === parts.color) continue;
-      siblings.push(`${parts.style}${color}${parts.size}${parts.suffix}`);
-    }
+    if (parts) siblings.push(...siblingsFrom(parts));
   }
-  const excluded = (pid) => seen[pid] || hotWatch[pid];
+
+  const registrySiblings = [];
+  for (const entry of Object.values(registry).sort((a, b) => String(b.lastSeenAt).localeCompare(String(a.lastSeenAt)))) {
+    registrySiblings.push(...siblingsFrom({ style: entry.style, color: null, size: entry.size, suffix: entry.suffix }, entry.colors));
+  }
+
   return {
     mined: uniqueValues(mined).filter((pid) => !excluded(pid)),
-    siblings: uniqueValues(siblings).filter((pid) => !excluded(pid))
+    siblings: uniqueValues(siblings).filter((pid) => !excluded(pid)),
+    registrySiblings: uniqueValues(registrySiblings).filter((pid) => !excluded(pid) && !siblings.includes(pid))
   };
 }
 
@@ -1359,15 +1401,24 @@ async function runStagingLane(env, cfg, state) {
       return !(restockCooldownMs > 0 && Number.isFinite(lastAlertedMs) && Date.now() - lastAlertedMs < restockCooldownMs);
     })
     .slice(0, 6);
+  const bursting = Boolean(state.burstUntil && Date.parse(state.burstUntil) > Date.now());
+  const probeBudget = bursting ? Math.max(cfg.probeBudgetPerTick ?? 26, cfg.burstProbeBudget ?? 80) : cfg.probeBudgetPerTick ?? 26;
+
   const candidates = enumerationCandidates(cfg, state);
   const minedSet = new Set(candidates.mined);
-  const minedQueue = candidates.mined.filter((pid) => !enumTried[pid]);
-  const siblingQueue = candidates.siblings.filter((pid) => !enumTried[pid]);
-  const enumRoom = Math.max(0, (cfg.probeBudgetPerTick ?? 26) - activePids.length - restockPids.length - 6);
+  const notTried = (pid) => bursting || !enumTried[pid];
+  const minedQueue = candidates.mined.filter(notTried);
+  const siblingQueue = candidates.siblings.filter(notTried);
+  const registryQueue = candidates.registrySiblings.filter(notTried);
+  const enumRoom = Math.max(0, probeBudget - activePids.length - restockPids.length - 6);
   const minedSlice = minedQueue.slice(0, Math.min(enumRoom, 8));
-  const siblingRoom = Math.min(Math.max(0, enumRoom - minedSlice.length), 12);
-  const enumSlice = [...minedSlice, ...rotatingSlice(siblingQueue, Math.floor(startedAt / 15000) * siblingRoom, siblingRoom)];
-  const enumPoolSize = minedQueue.length + siblingQueue.length;
+  const rotor = Math.floor(startedAt / 15000);
+  const siblingRoom = Math.min(Math.max(0, enumRoom - minedSlice.length), bursting ? 40 : 12);
+  const siblingSlice = rotatingSlice(siblingQueue, rotor * siblingRoom, siblingRoom);
+  const registryRoom = Math.max(0, enumRoom - minedSlice.length - siblingSlice.length);
+  const registrySlice = rotatingSlice(registryQueue, rotor * Math.max(1, registryRoom), registryRoom);
+  const enumSlice = [...minedSlice, ...siblingSlice, ...registrySlice];
+  const enumPoolSize = minedQueue.length + siblingQueue.length + registryQueue.length;
 
   const signals = await collectStagingSignals(env, cfg, {
     probePids: uniqueValues([...activePids, ...restockPids, ...enumSlice]),
@@ -1492,6 +1543,8 @@ async function runStagingLane(env, cfg, state) {
     if (lines.length) await sendStagingPings(cfg, lines);
   }
 
+  const dropSignal = discoveries.length > 0 || addedCategories.length > 0;
+
   return {
     hotWatch,
     enumTried,
@@ -1499,6 +1552,8 @@ async function runStagingLane(env, cfg, state) {
     discoveries,
     probedCount,
     enumPoolSize,
+    bursting,
+    dropSignal,
     dirty,
     baselined,
     ms: Date.now() - startedAt,
@@ -2746,7 +2801,11 @@ function catalogFingerprint(state) {
       .sort(),
     Object.keys(state.enumTried || {}).sort(),
     state.sitemapIndexLastmod || "",
-    state.sitemapCategoryIds || []
+    state.sitemapCategoryIds || [],
+    Object.entries(state.styleRegistry || {})
+      .map(([key, entry]) => `${key}:${(entry?.colors || []).slice().sort().join(",")}`)
+      .sort(),
+    state.burstUntil && Date.parse(state.burstUntil) > Date.now() ? 1 : 0
   ]);
 }
 
@@ -2882,6 +2941,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
             live: Object.keys(staging.liveProducts || {}).length,
             hotWatch: Object.keys(staging.hotWatch).length,
             enumPool: staging.enumPoolSize ?? 0,
+            bursting: Boolean(staging.bursting),
             ms: staging.ms ?? 0
           }
         : null,
@@ -2943,6 +3003,28 @@ async function runMonitor(env, cfg = null, opts = {}) {
           nextState.seen[product.pid] = { ...nextState.seen[product.pid], lastAlertedAt: nowIso() };
         }
       }
+    }
+
+    if (Object.keys(products).length) {
+      nextState.styleRegistry = boundStyleRegistry(updateStyleRegistry(products, state.styleRegistry));
+    }
+
+    if (cfg.burstWindowSeconds > 0) {
+      const previousActiveCats = Array.isArray(state.activeCategoryIds) ? state.activeCategoryIds : [];
+      const dropSignal =
+        enriched.length > 0 ||
+        (staging && (staging.dropSignal || Object.keys(staging.liveProducts || {}).length > 0)) ||
+        (mode === "full" &&
+          !degraded &&
+          previousActiveCats.length > 0 &&
+          Array.isArray(sweep?.activeCategoryIds) &&
+          sweep.activeCategoryIds.some((cgid) => !previousActiveCats.includes(cgid)));
+      if (dropSignal) {
+        nextState.burstUntil = new Date(Date.now() + cfg.burstWindowSeconds * 1000).toISOString();
+      } else if (state.burstUntil && Date.parse(state.burstUntil) <= Date.now()) {
+        delete nextState.burstUntil;
+      }
+      result.burstUntil = nextState.burstUntil || null;
     }
 
     const quietFullSweep =
@@ -3321,6 +3403,9 @@ async function handleFetch(request, env) {
         hotWatch: state.hotWatch || {},
         enumerationEnabled: cfg.enumerationEnabled,
         enumTriedCount: Object.keys(state.enumTried || {}).length,
+        styleRegistrySize: Object.keys(state.styleRegistry || {}).length,
+        burstActive: Boolean(state.burstUntil && Date.parse(state.burstUntil) > Date.now()),
+        burstUntil: state.burstUntil || null,
         sitemapIndexLastmod: state.sitemapIndexLastmod || null,
         sitemapCategories: Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : []
       },
@@ -3639,7 +3724,10 @@ class MonitorController {
     const everyTicks = Math.max(1, cfg.fullSweepEveryTicks);
     const mode = tick % everyTicks === 0 ? "full" : "fast";
     const startedAt = Date.now();
-    const intervalMs = Math.max(5, cfg.fastPollIntervalSeconds) * 1000;
+    const burstUntilMs = Date.parse((await this.state.storage.get("burstUntil")) || "") || 0;
+    const bursting = cfg.burstWindowSeconds > 0 && burstUntilMs > startedAt;
+    const effectiveIntervalSeconds = bursting ? Math.max(3, cfg.burstIntervalSeconds) : Math.max(5, cfg.fastPollIntervalSeconds);
+    const intervalMs = effectiveIntervalSeconds * 1000;
     const jitterMs = Math.floor(Math.random() * 400);
     await this.state.storage.setAlarm(startedAt + intervalMs + jitterMs);
     const previousTickAt = Date.parse((await this.state.storage.get("lastTickAt")) || "") || null;
@@ -3662,6 +3750,11 @@ class MonitorController {
       }
     } catch (error) {
       result = { ok: false, mode, error: String(error?.message || error) };
+    }
+
+    if (result && Object.prototype.hasOwnProperty.call(result, "burstUntil")) {
+      if (result.burstUntil) nextKeys.burstUntil = result.burstUntil;
+      else await this.state.storage.delete("burstUntil").catch(() => {});
     }
 
     nextKeys.lastResult = result;
@@ -3691,6 +3784,8 @@ class MonitorController {
         failedCategories: result.sweep?.failedCategoryCount ?? 0,
         staged: result.staging?.discoveries ?? 0,
         hotWatch: result.staging?.hotWatch ?? null,
+        enumPool: result.staging?.enumPool ?? 0,
+        burst: result.staging?.bursting ? 1 : 0,
         stagingMs: result.staging?.ms ?? 0,
         enrichMs: result.enrichMs || 0,
         sendMs: result.sendMs || 0,
@@ -3766,5 +3861,7 @@ export {
   stagingScan,
   parsePidParts,
   minePidCandidates,
-  enumerationCandidates
+  enumerationCandidates,
+  updateStyleRegistry,
+  boundStyleRegistry
 };
