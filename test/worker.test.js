@@ -1684,7 +1684,7 @@ test("An asset-mined sibling colorway is hot-watched and alerts when it gains st
     const state = JSON.parse(kv.values.get(STATE_KEY));
     assert.ok(state.hotWatch[minedPid], "mined sibling colorway enters the hot-watch map");
     assert.equal(state.hotWatch[minedPid].source, "mined");
-    assert.ok(Object.keys(state.enumTried || {}).length > 0, "permutation misses are remembered");
+    assert.equal(state.enumTried, undefined, "no miss-memory is persisted (kept out of state to avoid write amplification)");
   });
   kv.values.delete(LOCK_KEY);
 

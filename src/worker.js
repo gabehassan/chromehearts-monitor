@@ -557,7 +557,6 @@ function getConfig(env) {
     stagedIntelPings: boolSetting(env, "STAGED_INTEL_PINGS", false),
     enumerationEnabled: boolSetting(env, "ENUMERATION_ENABLED", true),
     enumerationRecentDays: intSetting(env, "ENUMERATION_RECENT_DAYS", 14, 0),
-    enumRetryHours: intSetting(env, "ENUM_RETRY_HOURS", 6, 1),
     restockCooldownHours: intSetting(env, "RESTOCK_COOLDOWN_HOURS", 12, 0),
     burstWindowSeconds: intSetting(env, "BURST_WINDOW_SECONDS", 180, 0),
     burstIntervalSeconds: intSetting(env, "BURST_INTERVAL_SECONDS", 5, 3),
@@ -1062,11 +1061,7 @@ function parsePidParts(pid) {
   return match ? { style: match[1], color: match[2], size: match[3], suffix: match[4] } : null;
 }
 
-const DEFAULT_COLOR_CODES = [
-  "ABD", "BLK", "WHT", "GRY", "NAV", "BLU", "RED", "PNK", "PUR", "GRN", "YEL", "ORG",
-  "BRN", "TAN", "CRM", "CAM", "MLT", "SLV", "GLD", "CRY", "DAY", "ADL", "AFW", "MB3",
-  "D5D", "D7B", "A7T", "AI6", "20U", "C4C", "IND", "OLV", "NAT", "CHL"
-];
+const DEFAULT_COLOR_CODES = ["ABD", "BLK", "WHT", "XXX"];
 
 function minePidCandidates(text) {
   const found = new Set();
@@ -1150,10 +1145,12 @@ function enumerationCandidates(cfg, state) {
     registrySiblings.push(...siblingsFrom({ style: entry.style, color: null, size: entry.size, suffix: entry.suffix }, entry.colors));
   }
 
+  const siblingsOut = uniqueValues(siblings).filter((pid) => !excluded(pid));
+  const siblingSet = new Set(siblingsOut);
   return {
     mined: uniqueValues(mined).filter((pid) => !excluded(pid)),
-    siblings: uniqueValues(siblings).filter((pid) => !excluded(pid)),
-    registrySiblings: uniqueValues(registrySiblings).filter((pid) => !excluded(pid) && !siblings.includes(pid))
+    siblings: siblingsOut,
+    registrySiblings: uniqueValues(registrySiblings).filter((pid) => !excluded(pid) && !siblingSet.has(pid))
   };
 }
 
@@ -1316,8 +1313,8 @@ async function stagingScan(cfg, opts = {}) {
     : [];
   const freshPids = [...stagedPids].filter((pid) => !knownPids.has(pid));
 
-  const budget = Math.max(0, cfg.probeBudgetPerTick ?? 26);
-  const probeList = uniqueValues([...freshPids.slice(0, 6), ...plannedPids, ...minedPids.slice(0, 6)]).slice(0, budget);
+  const budget = Math.max(0, Number.isFinite(opts.probeBudget) ? opts.probeBudget : cfg.probeBudgetPerTick ?? 26);
+  const probeList = uniqueValues([...freshPids.slice(0, 6), ...plannedPids, ...minedPids.slice(0, 6)]).slice(0, budget + 12);
   const probes = await probeHotWatchPids(cfg, probeList);
 
   return {
@@ -1359,6 +1356,34 @@ function activeHotWatchCount(map) {
   return Object.values(map).filter((entry) => entry && !entry.dormant).length;
 }
 
+const HOT_WATCH_PRIORITY = { "robots.txt": 3, sitemap: 3, homepage: 2, mined: 1, enumeration: 0 };
+function hotWatchPriority(entry) {
+  if (entry?.dormant) return -1;
+  return HOT_WATCH_PRIORITY[entry?.source] ?? 0;
+}
+
+function evictForPriority(map, incomingPriority) {
+  let victimPid = null;
+  let victim = null;
+  for (const [pid, entry] of Object.entries(map)) {
+    const priority = hotWatchPriority(entry);
+    if (priority >= incomingPriority) continue;
+    if (
+      !victim ||
+      priority < hotWatchPriority(victim) ||
+      String(entry?.firstStagedAt || "") < String(victim?.firstStagedAt || "")
+    ) {
+      victimPid = pid;
+      victim = entry;
+    }
+  }
+  if (victimPid) {
+    delete map[victimPid];
+    return true;
+  }
+  return false;
+}
+
 function hotWatchProduct(entry, probe, productType = "hotwatch") {
   const url = probe.url || entry.url || "";
   return {
@@ -1384,13 +1409,6 @@ async function runStagingLane(env, cfg, state) {
     .filter((pid) => !previousHotWatch[pid]?.dormant)
     .slice(0, cfg.hotWatchLimit);
 
-  const retryMs = Math.max(1, cfg.enumRetryHours) * 3600000;
-  const enumTried = {};
-  for (const [pid, at] of Object.entries(state.enumTried || {})) {
-    const triedMs = Date.parse(at || "");
-    if (Number.isFinite(triedMs) && Date.now() - triedMs < retryMs) enumTried[pid] = at;
-  }
-
   const restockCooldownMs = Math.max(0, cfg.restockCooldownHours ?? 12) * 3600000;
   const restockPids = Object.entries(state.missing || {})
     .filter(([, entry]) => Number(entry?.count || 0) >= cfg.relistAfterAbsentRuns)
@@ -1406,15 +1424,15 @@ async function runStagingLane(env, cfg, state) {
 
   const candidates = enumerationCandidates(cfg, state);
   const minedSet = new Set(candidates.mined);
-  const notTried = (pid) => bursting || !enumTried[pid];
-  const minedQueue = candidates.mined.filter(notTried);
-  const siblingQueue = candidates.siblings.filter(notTried);
-  const registryQueue = candidates.registrySiblings.filter(notTried);
+  const minedQueue = candidates.mined;
+  const siblingQueue = candidates.siblings;
+  const registryQueue = candidates.registrySiblings;
   const enumRoom = Math.max(0, probeBudget - activePids.length - restockPids.length - 6);
   const minedSlice = minedQueue.slice(0, Math.min(enumRoom, 8));
-  const rotor = Math.floor(startedAt / 15000);
+  const rotorMs = Math.max(1000, (bursting ? cfg.burstIntervalSeconds : cfg.fastPollIntervalSeconds) * 1000);
+  const rotor = Math.floor(startedAt / rotorMs);
   const siblingRoom = Math.min(Math.max(0, enumRoom - minedSlice.length), bursting ? 40 : 12);
-  const siblingSlice = rotatingSlice(siblingQueue, rotor * siblingRoom, siblingRoom);
+  const siblingSlice = rotatingSlice(siblingQueue, rotor * Math.max(1, siblingRoom), siblingRoom);
   const registryRoom = Math.max(0, enumRoom - minedSlice.length - siblingSlice.length);
   const registrySlice = rotatingSlice(registryQueue, rotor * Math.max(1, registryRoom), registryRoom);
   const enumSlice = [...minedSlice, ...siblingSlice, ...registrySlice];
@@ -1423,7 +1441,8 @@ async function runStagingLane(env, cfg, state) {
   const signals = await collectStagingSignals(env, cfg, {
     probePids: uniqueValues([...activePids, ...restockPids, ...enumSlice]),
     knownPids: [...Object.keys(seen), ...Object.keys(previousHotWatch)],
-    sitemapLastmod: state.sitemapIndexLastmod || ""
+    sitemapLastmod: state.sitemapIndexLastmod || "",
+    probeBudget
   });
   if (!signals) return null;
   for (const pid of signals.minedPids || []) minedSet.add(pid);
@@ -1446,7 +1465,7 @@ async function runStagingLane(env, cfg, state) {
   for (const staged of signals.stagedUrls || []) {
     const pid = pidFromProductUrl(staged.url);
     if (!pid || seen[pid] || hotWatch[pid]) continue;
-    if (activeHotWatchCount(hotWatch) >= cfg.hotWatchLimit) break;
+    if (activeHotWatchCount(hotWatch) >= cfg.hotWatchLimit && !evictForPriority(hotWatch, hotWatchPriority({ source: staged.source }))) break;
     hotWatch[pid] = { pid, url: staged.url, source: staged.source, name: stagedNameFromUrl(staged.url), firstStagedAt: now };
     discoveries.push(hotWatch[pid]);
     dirty = true;
@@ -1459,20 +1478,11 @@ async function runStagingLane(env, cfg, state) {
     if (!probe) continue;
     const entry = hotWatch[pid];
 
-    if (probe.ok === false) {
-      if (!entry && !seen[pid]) {
-        enumTried[pid] = now;
-        dirty = true;
-      }
-      continue;
-    }
+    if (probe.ok === false) continue;
 
     if (probe.masterPid && probe.masterPid !== pid && (seen[probe.masterPid] || hotWatch[probe.masterPid])) {
       if (entry && !entry.dormant) {
         hotWatch[pid] = { ...entry, dormant: true, masterPid: probe.masterPid };
-        dirty = true;
-      } else if (!entry) {
-        enumTried[pid] = now;
         dirty = true;
       }
       continue;
@@ -1491,11 +1501,7 @@ async function runStagingLane(env, cfg, state) {
     }
 
     if (!entry) {
-      if (!probe.name) {
-        enumTried[pid] = now;
-        dirty = true;
-        continue;
-      }
+      if (!probe.name) continue;
       if (activeHotWatchCount(hotWatch) >= cfg.hotWatchLimit) continue;
       const created = {
         pid,
@@ -1547,7 +1553,6 @@ async function runStagingLane(env, cfg, state) {
 
   return {
     hotWatch,
-    enumTried,
     liveProducts,
     discoveries,
     probedCount,
@@ -2799,7 +2804,6 @@ function catalogFingerprint(state) {
     Object.entries(state.hotWatch || {})
       .map(([pid, entry]) => `${pid}:${entry?.dormant ? 1 : 0}`)
       .sort(),
-    Object.keys(state.enumTried || {}).sort(),
     state.sitemapIndexLastmod || "",
     state.sitemapCategoryIds || [],
     Object.entries(state.styleRegistry || {})
@@ -2991,11 +2995,11 @@ async function runMonitor(env, cfg = null, opts = {}) {
         if (product.masterPid) delete nextHotWatch[product.masterPid];
       }
       nextState.hotWatch = nextHotWatch;
-      if (staging.enumTried) nextState.enumTried = staging.enumTried;
       if (staging.sitemapIndexLastmod !== undefined) nextState.sitemapIndexLastmod = staging.sitemapIndexLastmod;
       if (staging.sitemapCategoryIds) nextState.sitemapCategoryIds = staging.sitemapCategoryIds;
       if (!state.stagingBaselinedAt) nextState.stagingBaselinedAt = nowIso();
     }
+    if (nextState.enumTried) delete nextState.enumTried;
 
     if (enriched.length && nextState.seen) {
       for (const product of enriched) {
@@ -3036,6 +3040,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
       Boolean(state.lastRunAt) &&
       !state.lastError &&
       !state.backoffUntil &&
+      !state.enumTried &&
       catalogFingerprint(nextState) === catalogFingerprint(state);
     result.kvWrite = !quietFullSweep;
     if (!quietFullSweep) await saveState(env, cfg, nextState);
@@ -3402,7 +3407,6 @@ async function handleFetch(request, env) {
         baselinedAt: state.stagingBaselinedAt || null,
         hotWatch: state.hotWatch || {},
         enumerationEnabled: cfg.enumerationEnabled,
-        enumTriedCount: Object.keys(state.enumTried || {}).length,
         styleRegistrySize: Object.keys(state.styleRegistry || {}).length,
         burstActive: Boolean(state.burstUntil && Date.parse(state.burstUntil) > Date.now()),
         burstUntil: state.burstUntil || null,
@@ -3503,10 +3507,12 @@ async function handleFetch(request, env) {
           .map((value) => String(value || "").trim())
           .filter(isPidLikeSegment)
           .slice(0, cap);
+      const probeBudget = Number.parseInt(body.staging.probeBudget, 10);
       const staging = await stagingScan(cfg, {
-        probePids: cleanPidList(body.staging.probePids, 64),
+        probePids: cleanPidList(body.staging.probePids, 128),
         knownPids: cleanPidList(body.staging.knownPids, 500),
-        sitemapLastmod: String(body.staging.sitemapLastmod || "")
+        sitemapLastmod: String(body.staging.sitemapLastmod || ""),
+        probeBudget: Number.isFinite(probeBudget) ? probeBudget : undefined
       });
       return jsonResponse({ ok: true, staging });
     }
