@@ -11,7 +11,10 @@ import worker, {
   stagedNameFromUrl,
   parseHotWatchProbe,
   applyPlanPreset,
-  buildCatalogState
+  buildCatalogState,
+  parsePidParts,
+  minePidCandidates,
+  enumerationCandidates
 } from "../src/worker.js";
 
 const STATE_KEY = "state";
@@ -1288,7 +1291,9 @@ function stagedVariation(pid, { live = false, name = "CORD SLIPPERS" } = {}) {
       price: { sales: { value: live ? 1155 : null, currency: live ? "USD" : null } },
       availability: { messages: live ? ["In Stock"] : [] },
       variationAttributes: [{ id: "size", values: [{ id: "OSZ", displayValue: "OS", selectable: live }] }],
-      images: live ? { large: [{ url: "/dw/image/v2/slippers.png" }] } : {}
+      images: live ? { large: [{ url: "/dw/image/v2/slippers.png" }] } : {},
+      selectedProductUrl: `/slippers/cord-slippers/${pid}.html?quantity=1`,
+      online: live
     }
   };
 }
@@ -1331,7 +1336,8 @@ test("applyPlanPreset retunes cadence and budgets for Workers Paid, never for fr
     maxCategoryIds: 250,
     categoryFetchConcurrency: 20,
     discoveryEveryFullSweeps: 10,
-    hotWatchLimit: 12
+    hotWatchLimit: 12,
+    probeBudgetPerTick: 26
   };
   assert.equal(applyPlanPreset(freeCfg), freeCfg, "free plan passes through untouched");
 
@@ -1340,7 +1346,8 @@ test("applyPlanPreset retunes cadence and budgets for Workers Paid, never for fr
   assert.equal(paid.fastMaxCategories, 220);
   assert.equal(paid.maxStorefrontSubrequests, 260);
   assert.equal(paid.subrequestHardCap, 950);
-  assert.equal(paid.hotWatchLimit, 24);
+  assert.equal(paid.hotWatchLimit, 48);
+  assert.equal(paid.probeBudgetPerTick, 60);
 });
 
 test("buildCatalogState gives freshly-seen products an index-lag grace before missing", () => {
@@ -1373,7 +1380,8 @@ test("Staging lane hot-watches a robots-staged product and alerts the instant it
     DISCOVER_HOMEPAGE_CATEGORIES: "false",
     DISCOVER_PRODUCT_URL_CATEGORIES: "false",
     DISCOVER_SITEMAP_CATEGORIES: "false",
-    MAX_DIRECT_PRODUCT_URLS: "0"
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    ENUMERATION_ENABLED: "false"
   };
 
   const baselineMock = createChromeHeartsFetch({
@@ -1436,7 +1444,9 @@ test("Staging lane pings new staged discoveries after baseline, once", async () 
     DISCOVER_HOMEPAGE_CATEGORIES: "false",
     DISCOVER_PRODUCT_URL_CATEGORIES: "false",
     DISCOVER_SITEMAP_CATEGORIES: "false",
-    MAX_DIRECT_PRODUCT_URLS: "0"
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    ENUMERATION_ENABLED: "false",
+    STAGED_INTEL_PINGS: "true"
   };
 
   const mock = createChromeHeartsFetch({
@@ -1472,7 +1482,9 @@ test("Staging lane pings a sitemap category addition and feeds it to the scan po
   const stagingEnv = {
     DISCOVER_HOMEPAGE_CATEGORIES: "false",
     DISCOVER_PRODUCT_URL_CATEGORIES: "false",
-    MAX_DIRECT_PRODUCT_URLS: "0"
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    ENUMERATION_ENABLED: "false",
+    STAGED_INTEL_PINGS: "true"
   };
 
   // Run 1 baselines the current sitemap category set.
@@ -1537,19 +1549,23 @@ test("A staged size-variant of an already-seen master goes dormant instead of fl
   const masterPid = "129111BLKXXX756";
   const variantPid = "129111BLKXSM756";
   const variantUrl = `https://www.chromehearts.com/t-shirt/short-sleeve-pocket-crew/${variantPid}.html`;
-  const kv = fakeKV(
-    withStagingBaseline(
-      stateWithActive([
-        { pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" },
-        { pid: masterPid, name: "SHORT SLEEVE POCKET CREW" }
-      ])
-    )
-  );
+  const base = withStagingBaseline(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  base.seen[masterPid] = {
+    pid: masterPid,
+    name: "SHORT SLEEVE POCKET CREW",
+    price: "395.00",
+    category: "T Shirt",
+    url: `https://www.chromehearts.com/t-shirt/short-sleeve-pocket-crew/${masterPid}.html`,
+    image: "",
+    firstSeenAt: base.createdAt
+  };
+  const kv = fakeKV(base);
   const stagingEnv = {
     DISCOVER_HOMEPAGE_CATEGORIES: "false",
     DISCOVER_PRODUCT_URL_CATEGORIES: "false",
     DISCOVER_SITEMAP_CATEGORIES: "false",
-    MAX_DIRECT_PRODUCT_URLS: "0"
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    ENUMERATION_ENABLED: "false"
   };
   const variantPv = stagedVariation(variantPid, { live: false, name: "SHORT SLEEVE POCKET CREW" });
   variantPv.product.masterProductId = masterPid;
@@ -1585,4 +1601,202 @@ test("A staged size-variant of an already-seen master goes dormant instead of fl
     });
     kv.values.delete(LOCK_KEY);
   }
+});
+
+// ---- Enumeration / mining / restock ----
+
+test("parsePidParts and minePidCandidates extract sibling PIDs from asset URLs", () => {
+  assert.deepEqual(parsePidParts("180539C4CXXX593"), { style: "180539", color: "C4C", size: "XXX", suffix: "593" });
+  assert.equal(parsePidParts("175364_214824"), null, "composite PIDs do not parse");
+  assert.equal(parsePidParts("KEEP_SHOP"), null);
+
+  const mined = minePidCandidates(
+    "https://www.chromehearts.com/dw/image/v2/BFBV_PRD/on/demandware.static/-/Sites-ch-master-catalog/default/dw5c238470/img_products/hi-res/308180539ABDXXX593_2708.png?sw=800"
+  );
+  assert.deepEqual(mined, ["180539ABDXXX593"]);
+  assert.deepEqual(minePidCandidates("no pids here 1234567890123456789"), [], "pure digits are not PIDs");
+});
+
+test("enumerationCandidates mines seen-product assets and permutes recent styles", () => {
+  const cfg = { enumerationEnabled: true, enumerationRecentDays: 14 };
+  const state = {
+    seen: {
+      "180539C4CXXX593": {
+        pid: "180539C4CXXX593",
+        firstSeenAt: new Date().toISOString(),
+        image: "https://www.chromehearts.com/img_products/hi-res/308180539ABDXXX593_2708.png",
+        url: "https://www.chromehearts.com/slippers/cord-slippers/180539C4CXXX593.html"
+      },
+      OLD_UNPARSEABLE: { pid: "OLD_UNPARSEABLE", firstSeenAt: new Date().toISOString(), image: "" }
+    },
+    hotWatch: {}
+  };
+  const { mined, siblings } = enumerationCandidates(cfg, state);
+  assert.deepEqual(mined, ["180539ABDXXX593"], "asset-mined sibling colorway");
+  assert.ok(siblings.includes("180539BLKXXX593"), "style+color permutation generated");
+  assert.ok(!siblings.includes("180539C4CXXX593"), "own colorway excluded");
+  assert.equal(enumerationCandidates({ enumerationEnabled: false }, state).mined.length, 0, "disable switch works");
+});
+
+test("parseHotWatchProbe requires actual stock, not just an available flag", () => {
+  const pid = "180539C4CXXX593";
+  const pricedButStockless = stagedVariation(pid, { live: true });
+  pricedButStockless.product.variationAttributes[0].values[0].selectable = false;
+  const probe = parseHotWatchProbe(pricedButStockless, pid);
+  assert.equal(probe.purchasable, false, "price + available flag but zero orderable sizes must NOT alert");
+  assert.match(probe.url, /cord-slippers\/180539C4CXXX593\.html$/, "canonical PDP URL extracted from the probe");
+});
+
+test("An asset-mined sibling colorway is hot-watched and alerts when it gains stock", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const seedPid = "180539C4CXXX593";
+  const minedPid = "180539ABDXXX593";
+  const base = stateWithActive([
+    { pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" },
+    { pid: seedPid, name: "CORD SLIPPERS", url: `https://www.chromehearts.com/slippers/cord-slippers/${seedPid}.html` }
+  ]);
+  base.seen[seedPid].firstSeenAt = new Date(Date.now() - 3600 * 1000).toISOString();
+  base.seen[seedPid].image = `https://www.chromehearts.com/img_products/hi-res/308${minedPid}_2708.png`;
+  base.active[seedPid] = structuredClone(base.seen[seedPid]);
+  const kv = fakeKV(withStagingBaseline(base));
+  const stagingEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    DISCOVER_ROBOTS_PRODUCTS: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    PROBE_BUDGET_PER_TICK: "40"
+  };
+
+  const stagedMock = createChromeHeartsFetch({
+    root: keep,
+    productVariations: { [minedPid]: stagedVariation(minedPid, { live: false }) }
+  });
+  await withMockedFetch(stagedMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 0);
+    assert.equal(stagedMock.discordPayloads.length, 0);
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.hotWatch[minedPid], "mined sibling colorway enters the hot-watch map");
+    assert.equal(state.hotWatch[minedPid].source, "mined");
+    assert.ok(Object.keys(state.enumTried || {}).length > 0, "permutation misses are remembered");
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const liveMock = createChromeHeartsFetch({
+    root: keep,
+    productVariations: { [minedPid]: stagedVariation(minedPid, { live: true }) },
+    productDetails: { [minedPid]: { name: "CORD SLIPPERS", categoryName: "Slippers", price: "1155.00" } }
+  });
+  await withMockedFetch(liveMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, [minedPid]);
+    assert.equal(result.alertLanes[minedPid], "hotwatch");
+    assert.equal(liveMock.discordPayloads[0].embeds[0].title, "CORD SLIPPERS");
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(state.seen[minedPid]);
+    assert.ok(state.seen[minedPid].lastAlertedAt, "alert timestamp stamped for the relist guard");
+    assert.equal(state.hotWatch[minedPid], undefined, "graduates out of hot-watch");
+  });
+});
+
+test("Restock watch relist-alerts a confirmed-missing product the moment its probe shows stock", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const gonePid = "129111BLKXXX756";
+  const base = stateWithActive([
+    { pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" },
+    { pid: gonePid, name: "SHORT SLEEVE POCKET CREW", url: `https://www.chromehearts.com/t-shirt/short-sleeve-pocket-crew/${gonePid}.html` }
+  ]);
+  delete base.active[gonePid];
+  base.missing = { [gonePid]: { pid: gonePid, firstMissingAt: base.createdAt, lastMissingAt: base.createdAt, count: 2 } };
+  const kv = fakeKV(withStagingBaseline(base));
+  const stagingEnv = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    DISCOVER_ROBOTS_PRODUCTS: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    ENUMERATION_ENABLED: "false",
+    RELIST_AFTER_ABSENT_RUNS: "2"
+  };
+
+  const restockMock = createChromeHeartsFetch({
+    root: keep,
+    productVariations: { [gonePid]: stagedVariation(gonePid, { live: true, name: "SHORT SLEEVE POCKET CREW" }) },
+    productDetails: { [gonePid]: { name: "SHORT SLEEVE POCKET CREW", categoryName: "T Shirt", price: "395.00" } }
+  });
+  await withMockedFetch(restockMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(stagingEnv, kv));
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.newPids, [gonePid]);
+    assert.equal(result.alertLanes[gonePid], "restock");
+    assert.equal(restockMock.discordPayloads[0].embeds[0].title, "SHORT SLEEVE POCKET CREW");
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.equal(state.missing[gonePid], undefined, "restocked product leaves the missing map");
+    assert.ok(state.active[gonePid], "restocked product is active again");
+  });
+});
+
+test("parseHotWatchProbe rejects delisted standard products (the TRUCKER HAT false-positive shape)", () => {
+  const pid = "196451DAYOSZ262";
+  const delisted = {
+    product: {
+      id: pid,
+      masterProductId: pid,
+      productName: "TRUCKER HAT",
+      productType: "standard",
+      online: false,
+      available: false,
+      readyToOrder: true,
+      price: { sales: { value: 395, currency: "USD" } },
+      availability: { messages: ["This item is currently not available"] },
+      variationAttributes: null
+    }
+  };
+  const probe = parseHotWatchProbe(delisted, pid);
+  assert.equal(probe.purchasable, false, "price + readyToOrder on a delisted product must not read as stock");
+  assert.equal(probe.inStockSizeCount, 0, '"not available" message defeats the readyToOrder fallback');
+
+  const relisted = structuredClone(delisted);
+  relisted.product.online = true;
+  relisted.product.available = true;
+  relisted.product.availability.messages = ["In Stock"];
+  assert.equal(parseHotWatchProbe(relisted, pid).purchasable, true);
+});
+
+test("Restock cooldown blocks a just-alerted product from re-probing into a loop", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const gonePid = "129111BLKXXX756";
+  const base = stateWithActive([
+    { pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" },
+    { pid: gonePid, name: "SHORT SLEEVE POCKET CREW" }
+  ]);
+  delete base.active[gonePid];
+  base.seen[gonePid].lastAlertedAt = new Date().toISOString();
+  base.missing = { [gonePid]: { pid: gonePid, firstMissingAt: base.createdAt, lastMissingAt: base.createdAt, count: 2 } };
+  const kv = fakeKV(withStagingBaseline(base));
+
+  const mock = createChromeHeartsFetch({
+    root: keep,
+    productVariations: { [gonePid]: stagedVariation(gonePid, { live: true, name: "SHORT SLEEVE POCKET CREW" }) }
+  });
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          ENUMERATION_ENABLED: "false"
+        },
+        kv
+      )
+    );
+    assert.equal(result.alerted, 0, "cooldown suppresses the restock re-alert");
+    assert.equal(result.staging.probed, 0, "cooldown removes the PID from the probe plan entirely");
+    assert.equal(mock.discordPayloads.length, 0);
+  });
 });

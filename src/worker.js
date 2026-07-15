@@ -553,7 +553,13 @@ function getConfig(env) {
     logVerbose: boolSetting(env, "LOG_VERBOSE", true),
     workersPlan: String(env.WORKERS_PLAN || "free").toLowerCase() === "paid" ? "paid" : "free",
     stagingLaneEnabled: boolSetting(env, "STAGING_LANE_ENABLED", true),
-    hotWatchLimit: intSetting(env, "HOT_WATCH_LIMIT", 12, 0),
+    hotWatchLimit: intSetting(env, "HOT_WATCH_LIMIT", 24, 0),
+    stagedIntelPings: boolSetting(env, "STAGED_INTEL_PINGS", false),
+    enumerationEnabled: boolSetting(env, "ENUMERATION_ENABLED", true),
+    enumerationRecentDays: intSetting(env, "ENUMERATION_RECENT_DAYS", 14, 0),
+    enumRetryHours: intSetting(env, "ENUM_RETRY_HOURS", 6, 1),
+    restockCooldownHours: intSetting(env, "RESTOCK_COOLDOWN_HOURS", 12, 0),
+    probeBudgetPerTick: intSetting(env, "PROBE_BUDGET_PER_TICK", 26, 0),
     pingFirstAlerts: boolSetting(env, "PING_FIRST_ALERTS", true),
     freshMissingGraceMinutes: intSetting(env, "FRESH_MISSING_GRACE_MINUTES", 30, 0),
     userAgent: env.MONITOR_USER_AGENT || DEFAULT_USER_AGENT
@@ -571,7 +577,8 @@ function applyPlanPreset(cfg) {
     maxCategoryIds: Math.max(cfg.maxCategoryIds, 260),
     categoryFetchConcurrency: Math.max(cfg.categoryFetchConcurrency, 20),
     discoveryEveryFullSweeps: Math.min(cfg.discoveryEveryFullSweeps, 5),
-    hotWatchLimit: Math.max(cfg.hotWatchLimit, 24)
+    hotWatchLimit: Math.max(cfg.hotWatchLimit, 48),
+    probeBudgetPerTick: Math.max(cfg.probeBudgetPerTick, 60)
   };
 }
 
@@ -1017,14 +1024,15 @@ async function fetchSitemapSignals(cfg) {
 }
 
 async function fetchHomepageSignals(cfg) {
-  const empty = { categoryIds: [], productUrls: [] };
+  const empty = { categoryIds: [], productUrls: [], html: "" };
   if (!cfg.discoverHomepageCategories) return empty;
   try {
     const html = await fetchHtml(BASE_URL, cfg);
     const hrefs = [...html.matchAll(/\bhref=["']([^"']+)["']/gi)].map((match) => absoluteUrl(match[1]));
     return {
       categoryIds: hrefs.map(categoryIdFromUrl).filter(Boolean),
-      productUrls: hrefs.map(productUrlFromUrl).filter(Boolean)
+      productUrls: hrefs.map(productUrlFromUrl).filter(Boolean),
+      html
     };
   } catch {
     return empty;
@@ -1042,6 +1050,69 @@ async function fetchRobotsProductUrls(cfg) {
   } catch {
     return [];
   }
+}
+
+const PID_PARTS_PATTERN = /^(\d{6})([A-Z0-9]{3})([A-Z0-9]{3})([A-Z0-9]{3})$/;
+
+function parsePidParts(pid) {
+  const match = String(pid || "").toUpperCase().match(PID_PARTS_PATTERN);
+  return match ? { style: match[1], color: match[2], size: match[3], suffix: match[4] } : null;
+}
+
+const DEFAULT_COLOR_CODES = [
+  "ABD", "BLK", "WHT", "GRY", "NAV", "BLU", "RED", "PNK", "PUR", "GRN", "YEL", "ORG",
+  "BRN", "TAN", "CRM", "CAM", "MLT", "SLV", "GLD", "CRY", "DAY", "ADL", "AFW", "MB3",
+  "D5D", "D7B", "A7T", "AI6", "20U", "C4C", "IND", "OLV", "NAT", "CHL"
+];
+
+function minePidCandidates(text) {
+  const found = new Set();
+  for (const match of String(text || "").matchAll(/[0-9A-Z]{15,24}/g)) {
+    const token = match[0];
+    for (const candidate of new Set([token, token.slice(-15)])) {
+      if (candidate.length === 15 && PID_PARTS_PATTERN.test(candidate) && /[A-Z]/.test(candidate.slice(6))) {
+        found.add(candidate);
+      }
+    }
+  }
+  return [...found];
+}
+
+function enumerationCandidates(cfg, state) {
+  if (!cfg.enumerationEnabled) return { mined: [], siblings: [] };
+  const seen = state.seen || {};
+  const hotWatch = state.hotWatch || {};
+  const mined = minePidCandidates(
+    Object.values(seen)
+      .map((record) => `${record?.image || ""} ${record?.url || ""}`)
+      .join("\n")
+  );
+
+  const recentMs = cfg.enumerationRecentDays * 86400000;
+  const seedPids = uniqueValues([
+    ...Object.keys(hotWatch).filter((pid) => !hotWatch[pid]?.dormant),
+    ...Object.values(seen)
+      .filter((record) => recentMs > 0 && Date.parse(record?.firstSeenAt || "") > Date.now() - recentMs)
+      .map((record) => record?.pid)
+  ]);
+  const colorVocab = uniqueValues([
+    ...DEFAULT_COLOR_CODES,
+    ...[...Object.keys(seen), ...Object.keys(hotWatch)].map((pid) => parsePidParts(pid)?.color).filter(Boolean)
+  ]);
+  const siblings = [];
+  for (const seedPid of seedPids) {
+    const parts = parsePidParts(seedPid);
+    if (!parts) continue;
+    for (const color of colorVocab) {
+      if (color === parts.color) continue;
+      siblings.push(`${parts.style}${color}${parts.size}${parts.suffix}`);
+    }
+  }
+  const excluded = (pid) => seen[pid] || hotWatch[pid];
+  return {
+    mined: uniqueValues(mined).filter((pid) => !excluded(pid)),
+    siblings: uniqueValues(siblings).filter((pid) => !excluded(pid))
+  };
 }
 
 function pidFromProductUrl(value) {
@@ -1109,14 +1180,19 @@ function parseHotWatchProbe(body, pid) {
   const product = body?.product || {};
   const variation = parseProductVariationJson(body);
   const priceValue = product?.price?.sales?.value ?? product?.price?.list?.value ?? null;
-  const purchasable = Boolean(
-    priceValue !== null && (variation.productAvailable || variation.readyToOrder || variation.inStockSizeCount > 0)
-  );
+  const purchasable = Boolean(priceValue !== null && variation.inStockSizeCount > 0 && product.online !== false);
   const imageGroups = product?.images || {};
   const imageUrl =
     ["large", "hiRes", "hi-res", "medium", "small"]
       .map((key) => imageGroups?.[key]?.[0]?.url || imageGroups?.[key]?.[0]?.absURL)
       .find(Boolean) || "";
+  let canonicalUrl = "";
+  try {
+    const rawUrl = String(product.selectedProductUrl || "");
+    if (rawUrl) canonicalUrl = absoluteUrl(new URL(rawUrl, BASE_URL).pathname);
+  } catch {
+    canonicalUrl = "";
+  }
   return {
     ok: true,
     pid,
@@ -1124,6 +1200,9 @@ function parseHotWatchProbe(body, pid) {
     name: String(product.productName || "").trim(),
     price: priceValue === null ? "" : String(priceValue),
     image: imageUrl ? absoluteUrl(imageUrl) : "",
+    url: canonicalUrl,
+    online: product.online === undefined ? null : Boolean(product.online),
+    category: String(product?.primaryCategory || "").trim(),
     purchasable,
     sizes: variation.sizes,
     inStockSizeCount: variation.inStockSizeCount,
@@ -1151,6 +1230,11 @@ async function probeHotWatchPids(cfg, pids) {
         cfg
       );
       if (!response.ok) {
+        try {
+          response.body?.cancel?.();
+        } catch {
+          // ignore
+        }
         probes[pid] = { ok: false, status: response.status };
         return;
       }
@@ -1163,12 +1247,15 @@ async function probeHotWatchPids(cfg, pids) {
 }
 
 async function stagingScan(cfg, opts = {}) {
-  const [robotsUrls, homepage, sitemap, probes] = await Promise.all([
+  const knownPids = new Set(Array.isArray(opts.knownPids) ? opts.knownPids : []);
+  const plannedPids = (Array.isArray(opts.probePids) ? opts.probePids : []).filter(isPidLikeSegment);
+
+  const [robotsUrls, homepage, sitemap] = await Promise.all([
     fetchRobotsProductUrls(cfg),
     fetchHomepageSignals(cfg),
-    fetchSitemapDelta(cfg, String(opts.sitemapLastmod || "")),
-    probeHotWatchPids(cfg, opts.hotWatchPids || [])
+    fetchSitemapDelta(cfg, String(opts.sitemapLastmod || ""))
   ]);
+
   const stagedUrls = [];
   const stagedPids = new Set();
   for (const { url, source } of [
@@ -1181,8 +1268,19 @@ async function stagingScan(cfg, opts = {}) {
     stagedPids.add(pid);
     stagedUrls.push({ url, source });
   }
+
+  const minedPids = cfg.enumerationEnabled
+    ? minePidCandidates(homepage.html || "").filter((pid) => !knownPids.has(pid) && !stagedPids.has(pid))
+    : [];
+  const freshPids = [...stagedPids].filter((pid) => !knownPids.has(pid));
+
+  const budget = Math.max(0, cfg.probeBudgetPerTick ?? 26);
+  const probeList = uniqueValues([...freshPids.slice(0, 6), ...plannedPids, ...minedPids.slice(0, 6)]).slice(0, budget);
+  const probes = await probeHotWatchPids(cfg, probeList);
+
   return {
     stagedUrls,
+    minedPids: minedPids.slice(0, 12),
     sitemap: { lastmod: sitemap.lastmod, changed: sitemap.changed, categoryIds: sitemap.categoryIds },
     probes
   };
@@ -1215,18 +1313,69 @@ async function collectStagingSignals(env, cfg, opts) {
 
 const HOT_WATCH_EXPIRY_MS = 21 * 24 * 3600 * 1000;
 
+function activeHotWatchCount(map) {
+  return Object.values(map).filter((entry) => entry && !entry.dormant).length;
+}
+
+function hotWatchProduct(entry, probe, productType = "hotwatch") {
+  const url = probe.url || entry.url || "";
+  return {
+    pid: entry.pid,
+    name: probe.name || entry.name || entry.pid,
+    price: probe.price || "",
+    brand: "Chrome Hearts",
+    category: probe.category || categoryFromUrl(url) || "staged",
+    productType,
+    url,
+    image: probe.image || "",
+    sizes: probe.sizes || [],
+    inStockSizeCount: probe.inStockSizeCount ?? 0
+  };
+}
+
 async function runStagingLane(env, cfg, state) {
+  const startedAt = Date.now();
   const seen = state.seen || {};
   const previousHotWatch =
     state.hotWatch && typeof state.hotWatch === "object" && !Array.isArray(state.hotWatch) ? state.hotWatch : {};
-  const hotWatchPids = Object.keys(previousHotWatch)
+  const activePids = Object.keys(previousHotWatch)
     .filter((pid) => !previousHotWatch[pid]?.dormant)
     .slice(0, cfg.hotWatchLimit);
+
+  const retryMs = Math.max(1, cfg.enumRetryHours) * 3600000;
+  const enumTried = {};
+  for (const [pid, at] of Object.entries(state.enumTried || {})) {
+    const triedMs = Date.parse(at || "");
+    if (Number.isFinite(triedMs) && Date.now() - triedMs < retryMs) enumTried[pid] = at;
+  }
+
+  const restockCooldownMs = Math.max(0, cfg.restockCooldownHours ?? 12) * 3600000;
+  const restockPids = Object.entries(state.missing || {})
+    .filter(([, entry]) => Number(entry?.count || 0) >= cfg.relistAfterAbsentRuns)
+    .map(([pid]) => pid)
+    .filter((pid) => {
+      if (!seen[pid]) return false;
+      const lastAlertedMs = Date.parse(seen[pid]?.lastAlertedAt || "");
+      return !(restockCooldownMs > 0 && Number.isFinite(lastAlertedMs) && Date.now() - lastAlertedMs < restockCooldownMs);
+    })
+    .slice(0, 6);
+  const candidates = enumerationCandidates(cfg, state);
+  const minedSet = new Set(candidates.mined);
+  const minedQueue = candidates.mined.filter((pid) => !enumTried[pid]);
+  const siblingQueue = candidates.siblings.filter((pid) => !enumTried[pid]);
+  const enumRoom = Math.max(0, (cfg.probeBudgetPerTick ?? 26) - activePids.length - restockPids.length - 6);
+  const minedSlice = minedQueue.slice(0, Math.min(enumRoom, 8));
+  const siblingRoom = Math.min(Math.max(0, enumRoom - minedSlice.length), 12);
+  const enumSlice = [...minedSlice, ...rotatingSlice(siblingQueue, Math.floor(startedAt / 15000) * siblingRoom, siblingRoom)];
+  const enumPoolSize = minedQueue.length + siblingQueue.length;
+
   const signals = await collectStagingSignals(env, cfg, {
-    hotWatchPids,
+    probePids: uniqueValues([...activePids, ...restockPids, ...enumSlice]),
+    knownPids: [...Object.keys(seen), ...Object.keys(previousHotWatch)],
     sitemapLastmod: state.sitemapIndexLastmod || ""
   });
   if (!signals) return null;
+  for (const pid of signals.minedPids || []) minedSet.add(pid);
 
   const baselined = Boolean(state.stagingBaselinedAt);
   const now = nowIso();
@@ -1246,7 +1395,7 @@ async function runStagingLane(env, cfg, state) {
   for (const staged of signals.stagedUrls || []) {
     const pid = pidFromProductUrl(staged.url);
     if (!pid || seen[pid] || hotWatch[pid]) continue;
-    if (Object.keys(hotWatch).length >= cfg.hotWatchLimit) break;
+    if (activeHotWatchCount(hotWatch) >= cfg.hotWatchLimit) break;
     hotWatch[pid] = { pid, url: staged.url, source: staged.source, name: stagedNameFromUrl(staged.url), firstStagedAt: now };
     discoveries.push(hotWatch[pid]);
     dirty = true;
@@ -1256,28 +1405,63 @@ async function runStagingLane(env, cfg, state) {
   let probedCount = 0;
   for (const [pid, probe] of Object.entries(signals.probes || {})) {
     probedCount += 1;
+    if (!probe) continue;
     const entry = hotWatch[pid];
-    if (!entry || !probe || probe.ok === false) continue;
-    if (probe.masterPid && probe.masterPid !== pid && (seen[probe.masterPid] || hotWatch[probe.masterPid])) {
-      if (!entry.dormant) {
-        hotWatch[pid] = { ...entry, dormant: true, masterPid: probe.masterPid };
+
+    if (probe.ok === false) {
+      if (!entry && !seen[pid]) {
+        enumTried[pid] = now;
         dirty = true;
       }
       continue;
     }
+
+    if (probe.masterPid && probe.masterPid !== pid && (seen[probe.masterPid] || hotWatch[probe.masterPid])) {
+      if (entry && !entry.dormant) {
+        hotWatch[pid] = { ...entry, dormant: true, masterPid: probe.masterPid };
+        dirty = true;
+      } else if (!entry) {
+        enumTried[pid] = now;
+        dirty = true;
+      }
+      continue;
+    }
+
+    if (seen[pid]) {
+      if (probe.purchasable && relistEligible(pid, seen, state.active || seen, state.missing || {}, cfg)) {
+        const record = seen[pid] || {};
+        liveProducts[pid] = {
+          ...hotWatchProduct({ pid, url: record.url || "", name: record.name || "" }, probe, "restock"),
+          image: probe.image || record.image || "",
+          price: probe.price || record.price || ""
+        };
+      }
+      continue;
+    }
+
+    if (!entry) {
+      if (!probe.name) {
+        enumTried[pid] = now;
+        dirty = true;
+        continue;
+      }
+      if (activeHotWatchCount(hotWatch) >= cfg.hotWatchLimit) continue;
+      const created = {
+        pid,
+        url: probe.url || "",
+        source: minedSet.has(pid) ? "mined" : "enumeration",
+        name: probe.name,
+        firstStagedAt: now
+      };
+      hotWatch[pid] = created;
+      discoveries.push(created);
+      dirty = true;
+      if (probe.purchasable) liveProducts[pid] = hotWatchProduct(created, probe);
+      continue;
+    }
+
     if (!probe.purchasable) continue;
-    liveProducts[pid] = {
-      pid,
-      name: probe.name || entry.name || pid,
-      price: probe.price || "",
-      brand: "Chrome Hearts",
-      category: categoryFromUrl(entry.url) || "staged",
-      productType: "hotwatch",
-      url: entry.url,
-      image: probe.image || "",
-      sizes: probe.sizes || [],
-      inStockSizeCount: probe.inStockSizeCount ?? 0
-    };
+    liveProducts[pid] = hotWatchProduct(entry, probe);
   }
 
   const previousCategories = Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : null;
@@ -1297,11 +1481,11 @@ async function runStagingLane(env, cfg, state) {
     if (lastmodChanged || categoriesChanged) dirty = true;
   }
 
-  if (baselined) {
+  if (baselined && cfg.stagedIntelPings) {
     const lines = [
       ...discoveries.map(
         (entry) =>
-          `👀 **STAGED ITEM** ${entry.name || entry.pid} — <${entry.url}> — found in ${entry.source}, not yet purchasable. Hot-watching every tick.`
+          `👀 **STAGED ITEM** ${entry.name || entry.pid} — <${entry.url || `${BASE_URL}/search?q=${entry.pid}`}> — found via ${entry.source}, not yet purchasable. Hot-watching every tick.`
       ),
       ...addedCategories.map((cgid) => `📁 **SITEMAP** category \`/${cgid}\` just appeared — possible drop prep.`)
     ];
@@ -1310,11 +1494,14 @@ async function runStagingLane(env, cfg, state) {
 
   return {
     hotWatch,
+    enumTried,
     liveProducts,
     discoveries,
     probedCount,
+    enumPoolSize,
     dirty,
     baselined,
+    ms: Date.now() - startedAt,
     sitemapIndexLastmod: sitemapLastmod,
     sitemapCategoryIds
   };
@@ -1891,7 +2078,7 @@ function productVariationUrl(pid, quantity = 1) {
 function isVariationInStock(product) {
   const messages = product?.availability?.messages || [];
   const text = messages.join(" ").toLowerCase();
-  if (text.includes("out of stock") || text.includes("unavailable")) return false;
+  if (text.includes("out of stock") || text.includes("unavailable") || text.includes("not available")) return false;
   return Boolean(product?.available || product?.readyToOrder || text.includes("in stock"));
 }
 
@@ -2496,8 +2683,8 @@ function buildCatalogState(products, state, deferredPids, cfg, { partial = false
 
   for (const pid of Object.keys(previousActive)) {
     if (currentPids.has(pid)) continue;
-    const firstSeenMs = Date.parse(seen[pid]?.firstSeenAt || "");
-    if (graceMs && Number.isFinite(firstSeenMs) && Date.now() - firstSeenMs < graceMs) continue;
+    const freshMs = Math.max(Date.parse(seen[pid]?.firstSeenAt || "") || 0, Date.parse(seen[pid]?.lastAlertedAt || "") || 0);
+    if (graceMs && freshMs && Date.now() - freshMs < graceMs) continue;
     const previous = previousMissing[pid] || {};
     const count = Number(previous.count || 0) + 1;
     missing[pid] = {
@@ -2557,6 +2744,7 @@ function catalogFingerprint(state) {
     Object.entries(state.hotWatch || {})
       .map(([pid, entry]) => `${pid}:${entry?.dormant ? 1 : 0}`)
       .sort(),
+    Object.keys(state.enumTried || {}).sort(),
     state.sitemapIndexLastmod || "",
     state.sitemapCategoryIds || []
   ]);
@@ -2626,7 +2814,9 @@ async function runMonitor(env, cfg = null, opts = {}) {
           newPids: [],
           productCount: fast.meta.pidUniverse,
           fast: fast.meta,
-          staging: staging ? { probed: staging.probedCount, hotWatch: Object.keys(staging.hotWatch).length } : null,
+          staging: staging
+            ? { probed: staging.probedCount, hotWatch: Object.keys(staging.hotWatch).length, enumPool: staging.enumPoolSize ?? 0, ms: staging.ms ?? 0 }
+            : null,
           nextFastCursor,
           storage: "cloudflare-kv",
           checkedAt: nowIso()
@@ -2690,9 +2880,12 @@ async function runMonitor(env, cfg = null, opts = {}) {
             discoveries: staging.discoveries.length,
             probed: staging.probedCount,
             live: Object.keys(staging.liveProducts || {}).length,
-            hotWatch: Object.keys(staging.hotWatch).length
+            hotWatch: Object.keys(staging.hotWatch).length,
+            enumPool: staging.enumPoolSize ?? 0,
+            ms: staging.ms ?? 0
           }
         : null,
+      alertLanes: enriched.length ? Object.fromEntries(enriched.map((product) => [product.pid, product.productType || "grid"])) : null,
       nextFastCursor,
       nextProspectiveCursor: mode === "full" ? cfg.discoveryRun?.nextProspectiveCategoryCursor ?? null : null,
       subrequestsUsed: cfg.subrequestsUsed || 0,
@@ -2738,9 +2931,18 @@ async function runMonitor(env, cfg = null, opts = {}) {
         if (product.masterPid) delete nextHotWatch[product.masterPid];
       }
       nextState.hotWatch = nextHotWatch;
+      if (staging.enumTried) nextState.enumTried = staging.enumTried;
       if (staging.sitemapIndexLastmod !== undefined) nextState.sitemapIndexLastmod = staging.sitemapIndexLastmod;
       if (staging.sitemapCategoryIds) nextState.sitemapCategoryIds = staging.sitemapCategoryIds;
       if (!state.stagingBaselinedAt) nextState.stagingBaselinedAt = nowIso();
+    }
+
+    if (enriched.length && nextState.seen) {
+      for (const product of enriched) {
+        if (nextState.seen[product.pid]) {
+          nextState.seen[product.pid] = { ...nextState.seen[product.pid], lastAlertedAt: nowIso() };
+        }
+      }
     }
 
     const quietFullSweep =
@@ -3116,7 +3318,9 @@ async function handleFetch(request, env) {
       staging: {
         enabled: cfg.stagingLaneEnabled,
         baselinedAt: state.stagingBaselinedAt || null,
-        hotWatch: Object.keys(state.hotWatch || {}),
+        hotWatch: state.hotWatch || {},
+        enumerationEnabled: cfg.enumerationEnabled,
+        enumTriedCount: Object.keys(state.enumTried || {}).length,
         sitemapIndexLastmod: state.sitemapIndexLastmod || null,
         sitemapCategories: Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : []
       },
@@ -3209,11 +3413,16 @@ async function handleFetch(request, env) {
     cfg.subrequestsUsed = 0;
     const body = await request.json().catch(() => ({}));
     if (body && body.staging && typeof body.staging === "object") {
-      const hotWatchPids = (Array.isArray(body.staging.hotWatchPids) ? body.staging.hotWatchPids : [])
-        .map((value) => String(value || "").trim())
-        .filter(isPidLikeSegment)
-        .slice(0, 24);
-      const staging = await stagingScan(cfg, { hotWatchPids, sitemapLastmod: String(body.staging.sitemapLastmod || "") });
+      const cleanPidList = (values, cap) =>
+        (Array.isArray(values) ? values : [])
+          .map((value) => String(value || "").trim())
+          .filter(isPidLikeSegment)
+          .slice(0, cap);
+      const staging = await stagingScan(cfg, {
+        probePids: cleanPidList(body.staging.probePids, 64),
+        knownPids: cleanPidList(body.staging.knownPids, 500),
+        sitemapLastmod: String(body.staging.sitemapLastmod || "")
+      });
       return jsonResponse({ ok: true, staging });
     }
     const cleanList = (values) =>
@@ -3308,7 +3517,7 @@ class MonitorController {
 
   async status() {
     const alarm = await this.state.storage.getAlarm();
-    const logs = (await this.state.storage.get("logs")) || [];
+    const logs = await this.state.storage.list({ prefix: "log:", limit: 1000 });
     return {
       tick: Number(await this.state.storage.get("tick")) || 0,
       lastTickAt: (await this.state.storage.get("lastTickAt")) || null,
@@ -3317,14 +3526,18 @@ class MonitorController {
       prospectiveCursor: Number(await this.state.storage.get("prospectiveCursor")) || 0,
       fullSweeps: Number(await this.state.storage.get("fullCount")) || 0,
       categoryStatusesTracked: Object.keys((await this.state.storage.get("catStatus")) || {}).length,
-      logCount: logs.length,
+      logCount: logs.size,
       lastResult: (await this.state.storage.get("lastResult")) || null
     };
   }
 
   async logs(limit = 100) {
-    const logs = (await this.state.storage.get("logs")) || [];
-    return { count: logs.length, runs: logs.slice(-limit).reverse() };
+    const capped = Math.max(1, Math.min(500, limit));
+    const listed = await this.state.storage.list({ prefix: "log:", reverse: true, limit: capped });
+    const runs = [...listed.values()];
+    if (runs.length) return { count: runs.length, runs };
+    const legacy = (await this.state.storage.get("logs")) || [];
+    return { count: legacy.length, runs: legacy.slice(-capped).reverse() };
   }
 
   async categoryStatusSweep(cfg) {
@@ -3385,10 +3598,14 @@ class MonitorController {
   }
 
   async record(entry, bufferSize) {
-    const logs = (await this.state.storage.get("logs")) || [];
-    logs.push(entry);
     const cap = Math.max(0, bufferSize || 0);
-    await this.state.storage.put("logs", cap ? logs.slice(-cap) : []);
+    if (!cap) return;
+    const ordinal = Number.isFinite(entry?.tick) ? entry.tick : 0;
+    await this.state.storage.put(`log:${String(ordinal).padStart(10, "0")}`, entry);
+    const expired = ordinal - cap;
+    if (expired > 0) {
+      await this.state.storage.delete(`log:${String(expired).padStart(10, "0")}`).catch(() => {});
+    }
   }
 
   async fetch(request) {
@@ -3474,6 +3691,7 @@ class MonitorController {
         failedCategories: result.sweep?.failedCategoryCount ?? 0,
         staged: result.staging?.discoveries ?? 0,
         hotWatch: result.staging?.hotWatch ?? null,
+        stagingMs: result.staging?.ms ?? 0,
         enrichMs: result.enrichMs || 0,
         sendMs: result.sendMs || 0,
         error: result.error || null
@@ -3488,7 +3706,9 @@ class MonitorController {
         tick,
         mode: result.mode || mode,
         pids: result.newPids || [],
+        lanes: result.alertLanes || null,
         totalMs: Date.now() - startedAt,
+        stagingMs: result.staging?.ms ?? 0,
         enrichMs: result.enrichMs || 0,
         sendMs: result.sendMs || 0,
         tickGapMs
@@ -3543,5 +3763,8 @@ export {
   parseHotWatchProbe,
   applyPlanPreset,
   runStagingLane,
-  stagingScan
+  stagingScan,
+  parsePidParts,
+  minePidCandidates,
+  enumerationCandidates
 };
