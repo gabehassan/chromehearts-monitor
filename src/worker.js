@@ -1622,8 +1622,10 @@ async function fetchProductsForCategory(cgid, cfg, maxPages) {
   const allProducts = {};
   for (let page = 0; page < maxPages; page += 1) {
     const start = page * cfg.pageSize;
-    const pageProducts = parseProducts(await fetchHtml(productGridUrl(cgid, start, cfg.pageSize), cfg));
-    const pagePids = Object.keys(pageProducts);
+    const html = await fetchHtml(productGridUrl(cgid, start, cfg.pageSize), cfg);
+    const pidCount = extractGridPids(html).size;
+    if (pidCount === 0) break;
+    const pageProducts = parseProducts(html);
     let newOnPage = 0;
 
     for (const [pid, product] of Object.entries(pageProducts)) {
@@ -1631,7 +1633,7 @@ async function fetchProductsForCategory(cgid, cfg, maxPages) {
       allProducts[pid] = product;
     }
 
-    if (pagePids.length < cfg.pageSize) break;
+    if (pidCount < cfg.pageSize) break;
     if (newOnPage === 0) break;
   }
   return allProducts;
@@ -1750,7 +1752,7 @@ async function fetchProducts(cfg, state = {}) {
 
 function extractGridPids(html) {
   const pids = new Set();
-  const pattern = /data-pid="([^"]+)"/g;
+  const pattern = /data-pid\s*=\s*["']([^"']+)["']/g;
   let match;
   while ((match = pattern.exec(html)) !== null) {
     if (match[1]) pids.add(match[1]);
@@ -1871,15 +1873,18 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
   const products = {};
   const activeCgids = [];
   const failed = [];
+  const parseIfAny = (html) => (extractGridPids(html).size ? parseProducts(html) : null);
   const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
   htmls.forEach((html, index) => {
     if (!html) {
       failed.push(cgids[index]);
       return;
     }
-    const found = parseProducts(html);
-    if (Object.keys(found).length) activeCgids.push(cgids[index]);
-    Object.assign(products, found);
+    const found = parseIfAny(html);
+    if (found) {
+      activeCgids.push(cgids[index]);
+      Object.assign(products, found);
+    }
   });
   const queryHtmls = await mapWithConcurrency(queries, cfg.categoryFetchConcurrency, (query) => fetchSearchHtmlSafe(query, cfg));
   queryHtmls.forEach((html, index) => {
@@ -1887,7 +1892,8 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
       failed.push(`q:${queries[index]}`);
       return;
     }
-    Object.assign(products, parseProducts(html));
+    const found = parseIfAny(html);
+    if (found) Object.assign(products, found);
   });
   return { ok: true, products, activeCgids, failed, scanned: cgids.length + queries.length };
 }
@@ -1924,8 +1930,9 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
     : [];
   const cgids = uniqueValues([...head, ...shard]);
   const htmls = [...headHtmls, ...shardHtmls];
-  const combinedHtml = [...htmls, ...searchHtmls].join("\n");
-  const pidUniverse = extractGridPids(combinedHtml);
+  const pidUniverse = new Set();
+  for (const html of htmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
+  for (const html of searchHtmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
   for (const pid of Object.keys(fanout?.products || {})) pidUniverse.add(pid);
 
   const previousSeen = state.seen || {};
@@ -1957,6 +1964,7 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
     return { products: {}, meta, nextFastCursor, empty: true };
   }
 
+  const combinedHtml = [...htmls, ...searchHtmls].filter(Boolean).join("\n");
   return { products: { ...parseProducts(combinedHtml), ...(fanout?.products || {}) }, meta, nextFastCursor, empty: false };
 }
 

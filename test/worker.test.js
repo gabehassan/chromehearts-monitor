@@ -1932,3 +1932,26 @@ test("Burst window does not open on an ordinary quiet tick", async () => {
     assert.equal(state.burstUntil, undefined, "no drop signal, no burst");
   });
 });
+
+test("extractGridPids is a faithful superset of parseProducts (coverage gate safety)", async () => {
+  const { parseProducts, extractGridPids } = await import("../src/worker.js");
+  const variants = [
+    productTile("053669BLKOSZD62", "SWEATBAND", "sweatbands", "Accessories"),
+    // single-quoted attributes
+    `<div class='product productType-master' data-pid='129111BLKXXX756'>
+       <span class='product-metadata' data-pid='129111BLKXXX756' data-name='TEE' data-price='395'></span>
+       <a class='link' href='/t-shirt/x/129111BLKXXX756.html'>x</a></div>`,
+    // extra whitespace around the attribute
+    `<div class="product productType-master"  data-pid = "180539C4CXXX593" >
+       <span class="product-metadata" data-pid="180539C4CXXX593" data-name="SLIPPERS" data-price="1155"></span>
+       <a class="link" href="/slippers/x/180539C4CXXX593.html">x</a></div>`
+  ];
+  for (const html of variants) {
+    const cheerioPids = new Set(Object.keys(parseProducts(html)));
+    const regexPids = extractGridPids(html);
+    for (const pid of cheerioPids) {
+      assert.ok(regexPids.has(pid), `regex gate must catch every parseable product PID (missed ${pid})`);
+    }
+  }
+  assert.equal(extractGridPids('<div class="search-result-content"></div>').size, 0);
+});
