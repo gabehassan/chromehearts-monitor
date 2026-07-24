@@ -3514,7 +3514,8 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
     .fields .field { margin: 0; }
     .field.num { width: 150px; }
     .field.wide { flex: 1 1 100%; }
-    .field .deflt { color: var(--muted); font-weight: 400; font-size: 11px; }
+    .field .deflt { display: block; color: var(--muted); font-weight: 400; font-size: 11px; margin-top: 2px; }
+    .check .deflt { display: inline; margin-left: 4px; }
     section { border-top: 1px solid var(--line); padding-top: 18px; margin-top: 18px; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0c0d0d; border: 1px solid var(--line); border-radius: 8px; padding: 14px; color: var(--muted); }
     form { display: grid; gap: 16px; }
