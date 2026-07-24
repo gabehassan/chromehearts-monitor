@@ -3344,9 +3344,10 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
       <span class="arrow ${dropping ? "down" : "up"}">${dropping ? "↓" : "↑"}</span>
       <span class="stock ${dropping ? "down" : "up"}">${escapeHtml(stockText(latest))}</span>`;
   };
+  const thumbUrl = (url) => `${url}${url.includes("?") ? "&" : "?"}sw=80&sh=80&sm=fit`;
   const thumb = (entry) =>
     entry.image
-      ? `<img class="thumb" src="${escapeHtml(entry.image)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+      ? `<img class="thumb" src="${escapeHtml(thumbUrl(entry.image))}" alt="" loading="lazy">`
       : `<span class="thumb empty"></span>`;
   const productRow = (entry, whenIso, whenLabel, withStock = false) => `<tr>
     <td class="prod">${thumb(entry)}<span>${
