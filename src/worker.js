@@ -477,7 +477,7 @@ function boolSetting(env, name, fallback = false) {
 
 function getConfig(env) {
   if (!env.STATE) throw new MonitorError("Missing STATE KV binding.");
-  if (!env.DISCORD_WEBHOOK_URL && !env.DISCORD_WEBHOOK_URLS) {
+  if (!env.DISCORD_WEBHOOK_URL && !env.DISCORD_WEBHOOK_URLS && !env.DISCORD_MAIN_WEBHOOK_URL) {
     throw new MonitorError("Missing DISCORD_WEBHOOK_URL secret.");
   }
 
@@ -634,8 +634,12 @@ function applyRuntimeSettings(cfg, settings) {
   if (Array.isArray(settings.discordWebhookVerbose)) {
     next.discordWebhookVerbose = settings.discordWebhookVerbose.map((id) => String(id));
   }
-  if (next.discordMainWebhookUrl) {
-    next.discordWebhookUrls = uniqueValues([next.discordMainWebhookUrl, ...(next.discordWebhookUrls || [])]);
+  if (next.discordMainWebhookUrl && !(next.discordWebhookUrls || []).includes(next.discordMainWebhookUrl)) {
+    if (Array.isArray(settings.discordWebhookUrls)) {
+      delete next.discordMainWebhookUrl;
+    } else {
+      next.discordWebhookUrls = uniqueValues([next.discordMainWebhookUrl, ...(next.discordWebhookUrls || [])]);
+    }
   }
   return next;
 }
@@ -3049,7 +3053,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
 
   let state = await loadState(env, cfg);
   try {
-    if (state.backoffUntil && Date.parse(state.backoffUntil) > Date.now()) {
+    if (!skipLock && state.backoffUntil && Date.parse(state.backoffUntil) > Date.now()) {
       return done({ ok: true, skipped: true, reason: "backoff", mode, backoffUntil: state.backoffUntil, storage: "cloudflare-kv" });
     }
     if (!skipLock && mode === "full" && shouldSkipForInterval(state, cfg)) {

@@ -2210,3 +2210,77 @@ test("Non-item pings go to the MAIN webhook only", async () => {
     assert.ok(!mock.discordUrls.some((url) => url.includes("second-token")), "second server must not get plumbing pings");
   });
 });
+
+test("Error backoff throttles external runs but never stops the Durable Object loop", async () => {
+  const keep = productTile("KEEP_BACKOFF", "KEEP BACKOFF ITEM", "shop", "Shop", "100.00");
+  const fresh = productTile("BACKOFF_NEW", "BACKOFF DROP", "shop", "Shop", "250.00");
+  const backedOffState = {
+    ...withStagingBaseline(stateWithActive([{ pid: "KEEP_BACKOFF", name: "KEEP BACKOFF ITEM" }])),
+    errorStreak: 4,
+    backoffUntil: new Date(Date.now() + 90_000).toISOString()
+  };
+  const overrides = {
+    DISCOVER_HOMEPAGE_CATEGORIES: "false",
+    DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+    DISCOVER_SITEMAP_CATEGORIES: "false",
+    DISCOVER_ROBOTS_PRODUCTS: "false",
+    MAX_DIRECT_PRODUCT_URLS: "0",
+    ENUMERATION_ENABLED: "false"
+  };
+
+  const kvLoop = fakeKV(backedOffState);
+  const mockLoop = createChromeHeartsFetch({
+    root: `${keep}${fresh}`,
+    productDetails: { BACKOFF_NEW: { name: "BACKOFF DROP", categoryName: "Shop", price: "250.00" } }
+  });
+  await withMockedFetch(mockLoop.fetchMock, async () => {
+    const result = await runMonitor(env(overrides, kvLoop), null, { mode: "full", skipLock: true });
+    assert.notEqual(result.reason, "backoff", "the fast loop must not skip a scan because of backoff");
+    assert.equal(result.skipped, undefined, "it actually scanned");
+    assert.equal(result.alerted, 1, "and the drop still alerted while backoff was armed");
+  });
+
+  const kvExternal = fakeKV(backedOffState);
+  const mockExternal = createChromeHeartsFetch({ root: `${keep}${fresh}` });
+  await withMockedFetch(mockExternal.fetchMock, async () => {
+    const result = await runMonitor(env(overrides, kvExternal), null, { mode: "full" });
+    assert.equal(result.skipped, true);
+    assert.equal(result.reason, "backoff", "manual/cron runs still back off");
+  });
+});
+
+test("An env-configured MAIN webhook can be removed from the dashboard", async () => {
+  const envMain = "https://discord.com/api/webhooks/777/env-main";
+  const added = "https://discord.com/api/webhooks/888/dashboard-added";
+  const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
+  const testEnv = env({ DISCORD_MAIN_WEBHOOK_URL: envMain, DISCORD_WEBHOOK_URL: "" }, kv);
+  const post = (params) => {
+    const body = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) for (const i of Array.isArray(v) ? v : [v]) body.append(k, i);
+    return worker.fetch(
+      new Request("https://monitor.test/webhooks", {
+        method: "POST",
+        headers: { ...basicAuthHeaders(), "content-type": "application/x-www-form-urlencoded" },
+        body
+      }),
+      testEnv
+    );
+  };
+  const health = async () => {
+    const r = await worker.fetch(new Request("https://monitor.test/health", { headers: basicAuthHeaders() }), testEnv);
+    return (await r.json()).settings;
+  };
+
+  // The env MAIN starts in the fan-out and is MAIN.
+  assert.equal((await health()).webhookCount, 1);
+
+  await post({ discordWebhookUrls: added, webhookName: "Backup" });
+  assert.equal((await health()).webhookCount, 2);
+  await post({ remove: "777" });
+
+  const after = await health();
+  assert.equal(after.webhookCount, 1, "the env MAIN is not resurrected from the secret");
+  assert.match(after.mainWebhook, /888/, "MAIN falls back to the remaining webhook");
+  const saved = JSON.parse(kv.values.get(SETTINGS_KEY));
+  assert.deepEqual(saved.discordWebhookUrls, [added]);
+});
