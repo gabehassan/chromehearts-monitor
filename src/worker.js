@@ -2827,11 +2827,9 @@ async function sendStagingPings(cfg, lines) {
 
 function alertStockLevel(product) {
   if (!product) return null;
-  if (product.exactStockKnown && Number.isFinite(product.totalStock)) {
-    return { units: product.totalStock, exact: true };
-  }
-  if (Number.isFinite(product.inStockSizeCount) && product.inStockSizeCount > 0) {
-    return { units: product.inStockSizeCount, exact: false };
+  if (product.exactStockKnown && Number.isFinite(product.totalStock)) return { units: product.totalStock };
+  if (Number.isFinite(product.cappedOrderableTotal) && product.cappedOrderableTotal > 0) {
+    return { units: product.cappedOrderableTotal, capped: true };
   }
   return null;
 }
@@ -3331,12 +3329,12 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
     const text = priceText(value);
     return text ? escapeHtml(text) : "—";
   };
-  const stockText = (stock) => (stock ? `${stock.units}${stock.exact ? "" : " sizes"}` : "—");
+  const stockText = (stock) => (stock ? `${stock.units}${stock.capped ? "+" : ""}` : "—");
   const stockCell = (entry) => {
     const initial = entry.initialStock || null;
     const latest = entry.latestStock || null;
     if (!initial && !latest) return "—";
-    if (!initial || !latest || (initial.units === latest.units && initial.exact === latest.exact)) {
+    if (!initial || !latest || initial.units === latest.units) {
       return `<span class="stock">${escapeHtml(stockText(latest || initial))}</span>`;
     }
     const dropping = latest.units < initial.units;
@@ -3344,7 +3342,7 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
       <span class="arrow ${dropping ? "down" : "up"}">${dropping ? "↓" : "↑"}</span>
       <span class="stock ${dropping ? "down" : "up"}">${escapeHtml(stockText(latest))}</span>`;
   };
-  const thumbUrl = (url) => `${url}${url.includes("?") ? "&" : "?"}sw=80&sh=80&sm=fit`;
+  const thumbUrl = (url) => `${String(url).split("?")[0]}?sw=80&sh=80&sm=fit`;
   const thumb = (entry) =>
     entry.image
       ? `<img class="thumb" src="${escapeHtml(thumbUrl(entry.image))}" alt="" loading="lazy">`
