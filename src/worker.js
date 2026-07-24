@@ -12,7 +12,7 @@ const DEFAULT_SETTINGS_KEY = "chrome-hearts:cloudflare:settings";
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const DO_SINGLETON_NAME = "chrome-hearts-monitor";
-const DO_FLUSH_EVERY_TICKS = 20;
+const DO_FLUSH_EVERY_TICKS = 4;
 const RESERVED_CATEGORY_IDS = new Set([
   "account",
   "cart",
@@ -3294,7 +3294,7 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
   const heartbeatIso = controller?.lastTickAt || state.lastRunAt || "";
   const lastRunMs = Date.parse(heartbeatIso) || 0;
   const staleMs = lastRunMs ? Math.max(0, Date.now() - lastRunMs) : null;
-  const staleLimitMs = Math.max(120000, cadenceSeconds * 1000 * 6);
+  const staleLimitMs = Math.max(150000, cadenceSeconds * 1000 * (DO_FLUSH_EVERY_TICKS + 6));
   const loopStalled = staleMs !== null && staleMs > staleLimitMs;
   const status = !state.lastRunAt ? "Ready" : loopStalled ? "STALLED" : last.ok === false ? "Issue" : "Online";
   const lastRun = state.lastRunAt || "Never";
@@ -3389,7 +3389,7 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
     td a:hover { text-decoration: underline; }
     .pid { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 2px; }
     td.prod { display: flex; gap: 10px; align-items: flex-start; }
-    .thumb { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; background: var(--field); border: 1px solid var(--line); flex: 0 0 auto; }
+    .thumb { width: 40px; height: 40px; border-radius: 6px; object-fit: contain; background: #fff; border: 1px solid var(--line); flex: 0 0 auto; }
     .thumb.empty { display: inline-block; }
     .stock { font-variant-numeric: tabular-nums; }
     .stock.was { color: var(--muted); }
