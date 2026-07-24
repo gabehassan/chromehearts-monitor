@@ -2825,6 +2825,17 @@ async function sendStagingPings(cfg, lines) {
   }
 }
 
+function alertStockLevel(product) {
+  if (!product) return null;
+  if (product.exactStockKnown && Number.isFinite(product.totalStock)) {
+    return { units: product.totalStock, exact: true };
+  }
+  if (Number.isFinite(product.inStockSizeCount) && product.inStockSizeCount > 0) {
+    return { units: product.inStockSizeCount, exact: false };
+  }
+  return null;
+}
+
 function productStateRecord(product, previousRecord, now) {
   return {
     ...(previousRecord || {}),
@@ -3136,7 +3147,21 @@ async function runMonitor(env, cfg = null, opts = {}) {
     if (enriched.length && nextState.seen) {
       for (const product of enriched) {
         if (nextState.seen[product.pid]) {
-          nextState.seen[product.pid] = { ...nextState.seen[product.pid], lastAlertedAt: nowIso() };
+          const previous = nextState.seen[product.pid];
+          const stock = alertStockLevel(product);
+          nextState.seen[product.pid] = {
+            ...previous,
+            lastAlertedAt: nowIso(),
+            image: product.image || previous.image || "",
+            ...(stock === null
+              ? {}
+              : {
+                  initialStock: previous.initialStock ?? stock,
+                  initialStockAt: previous.initialStockAt || nowIso(),
+                  latestStock: stock,
+                  latestStockAt: nowIso()
+                })
+          };
         }
       }
     }
@@ -3267,7 +3292,9 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
   const activeCount = Object.keys(state.active || state.seen || {}).length;
   const missingCount = Object.keys(state.missing || {}).length;
   const cadenceSeconds = cfg.fastPollEnabled ? cfg.fastPollIntervalSeconds : 60;
-  const lastRunMs = Date.parse(state.lastRunAt || "") || 0;
+  const controller = flags.controller || null;
+  const heartbeatIso = controller?.lastTickAt || state.lastRunAt || "";
+  const lastRunMs = Date.parse(heartbeatIso) || 0;
   const staleMs = lastRunMs ? Math.max(0, Date.now() - lastRunMs) : null;
   const staleLimitMs = Math.max(120000, cadenceSeconds * 1000 * 6);
   const loopStalled = staleMs !== null && staleMs > staleLimitMs;
@@ -3304,14 +3331,32 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
     const text = priceText(value);
     return text ? escapeHtml(text) : "—";
   };
-  const productRow = (entry, whenIso, whenLabel) => `<tr>
-    <td>${
+  const stockText = (stock) => (stock ? `${stock.units}${stock.exact ? "" : " sizes"}` : "—");
+  const stockCell = (entry) => {
+    const initial = entry.initialStock || null;
+    const latest = entry.latestStock || null;
+    if (!initial && !latest) return "—";
+    if (!initial || !latest || (initial.units === latest.units && initial.exact === latest.exact)) {
+      return `<span class="stock">${escapeHtml(stockText(latest || initial))}</span>`;
+    }
+    const dropping = latest.units < initial.units;
+    return `<span class="stock was">${escapeHtml(stockText(initial))}</span>
+      <span class="arrow ${dropping ? "down" : "up"}">${dropping ? "↓" : "↑"}</span>
+      <span class="stock ${dropping ? "down" : "up"}">${escapeHtml(stockText(latest))}</span>`;
+  };
+  const thumb = (entry) =>
+    entry.image
+      ? `<img class="thumb" src="${escapeHtml(entry.image)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+      : `<span class="thumb empty"></span>`;
+  const productRow = (entry, whenIso, whenLabel, withStock = false) => `<tr>
+    <td class="prod">${thumb(entry)}<span>${
       entry.url
         ? `<a href="${escapeHtml(entry.url)}" target="_blank" rel="noreferrer">${escapeHtml(entry.name || entry.pid)}</a>`
         : escapeHtml(entry.name || entry.pid)
-    }<div class="pid">${escapeHtml(entry.pid)}</div></td>
+    }<div class="pid">${escapeHtml(entry.pid)}</div></span></td>
     <td>${priceCell(entry.price)}</td>
     <td>${escapeHtml(entry.category || "—")}</td>
+    ${withStock ? `<td>${stockCell(entry)}</td>` : ""}
     <td title="${escapeHtml(whenIso || "")}">${escapeHtml(whenLabel)}</td>
   </tr>`;
   const mainHook = mainWebhookUrl(cfg);
@@ -3344,6 +3389,14 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
     td a { color: var(--blue); text-decoration: none; }
     td a:hover { text-decoration: underline; }
     .pid { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 2px; }
+    td.prod { display: flex; gap: 10px; align-items: flex-start; }
+    .thumb { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; background: var(--field); border: 1px solid var(--line); flex: 0 0 auto; }
+    .thumb.empty { display: inline-block; }
+    .stock { font-variant-numeric: tabular-nums; }
+    .stock.was { color: var(--muted); }
+    .stock.down, .arrow.down { color: var(--alarm); }
+    .stock.up, .arrow.up { color: var(--mint); }
+    .arrow { padding: 0 2px; }
     .card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; min-height: 96px; }
     .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
     .value { margin-top: 10px; font-size: 22px; font-weight: 700; overflow-wrap: anywhere; }
@@ -3428,10 +3481,12 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
       ${
         pingedProducts.length
           ? `<div class="tablewrap"><table>
-              <thead><tr><th>Product</th><th>Price</th><th>Category</th><th>Pinged</th></tr></thead>
+              <thead><tr><th>Product</th><th>Price</th><th>Category</th><th>Stock at ping → now</th><th>Pinged</th></tr></thead>
               <tbody>${pingedProducts
                 .slice(0, 25)
-                .map((entry) => productRow(entry, entry.lastAlertedAt, agoText(Math.max(0, Date.now() - (Date.parse(entry.lastAlertedAt) || 0)))))
+                .map((entry) =>
+                  productRow(entry, entry.lastAlertedAt, agoText(Math.max(0, Date.now() - (Date.parse(entry.lastAlertedAt) || 0))), true)
+                )
                 .join("")}</tbody>
             </table></div>
             ${pingedProducts.length > 25 ? `<p class="note">Showing the 25 most recent of ${pingedProducts.length} alerts.</p>` : ""}`
@@ -3621,10 +3676,12 @@ async function handleFetch(request, env) {
     if (!isPrivatePageAuthorized(request, baseCfg)) return privatePageUnauthorized(request);
     const settings = await loadSettings(env, baseCfg);
     const cfg = applyRuntimeSettings(baseCfg, settings);
+    const controller = await fastPollStatus(env).catch(() => null);
     return htmlResponse(
       dashboard(await loadState(env, cfg), cfg, settings, {
         saved: url.searchParams.get("saved") === "1",
-        webhooksSaved: url.searchParams.has("webhooks") ? url.searchParams.get("webhooks") : null
+        webhooksSaved: url.searchParams.has("webhooks") ? url.searchParams.get("webhooks") : null,
+        controller
       })
     );
   }
