@@ -486,7 +486,10 @@ function getConfig(env) {
     stateKey: env.STATE_KEY || DEFAULT_STATE_KEY,
     lockKey: env.LOCK_KEY || DEFAULT_LOCK_KEY,
     settingsKey: env.SETTINGS_KEY || DEFAULT_SETTINGS_KEY,
-    discordWebhookUrls: parseWebhookUrls(`${env.DISCORD_WEBHOOK_URL || ""} ${env.DISCORD_WEBHOOK_URLS || ""}`),
+    discordWebhookUrls: parseWebhookUrls(
+      `${env.DISCORD_MAIN_WEBHOOK_URL || ""} ${env.DISCORD_WEBHOOK_URL || ""} ${env.DISCORD_WEBHOOK_URLS || ""}`
+    ),
+    discordMainWebhookUrl: parseWebhookUrls(env.DISCORD_MAIN_WEBHOOK_URL || "")[0] || null,
     cronSecret: env.CRON_SECRET || "",
     dashboardUsername: env.DASHBOARD_USERNAME || "chrome-hearts",
     dashboardPassword: env.DASHBOARD_PASSWORD || env.CRON_SECRET || "",
@@ -620,6 +623,14 @@ function applyRuntimeSettings(cfg, settings) {
     // Back-compat with the old single-webhook setting.
     next.discordWebhookUrls = [settings.discordWebhookUrl];
   }
+  if (typeof settings.discordMainWebhookUrl === "string" && isValidDiscordWebhookUrl(settings.discordMainWebhookUrl)) {
+    if ((next.discordWebhookUrls || []).includes(settings.discordMainWebhookUrl)) {
+      next.discordMainWebhookUrl = settings.discordMainWebhookUrl;
+    }
+  }
+  if (next.discordMainWebhookUrl) {
+    next.discordWebhookUrls = uniqueValues([next.discordMainWebhookUrl, ...(next.discordWebhookUrls || [])]);
+  }
   return next;
 }
 
@@ -685,15 +696,6 @@ function isValidDiscordWebhookUrl(raw) {
   }
   const validHost = url.hostname === "discord.com" || url.hostname.endsWith(".discord.com") || url.hostname === "discordapp.com";
   return url.protocol === "https:" && validHost && url.pathname.startsWith("/api/webhooks/");
-}
-
-function validateDiscordWebhookUrl(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  if (!isValidDiscordWebhookUrl(raw)) {
-    throw new MonitorError("Discord webhook must be an https://discord.com/api/webhooks/... URL.", 400);
-  }
-  return new URL(raw).toString();
 }
 
 function validateDiscordWebhookList(value) {
@@ -2704,7 +2706,8 @@ async function postToWebhook(cfg, webhookUrl, payload) {
 }
 
 function mainWebhookUrl(cfg) {
-  return (cfg.discordWebhookUrls || []).filter(Boolean)[0] || null;
+  const configured = (cfg.discordWebhookUrls || []).filter(Boolean);
+  return cfg.discordMainWebhookUrl || configured[0] || null;
 }
 
 async function postToMainWebhook(cfg, payload) {
@@ -3263,9 +3266,22 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
   const seenCount = Object.keys(state.seen || {}).length;
   const activeCount = Object.keys(state.active || state.seen || {}).length;
   const missingCount = Object.keys(state.missing || {}).length;
-  const status = last.ok === false ? "Issue" : state.lastRunAt ? "Online" : "Ready";
+  const cadenceSeconds = cfg.fastPollEnabled ? cfg.fastPollIntervalSeconds : 60;
+  const lastRunMs = Date.parse(state.lastRunAt || "") || 0;
+  const staleMs = lastRunMs ? Math.max(0, Date.now() - lastRunMs) : null;
+  const staleLimitMs = Math.max(120000, cadenceSeconds * 1000 * 6);
+  const loopStalled = staleMs !== null && staleMs > staleLimitMs;
+  const status = !state.lastRunAt ? "Ready" : loopStalled ? "STALLED" : last.ok === false ? "Issue" : "Online";
   const lastRun = state.lastRunAt || "Never";
-  const next = cfg.checkMinIntervalSeconds ? `${cfg.checkMinIntervalSeconds}s minimum` : "No throttle";
+  const durationText = (ms) => {
+    const seconds = Math.round(ms / 1000);
+    if (seconds < 90) return `${seconds}s`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 90) return `${minutes} min`;
+    const hours = Math.round(minutes / 60);
+    return hours < 48 ? `${hours}h` : `${Math.round(hours / 24)} days`;
+  };
+  const agoText = (ms) => (ms === null ? "never" : `${durationText(ms)} ago`);
   const lastProducts = last.productCount ?? seenCount;
   const updated = state.updatedAt || state.createdAt || nowIso();
   const extraCategoryIds = cfg.extraCategoryIds.join(", ");
@@ -3274,8 +3290,35 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
   const dashboardWebhookCount = Array.isArray(settings.discordWebhookUrls) ? settings.discordWebhookUrls.length : 0;
   const webhookSource = dashboardWebhookCount ? "dashboard-managed" : "from Worker secret";
   const webhookStatus = `${webhookCount} webhook${webhookCount === 1 ? "" : "s"} active (${webhookSource})`;
-  const webhookMasked = (cfg.discordWebhookUrls || []).map((url) => maskWebhook(url));
-  const cadenceSeconds = cfg.fastPollEnabled ? cfg.fastPollIntervalSeconds : 60;
+  const newestFirst = (a, b) => (Date.parse(b) || 0) - (Date.parse(a) || 0);
+  const seenValues = Object.values(state.seen || {}).filter((entry) => entry && entry.pid);
+  const pingedProducts = seenValues
+    .filter((entry) => entry.lastAlertedAt)
+    .sort((a, b) => newestFirst(a.lastAlertedAt, b.lastAlertedAt));
+  const lastPing = pingedProducts[0] || null;
+  const lastPingMs = lastPing ? Date.parse(lastPing.lastAlertedAt) || 0 : 0;
+  const activeValues = Object.values(state.active || {})
+    .filter((entry) => entry && entry.pid)
+    .sort((a, b) => newestFirst(a.firstSeenAt, b.firstSeenAt));
+  const priceCell = (value) => {
+    const text = priceText(value);
+    return text ? escapeHtml(text) : "—";
+  };
+  const productRow = (entry, whenIso, whenLabel) => `<tr>
+    <td>${
+      entry.url
+        ? `<a href="${escapeHtml(entry.url)}" target="_blank" rel="noreferrer">${escapeHtml(entry.name || entry.pid)}</a>`
+        : escapeHtml(entry.name || entry.pid)
+    }<div class="pid">${escapeHtml(entry.pid)}</div></td>
+    <td>${priceCell(entry.price)}</td>
+    <td>${escapeHtml(entry.category || "—")}</td>
+    <td title="${escapeHtml(whenIso || "")}">${escapeHtml(whenLabel)}</td>
+  </tr>`;
+  const mainHook = mainWebhookUrl(cfg);
+  const webhookRows = (cfg.discordWebhookUrls || []).map((url) => ({
+    masked: maskWebhook(url),
+    isMain: url === mainHook
+  }));
 
   return `<!doctype html>
 <html lang="en">
@@ -3284,17 +3327,33 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Chrome Hearts Monitor</title>
   <style>
-    :root { color-scheme: dark; --bg: #080909; --panel: #121414; --line: #2a2d2d; --text: #f1f1ee; --muted: #a9aaa4; --mint: #b8f3d4; --blue: #b7b2ff; --field: #0c0d0d; }
+    :root { color-scheme: dark; --bg: #080909; --panel: #121414; --line: #2a2d2d; --text: #f1f1ee; --muted: #a9aaa4; --mint: #b8f3d4; --blue: #b7b2ff; --field: #0c0d0d; --alarm: #ffb4a8; }
     * { box-sizing: border-box; }
     body { margin: 0; font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
     main { width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0; }
     header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; border-bottom: 1px solid var(--line); padding-bottom: 18px; }
     h1 { margin: 0; font-size: clamp(24px, 5vw, 44px); line-height: 1; letter-spacing: 0; }
     .pill { border: 1px solid var(--line); border-radius: 999px; padding: 8px 12px; color: var(--mint); white-space: nowrap; }
-    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 22px 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 22px 0; }
+    h2 .count { margin-left: 8px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-size: 12px; vertical-align: middle; }
+    .tablewrap { border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; background: var(--panel); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 10px 14px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    td { padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tr:last-child td { border-bottom: 0; }
+    td a { color: var(--blue); text-decoration: none; }
+    td a:hover { text-decoration: underline; }
+    .pid { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 2px; }
     .card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; min-height: 96px; }
     .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
     .value { margin-top: 10px; font-size: 22px; font-weight: 700; overflow-wrap: anywhere; }
+    .sub { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .card.alarm { border-color: var(--alarm); background: color-mix(in srgb, var(--alarm) 12%, var(--panel)); }
+    .card.alarm .value, .card.alarm .sub { color: var(--alarm); }
+    .banner { margin: 16px 0 0; padding: 12px 14px; border: 1px solid var(--alarm); border-radius: 8px; background: color-mix(in srgb, var(--alarm) 12%, var(--panel)); color: var(--alarm); }
+    .pill.stalled { color: var(--alarm); border-color: var(--alarm); }
+    .tag { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--mint); color: var(--mint); font-size: 11px; letter-spacing: .04em; }
+    .tag.muted-tag { border-color: var(--line); color: var(--muted); }
     section { border-top: 1px solid var(--line); padding-top: 18px; margin-top: 18px; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0c0d0d; border: 1px solid var(--line); border-radius: 8px; padding: 14px; color: var(--muted); }
     form { display: grid; gap: 16px; }
@@ -3334,14 +3393,70 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
         <h1>Chrome Hearts Monitor</h1>
         <p>Cloudflare Worker cron, KV state, Discord product alerts.</p>
       </div>
-      <div class="pill">${escapeHtml(status)}</div>
+      <div class="pill${loopStalled ? " stalled" : ""}">${escapeHtml(status)}</div>
     </header>
     <div class="grid">
-      <div class="card"><div class="label">Seen products</div><div class="value">${seenCount}</div></div>
-      <div class="card"><div class="label">Active listings</div><div class="value">${activeCount}</div></div>
-      <div class="card"><div class="label">Missing watch</div><div class="value">${missingCount}</div></div>
-      <div class="card"><div class="label">Cadence</div><div class="value">${escapeHtml(next)}</div></div>
+      <div class="card${loopStalled ? " alarm" : ""}">
+        <div class="label">Last check</div>
+        <div class="value">${escapeHtml(agoText(staleMs))}</div>
+        <div class="sub">${
+          loopStalled
+            ? `NOT SCANNING — expected every ~${escapeHtml(cadenceSeconds)}s`
+            : `scanning every ~${escapeHtml(cadenceSeconds)}s`
+        }</div>
+      </div>
+      <div class="card"><div class="label">Products tracked</div><div class="value">${activeCount}</div><div class="sub">${seenCount} seen all-time</div></div>
+      <div class="card"><div class="label">Watching for restock</div><div class="value">${missingCount}</div><div class="sub">sold out or delisted</div></div>
+      <div class="card">
+        <div class="label">Last ping</div>
+        <div class="value">${lastPing ? escapeHtml(agoText(Math.max(0, Date.now() - lastPingMs))) : "none yet"}</div>
+        <div class="sub">${lastPing ? escapeHtml(truncate(lastPing.name || lastPing.pid, 42)) : "no alert has fired yet"}</div>
+      </div>
+      <div class="card"><div class="label">Discord servers</div><div class="value">${webhookCount}</div><div class="sub">${escapeHtml(webhookSource)}</div></div>
     </div>
+    ${
+      loopStalled
+        ? `<p class="banner">The monitor has not completed a check for ${escapeHtml(
+            durationText(staleMs)
+          )}. Drops are NOT being detected right now. The 1-minute watchdog retries automatically — if this does not clear within a few minutes, redeploy.</p>`
+        : ""
+    }
+
+    <section>
+      <h2>Alert history</h2>
+      <p class="note">Every product the monitor has pinged Discord about, newest first.</p>
+      ${
+        pingedProducts.length
+          ? `<div class="tablewrap"><table>
+              <thead><tr><th>Product</th><th>Price</th><th>Category</th><th>Pinged</th></tr></thead>
+              <tbody>${pingedProducts
+                .slice(0, 25)
+                .map((entry) => productRow(entry, entry.lastAlertedAt, agoText(Math.max(0, Date.now() - (Date.parse(entry.lastAlertedAt) || 0)))))
+                .join("")}</tbody>
+            </table></div>
+            ${pingedProducts.length > 25 ? `<p class="note">Showing the 25 most recent of ${pingedProducts.length} alerts.</p>` : ""}`
+          : `<p class="note">No alerts have fired yet. Products already in the catalog when the monitor first ran are baselined silently — only genuinely new items ping.</p>`
+      }
+    </section>
+
+    <section>
+      <h2>Products tracked <span class="count">${activeValues.length}</span></h2>
+      <p class="note">Currently live in the catalog, newest first.${
+        missingCount ? ` ${missingCount} ${missingCount === 1 ? "other is" : "others are"} being watched for restock.` : ""
+      }</p>
+      ${
+        activeValues.length
+          ? `<div class="tablewrap"><table>
+              <thead><tr><th>Product</th><th>Price</th><th>Category</th><th>First seen</th></tr></thead>
+              <tbody>${activeValues
+                .slice(0, 100)
+                .map((entry) => productRow(entry, entry.firstSeenAt, agoText(Math.max(0, Date.now() - (Date.parse(entry.firstSeenAt) || 0)))))
+                .join("")}</tbody>
+            </table></div>
+            ${activeValues.length > 100 ? `<p class="note">Showing 100 of ${activeValues.length}.</p>` : ""}`
+          : `<p class="note">Nothing tracked yet — the first full sweep will populate this.</p>`
+      }
+    </section>
 
     <section class="webhooks">
       <div class="actions">
@@ -3354,11 +3469,23 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
           </p>
         </div>
       </div>
-      <p class="note">Alerts fire to <em>every</em> webhook below (one per Discord server). Changes take effect on the next check — about <strong>${escapeHtml(cadenceSeconds)} seconds</strong>, no redeploy.</p>
+      <p class="note">
+        <strong>Product alerts</strong> (new items and restocks) go to <em>every</em> webhook below — one per Discord server.
+        <strong>Everything else</strong> — health warnings, staging/category intel and test alerts — goes to the
+        <strong class="mint">MAIN</strong> webhook only, so other people's servers only ever see real drops.
+        Changes apply on the next check, about <strong>${escapeHtml(cadenceSeconds)} seconds</strong>, no redeploy.
+      </p>
       ${
-        webhookMasked.length
-          ? `<div class="hooklist"><div class="label">Currently active (${webhookMasked.length})</div><ul>${webhookMasked
-              .map((h) => `<li>${escapeHtml(h)}</li>`)
+        webhookRows.length
+          ? `<div class="hooklist"><div class="label">Currently active (${webhookRows.length})</div><ul>${webhookRows
+              .map(
+                (row) =>
+                  `<li>${escapeHtml(row.masked)}${
+                    row.isMain
+                      ? ` <span class="tag">MAIN — also gets health, intel and tests</span>`
+                      : ` <span class="tag muted-tag">product alerts only</span>`
+                  }</li>`
+              )
               .join("")}</ul></div>`
           : `<p class="note">No webhooks configured — alerts have nowhere to go until you add one.</p>`
       }
@@ -3374,7 +3501,10 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
         </div>
         <div class="actions">
           <button type="submit">Save webhooks</button>
-          <p class="note"><a href="/selftest">Send a test alert</a> to every webhook to confirm delivery.</p>
+          <p class="note">
+            <a href="/selftest">Send a test alert</a> — goes to the MAIN webhook only.
+            <a href="/selftest?all=1">Test every webhook</a> if you just added one and want to prove it delivers.
+          </p>
         </div>
       </form>
       <details class="help">
@@ -3384,6 +3514,7 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
           <li><strong>Add a server:</strong> paste the URL, choose <em>Add</em>, and Save. Do this once per server.</li>
           <li><strong>Remove one:</strong> choose <em>Replace</em> and paste only the URLs you want to keep (leave out the one to drop), then Save.</li>
           <li><strong>Remove all:</strong> tick <em>Remove all</em> and Save — the monitor falls back to the Worker-secret webhook.</li>
+          <li><strong>Which one is MAIN?</strong> The first in the list, or whichever <code>DISCORD_MAIN_WEBHOOK_URL</code> is set to. It is the only webhook that receives non-product traffic — health warnings, staging intel and test alerts. Every other server gets product alerts and nothing else.</li>
           <li><strong>Is it live?</strong> Yes — saved webhooks apply on the next check (~${escapeHtml(cadenceSeconds)}s). The "Currently active" list above always reflects what's in effect right now. Use <em>Send a test alert</em> to confirm.</li>
         </ol>
       </details>
@@ -3556,6 +3687,8 @@ async function handleFetch(request, env) {
       },
       settings: {
         webhookCount: (cfg.discordWebhookUrls || []).length,
+        mainWebhook: maskWebhook(mainWebhookUrl(cfg) || ""),
+        mainWebhookSource: cfg.discordMainWebhookUrl ? "configured" : "first-in-list",
         dashboardManagedWebhooks: Array.isArray(settings.discordWebhookUrls) ? settings.discordWebhookUrls.length : 0,
         checkMinIntervalSeconds: cfg.checkMinIntervalSeconds,
         categoryFetchConcurrency: cfg.categoryFetchConcurrency,
