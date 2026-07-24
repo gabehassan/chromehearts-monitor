@@ -792,7 +792,8 @@ test("Worker dashboard saves multiple webhooks and alerts every server", async (
 
 test("/webhooks chips: add with a name, remove one by X, remove several, set MAIN, opt in to intel", async () => {
   const kv = fakeKV(stateWithSeen([{ pid: "OLD_SHOP", name: "OLD SHOP ITEM" }]));
-  const testEnv = env({}, kv);
+  const secretHook = "https://discord.com/api/webhooks/999/secret";
+  const testEnv = env({ DISCORD_WEBHOOK_URL: secretHook }, kv);
   const hookA = "https://discord.com/api/webhooks/111/aaa";
   const hookB = "https://discord.com/api/webhooks/222/bbb";
   const hookC = "https://discord.com/api/webhooks/333/ccc";
@@ -814,15 +815,15 @@ test("/webhooks chips: add with a name, remove one by X, remove several, set MAI
 
   let response = await postWebhooks({ discordWebhookUrls: hookA, webhookName: "Main server" });
   assert.equal(response.status, 303);
-  assert.deepEqual(saved().discordWebhookUrls, [hookA]);
+  assert.deepEqual(saved().discordWebhookUrls, [secretHook, hookA], "the secret webhook is kept, not replaced");
   assert.equal(saved().discordWebhookNames["111"], "Main server");
 
   await postWebhooks({ discordWebhookUrls: hookB, webhookName: "Friends" });
   await postWebhooks({ discordWebhookUrls: hookC });
-  assert.deepEqual(saved().discordWebhookUrls, [hookA, hookB, hookC]);
+  assert.deepEqual(saved().discordWebhookUrls, [secretHook, hookA, hookB, hookC]);
 
   await postWebhooks({ remove: "222" });
-  assert.deepEqual(saved().discordWebhookUrls, [hookA, hookC]);
+  assert.deepEqual(saved().discordWebhookUrls, [secretHook, hookA, hookC]);
   assert.equal(saved().discordWebhookNames["222"], undefined, "its label is dropped too");
 
   await postWebhooks({ webhookPrefs: "1", mainWebhook: "333", verbose: "111" });
@@ -831,14 +832,16 @@ test("/webhooks chips: add with a name, remove one by X, remove several, set MAI
 
   // Ticking several chips removes them together.
   await postWebhooks({ selected: ["111", "333"] });
-  assert.equal(saved().discordWebhookUrls, undefined, "removing all reverts to the Worker secret");
+  assert.deepEqual(saved().discordWebhookUrls, [secretHook], "only the untouched secret webhook remains");
+  await postWebhooks({ remove: "999" });
+  assert.equal(saved().discordWebhookUrls, undefined, "a secret-configured webhook is removable by its chip too");
   assert.equal(saved().discordMainWebhookUrl, undefined, "a MAIN that no longer exists is not kept");
 
   // A bad URL is rejected without corrupting the saved list.
   await postWebhooks({ discordWebhookUrls: hookA });
   const bad = await postWebhooks({ discordWebhookUrls: "https://example.com/not-discord" });
   assert.equal(bad.status, 400);
-  assert.deepEqual(saved().discordWebhookUrls, [hookA]);
+  assert.deepEqual(saved().discordWebhookUrls, [secretHook, hookA]);
 
   // Explicit clear still works.
   await postWebhooks({ clearDiscordWebhook: "on" });

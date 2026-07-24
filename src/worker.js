@@ -738,7 +738,7 @@ async function saveSettingsFromRequest(request, env, cfg) {
     next[key] = formData.get(key) === "on";
   }
 
-  applyWebhookForm(next, current, formData);
+  applyWebhookForm(next, current, formData, cfg.discordWebhookUrls || []);
 
   await env.STATE.put(cfg.settingsKey, JSON.stringify(next));
   return next;
@@ -749,9 +749,10 @@ function webhookIdFromUrl(url) {
   return match ? match[1] : "";
 }
 
-function applyWebhookForm(next, current, formData) {
+function applyWebhookForm(next, current, formData, effectiveUrls = []) {
   delete next.discordWebhookUrl; // migrate off the legacy single-URL key
-  const existing = Array.isArray(current.discordWebhookUrls) ? current.discordWebhookUrls.filter(Boolean) : [];
+  const saved = Array.isArray(current.discordWebhookUrls) ? current.discordWebhookUrls.filter(Boolean) : [];
+  const existing = saved.length ? saved : (effectiveUrls || []).filter((url) => url && isValidDiscordWebhookUrl(url));
   const names = { ...(current.discordWebhookNames && typeof current.discordWebhookNames === "object" ? current.discordWebhookNames : {}) };
 
   // Remove: one chip's X, plus any ticked checkboxes.
@@ -814,7 +815,7 @@ function applyWebhookForm(next, current, formData) {
 async function saveWebhooksFromRequest(request, env, cfg) {
   const current = await loadSettings(env, cfg);
   const formData = await request.formData();
-  const next = applyWebhookForm({ ...current, updatedAt: nowIso() }, current, formData);
+  const next = applyWebhookForm({ ...current, updatedAt: nowIso() }, current, formData, cfg.discordWebhookUrls || []);
   await env.STATE.put(cfg.settingsKey, JSON.stringify(next));
   return next;
 }
@@ -2740,17 +2741,26 @@ async function sleep(ms) {
 
 async function postToWebhook(cfg, webhookUrl, payload) {
   for (let attempt = 0; attempt < 4; attempt += 1) {
-    const response = await fetchWithTimeout(
-      webhookUrl,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
-        body: JSON.stringify(payload),
-        cache: "no-store"
-      },
-      cfg.webhookTimeoutMs,
-      cfg
-    );
+    let response;
+    try {
+      response = await fetchWithTimeout(
+        webhookUrl,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "user-agent": cfg.userAgent },
+          body: JSON.stringify(payload),
+          cache: "no-store"
+        },
+        cfg.webhookTimeoutMs,
+        cfg
+      );
+    } catch {
+      if (attempt < 3) {
+        await sleep(400 * (attempt + 1));
+        continue;
+      }
+      return false;
+    }
     if (response.ok) return true;
     if (response.status === 429 && attempt < 3) {
       const retryAfter = Number.parseFloat(response.headers.get("retry-after") || "1");
