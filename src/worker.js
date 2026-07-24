@@ -628,6 +628,12 @@ function applyRuntimeSettings(cfg, settings) {
       next.discordMainWebhookUrl = settings.discordMainWebhookUrl;
     }
   }
+  if (settings.discordWebhookNames && typeof settings.discordWebhookNames === "object") {
+    next.discordWebhookNames = settings.discordWebhookNames;
+  }
+  if (Array.isArray(settings.discordWebhookVerbose)) {
+    next.discordWebhookVerbose = settings.discordWebhookVerbose.map((id) => String(id));
+  }
   if (next.discordMainWebhookUrl) {
     next.discordWebhookUrls = uniqueValues([next.discordMainWebhookUrl, ...(next.discordWebhookUrls || [])]);
   }
@@ -738,18 +744,69 @@ async function saveSettingsFromRequest(request, env, cfg) {
   return next;
 }
 
+function webhookIdFromUrl(url) {
+  const match = String(url || "").match(/\/api\/webhooks\/(\d+)\//);
+  return match ? match[1] : "";
+}
+
 function applyWebhookForm(next, current, formData) {
   delete next.discordWebhookUrl; // migrate off the legacy single-URL key
+  const existing = Array.isArray(current.discordWebhookUrls) ? current.discordWebhookUrls.filter(Boolean) : [];
+  const names = { ...(current.discordWebhookNames && typeof current.discordWebhookNames === "object" ? current.discordWebhookNames : {}) };
+
+  // Remove: one chip's X, plus any ticked checkboxes.
+  const removeIds = new Set(
+    [formData.get("remove"), ...formData.getAll("selected")]
+      .flatMap((value) => String(value || "").split(","))
+      .map((value) => value.trim())
+      .filter(Boolean)
+  );
+  let list = removeIds.size ? existing.filter((url) => !removeIds.has(webhookIdFromUrl(url))) : existing;
+  for (const id of removeIds) delete names[id];
+
   const submitted = validateDiscordWebhookList(formData.get("discordWebhookUrls") || formData.get("discordWebhookUrl"));
+  if (submitted.length) {
+    list = uniqueValues([...list, ...submitted]);
+    const label = String(formData.get("webhookName") || "").trim().slice(0, 40);
+    if (label && submitted.length === 1) names[webhookIdFromUrl(submitted[0])] = label;
+  }
+
+  // Rename an existing chip in place.
+  const renameId = String(formData.get("renameId") || "").trim();
+  if (renameId) {
+    const label = String(formData.get("renameTo") || "").trim().slice(0, 40);
+    if (label) names[renameId] = label;
+    else delete names[renameId];
+  }
+
   if (formData.get("clearDiscordWebhook") === "on") {
     delete next.discordWebhookUrls;
-  } else if (formData.get("webhookMode") === "add") {
-    const existing = Array.isArray(current.discordWebhookUrls) ? current.discordWebhookUrls : [];
-    if (submitted.length) next.discordWebhookUrls = uniqueValues([...existing, ...submitted]);
-  } else if (submitted.length) {
-    next.discordWebhookUrls = submitted;
-  } else if (Array.isArray(current.discordWebhookUrls)) {
-    next.discordWebhookUrls = current.discordWebhookUrls;
+    delete next.discordWebhookNames;
+    return next;
+  }
+
+  if (list.length) next.discordWebhookUrls = list;
+  else delete next.discordWebhookUrls;
+  // Drop labels for webhooks that are no longer configured.
+  const liveIds = new Set(list.map(webhookIdFromUrl));
+  for (const id of Object.keys(names)) if (!liveIds.has(id)) delete names[id];
+  if (Object.keys(names).length) next.discordWebhookNames = names;
+  else delete next.discordWebhookNames;
+
+  const mainId = String(formData.get("mainWebhook") || "").trim();
+  if (mainId) {
+    const mainUrl = list.find((url) => webhookIdFromUrl(url) === mainId);
+    if (mainUrl) next.discordMainWebhookUrl = mainUrl;
+  }
+  if (next.discordMainWebhookUrl && !list.includes(next.discordMainWebhookUrl)) delete next.discordMainWebhookUrl;
+
+  if (formData.get("webhookPrefs") === "1") {
+    const verbose = formData.getAll("verbose").map((value) => String(value || "").trim()).filter((id) => liveIds.has(id));
+    if (verbose.length) next.discordWebhookVerbose = uniqueValues(verbose);
+    else delete next.discordWebhookVerbose;
+  } else if (Array.isArray(next.discordWebhookVerbose)) {
+    next.discordWebhookVerbose = next.discordWebhookVerbose.filter((id) => liveIds.has(id));
+    if (!next.discordWebhookVerbose.length) delete next.discordWebhookVerbose;
   }
   return next;
 }
@@ -2710,15 +2767,25 @@ function mainWebhookUrl(cfg) {
   return cfg.discordMainWebhookUrl || configured[0] || null;
 }
 
+function operationalWebhookUrls(cfg) {
+  const main = mainWebhookUrl(cfg);
+  const opted = new Set(Array.isArray(cfg.discordWebhookVerbose) ? cfg.discordWebhookVerbose : []);
+  const extra = (cfg.discordWebhookUrls || []).filter((url) => url !== main && opted.has(webhookIdFromUrl(url)));
+  return [main, ...extra].filter(Boolean);
+}
+
 async function postToMainWebhook(cfg, payload) {
-  const webhookUrl = mainWebhookUrl(cfg);
-  if (!webhookUrl) return false;
-  try {
-    await postToWebhook(cfg, webhookUrl, payload);
-    return true;
-  } catch {
-    return false;
-  }
+  const targets = operationalWebhookUrls(cfg);
+  if (!targets.length) return false;
+  const results = await Promise.all(
+    targets.map((webhookUrl) =>
+      postToWebhook(cfg, webhookUrl, payload).then(
+        () => true,
+        () => false
+      )
+    )
+  );
+  return results.some(Boolean);
 }
 
 const baselineMarkersEnsured = new Set();
@@ -3282,6 +3349,15 @@ function checked(value) {
   return value ? " checked" : "";
 }
 
+function numField(name, label, value, min, max, defaultValue, help = "") {
+  return `<div class="field num">
+      <label for="${name}">${escapeHtml(label)} <span class="deflt">default: ${escapeHtml(defaultValue)}</span></label>
+      <input id="${name}" name="${name}" type="number" min="${escapeHtml(min)}" max="${escapeHtml(max)}" value="${escapeHtml(value)}"${
+    help ? ` title="${escapeHtml(help)}"` : ""
+  }>
+    </div>`;
+}
+
 function dashboard(state, cfg, settings = {}, flags = {}) {
   const saved = flags.saved === true;
   const webhooksSaved = flags.webhooksSaved ?? null;
@@ -3359,10 +3435,18 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
     <td title="${escapeHtml(whenIso || "")}">${escapeHtml(whenLabel)}</td>
   </tr>`;
   const mainHook = mainWebhookUrl(cfg);
-  const webhookRows = (cfg.discordWebhookUrls || []).map((url) => ({
-    masked: maskWebhook(url),
-    isMain: url === mainHook
-  }));
+  const hookNames = cfg.discordWebhookNames && typeof cfg.discordWebhookNames === "object" ? cfg.discordWebhookNames : {};
+  const verboseIds = new Set(Array.isArray(cfg.discordWebhookVerbose) ? cfg.discordWebhookVerbose : []);
+  const webhookRows = (cfg.discordWebhookUrls || []).map((url) => {
+    const id = webhookIdFromUrl(url);
+    return {
+      id,
+      name: hookNames[id] || `Webhook ${id.slice(-4)}`,
+      masked: maskWebhook(url),
+      isMain: url === mainHook,
+      verbose: verboseIds.has(id)
+    };
+  });
 
   return `<!doctype html>
 <html lang="en">
@@ -3406,6 +3490,31 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
     .pill.stalled { color: var(--alarm); border-color: var(--alarm); }
     .tag { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--mint); color: var(--mint); font-size: 11px; letter-spacing: .04em; }
     .tag.muted-tag { border-color: var(--line); color: var(--muted); }
+    .chips { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 14px; }
+    .chip { display: flex; align-items: center; gap: 12px; padding: 8px 10px 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--field); flex-wrap: wrap; }
+    .chip.main { border-color: var(--mint); }
+    .chip-body { display: flex; flex-direction: column; min-width: 200px; flex: 1 1 220px; }
+    .chip-name { font-weight: 600; }
+    .chip-url { color: var(--muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .chip-opt { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
+    .chip.main .chip-opt input[type=radio] { accent-color: var(--mint); }
+    .chip-pick { display: inline-flex; align-items: center; }
+    .chip-x { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 8px; width: 30px; height: 30px; font-size: 17px; line-height: 1; cursor: pointer; padding: 0; }
+    .chip-x:hover { border-color: var(--alarm); color: var(--alarm); }
+    .addhook { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+    .addhook .field { margin: 0; }
+    .addhook .field.grow { flex: 1 1 340px; }
+    .hint { color: var(--muted); font-weight: 400; font-size: 11px; }
+    button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+    button.ghost:hover { border-color: var(--alarm); color: var(--alarm); }
+    fieldset.group { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px 16px; margin: 0 0 14px; }
+    fieldset.group legend { padding: 0 8px; color: var(--text); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .group-note { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+    .fields { display: flex; flex-wrap: wrap; gap: 14px; }
+    .fields .field { margin: 0; }
+    .field.num { width: 150px; }
+    .field.wide { flex: 1 1 100%; }
+    .field .deflt { color: var(--muted); font-weight: 400; font-size: 11px; }
     section { border-top: 1px solid var(--line); padding-top: 18px; margin-top: 18px; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0c0d0d; border: 1px solid var(--line); border-radius: 8px; padding: 14px; color: var(--muted); }
     form { display: grid; gap: 16px; }
@@ -3531,36 +3640,53 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
       </p>
       ${
         webhookRows.length
-          ? `<div class="hooklist"><div class="label">Currently active (${webhookRows.length})</div><ul>${webhookRows
-              .map(
-                (row) =>
-                  `<li>${escapeHtml(row.masked)}${
-                    row.isMain
-                      ? ` <span class="tag">MAIN — also gets health, intel and tests</span>`
-                      : ` <span class="tag muted-tag">product alerts only</span>`
-                  }</li>`
-              )
-              .join("")}</ul></div>`
+          ? `<form action="/webhooks" method="post">
+              <input type="hidden" name="webhookPrefs" value="1">
+              <div class="chips">${webhookRows
+                .map(
+                  (row) => `<div class="chip${row.isMain ? " main" : ""}">
+                    <label class="chip-pick"><input type="checkbox" name="selected" value="${escapeHtml(row.id)}"></label>
+                    <span class="chip-body">
+                      <span class="chip-name">${escapeHtml(row.name)}</span>
+                      <span class="chip-url">${escapeHtml(row.masked)}</span>
+                    </span>
+                    <label class="chip-opt" title="Make this the MAIN webhook — it receives everything and is the target for test alerts">
+                      <input type="radio" name="mainWebhook" value="${escapeHtml(row.id)}"${row.isMain ? " checked" : ""}> MAIN
+                    </label>
+                    <label class="chip-opt" title="Also send staging intel, new-category notices and health warnings to this server">
+                      <input type="checkbox" name="verbose" value="${escapeHtml(row.id)}"${row.verbose || row.isMain ? " checked" : ""}${
+                    row.isMain ? " disabled" : ""
+                  }> + intel
+                    </label>
+                    <button class="chip-x" type="submit" name="remove" value="${escapeHtml(row.id)}" title="Remove this webhook" aria-label="Remove ${escapeHtml(
+                    row.name
+                  )}">×</button>
+                  </div>`
+                )
+                .join("")}</div>
+              <div class="actions">
+                <button type="submit">Save webhook settings</button>
+                <button class="ghost" type="submit" name="removeSelected" value="1">Remove selected</button>
+                <p class="note">Tick the boxes to remove several at once, or click a chip's × to remove just that one.</p>
+              </div>
+            </form>`
           : `<p class="note">No webhooks configured — alerts have nowhere to go until you add one.</p>`
       }
-      <form action="/webhooks" method="post">
+      <form action="/webhooks" method="post" class="addhook">
         <div class="field">
-          <label for="discordWebhookUrls">Webhook URLs — one per line</label>
-          <textarea id="discordWebhookUrls" name="discordWebhookUrls" autocomplete="off" placeholder="https://discord.com/api/webhooks/AAA/token&#10;https://discord.com/api/webhooks/BBB/token"></textarea>
+          <label for="webhookName">Name <span class="hint">optional — e.g. "Main server"</span></label>
+          <input id="webhookName" name="webhookName" type="text" maxlength="40" autocomplete="off" placeholder="Spidey Bot">
         </div>
-        <div class="checks">
-          <label class="check"><input name="webhookMode" type="radio" value="add" checked> <strong>Add</strong> these to the current list</label>
-          <label class="check"><input name="webhookMode" type="radio" value="replace"> <strong>Replace</strong> the whole list with these</label>
-          <label class="check"><input name="clearDiscordWebhook" type="checkbox"> <strong>Remove all</strong> (revert to the Worker-secret webhook)</label>
+        <div class="field grow">
+          <label for="discordWebhookUrls">Webhook URL</label>
+          <input id="discordWebhookUrls" name="discordWebhookUrls" type="text" autocomplete="off" placeholder="https://discord.com/api/webhooks/…">
         </div>
-        <div class="actions">
-          <button type="submit">Save webhooks</button>
-          <p class="note">
-            <a href="/selftest">Send a test alert</a> — goes to the MAIN webhook only.
-            <a href="/selftest?all=1">Test every webhook</a> if you just added one and want to prove it delivers.
-          </p>
-        </div>
+        <button type="submit">Add webhook</button>
       </form>
+      <p class="note">
+        <a href="/selftest">Send a test alert</a> — goes to the MAIN webhook only.
+        <a href="/selftest?all=1">Test every webhook</a> if you just added one and want to prove it delivers.
+      </p>
       <details class="help">
         <summary>How to add or remove a webhook</summary>
         <ol>
@@ -3583,63 +3709,56 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
           </div>
           <button type="submit">Save settings</button>
         </div>
-        <div class="form-grid">
-          <div class="field">
-            <label for="checkMinIntervalSeconds">Minimum interval seconds</label>
-            <input id="checkMinIntervalSeconds" name="checkMinIntervalSeconds" type="number" min="0" max="3600" value="${escapeHtml(cfg.checkMinIntervalSeconds)}">
+        <fieldset class="group">
+          <legend>Alerting</legend>
+          <p class="group-note">How much the monitor is allowed to say, and how quickly a sold-out item counts as relisted.</p>
+          <div class="fields">
+            ${numField("maxAlertsPerRun", "Max alerts per run", cfg.maxAlertsPerRun, 1, 10, 5, "Extra finds wait for the next tick — none are dropped.")}
+            ${numField("relistAfterAbsentRuns", "Relist after absent runs", cfg.relistAfterAbsentRuns, 1, 12, 2, "Full sweeps a product must be missing before a restock re-alerts.")}
+            ${numField("checkMinIntervalSeconds", "Min interval (s)", cfg.checkMinIntervalSeconds, 0, 3600, 0, "Throttle for manual /api/cron runs only. The fast loop ignores it.")}
           </div>
-          <div class="field">
-            <label for="maxAlertsPerRun">Max alerts per run</label>
-            <input id="maxAlertsPerRun" name="maxAlertsPerRun" type="number" min="1" max="10" value="${escapeHtml(cfg.maxAlertsPerRun)}">
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>Coverage</legend>
+          <p class="group-note">How much of the catalog each sweep reaches. Higher means fewer blind spots and more fetches.</p>
+          <div class="fields">
+            ${numField("maxCategoryIds", "Max categories", cfg.maxCategoryIds, 1, 400, 250)}
+            ${numField("maxCategoryPages", "Pages per category", cfg.maxCategoryPages, 1, 5, 2)}
+            ${numField("prospectiveCategoryShardSize", "Hidden category shard", cfg.prospectiveCategoryShardSize, 1, 400, 60, "Rotation size when the SELF fan-out is unavailable.")}
+            ${numField("maxPages", "Root pages", cfg.maxPages, 1, 20, 10)}
+            ${numField("maxDirectProductUrls", "Direct product URLs", cfg.maxDirectProductUrls, 0, 50, 4)}
+            <div class="field wide">
+              <label for="extraCategoryIds">Extra categories <span class="deflt">default: none</span></label>
+              <input id="extraCategoryIds" name="extraCategoryIds" type="text" value="${escapeHtml(extraCategoryIds)}" placeholder="hat, hoodie, jewelry">
+            </div>
+            <div class="field wide">
+              <label for="extraProductUrls">Extra product URLs <span class="deflt">default: none — one per line</span></label>
+              <textarea id="extraProductUrls" name="extraProductUrls" placeholder="https://www.chromehearts.com/category/item/PID.html">${escapeHtml(extraProductUrls)}</textarea>
+            </div>
           </div>
-          <div class="field">
-            <label for="maxCategoryIds">Max categories</label>
-            <input id="maxCategoryIds" name="maxCategoryIds" type="number" min="1" max="400" value="${escapeHtml(cfg.maxCategoryIds)}">
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>Fetch budget</legend>
+          <p class="group-note">Guard rails against the Workers subrequest cap. Raising these on the free plan risks "too many subrequests".</p>
+          <div class="fields">
+            ${numField("categoryFetchConcurrency", "Grid concurrency", cfg.categoryFetchConcurrency, 1, 24, 20)}
+            ${numField("maxStorefrontSubrequests", "Storefront fetches", cfg.maxStorefrontSubrequests, 10, 400, 40)}
           </div>
-          <div class="field">
-            <label for="categoryFetchConcurrency">Grid concurrency</label>
-            <input id="categoryFetchConcurrency" name="categoryFetchConcurrency" type="number" min="1" max="24" value="${escapeHtml(cfg.categoryFetchConcurrency)}">
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>Discovery &amp; stock</legend>
+          <p class="group-note">Where new category slugs are learned from, and whether exact stock counts are probed.</p>
+          <div class="checks">
+            <label class="check"><input name="discoverSitemapCategories" type="checkbox"${checked(cfg.discoverSitemapCategories)}> Sitemap categories <span class="deflt">on</span></label>
+            <label class="check"><input name="discoverHomepageCategories" type="checkbox"${checked(cfg.discoverHomepageCategories)}> Homepage categories <span class="deflt">on</span></label>
+            <label class="check"><input name="discoverProductUrlCategories" type="checkbox"${checked(cfg.discoverProductUrlCategories)}> Product URL categories <span class="deflt">on</span></label>
+            <label class="check"><input name="discoverRobotsProducts" type="checkbox"${checked(cfg.discoverRobotsProducts)}> Robots product URLs <span class="deflt">on</span></label>
+            <label class="check"><input name="probeExactStock" type="checkbox"${checked(cfg.probeExactStock)}> Exact stock probe <span class="deflt">on</span></label>
           </div>
-          <div class="field">
-            <label for="maxCategoryPages">Pages per category</label>
-            <input id="maxCategoryPages" name="maxCategoryPages" type="number" min="1" max="5" value="${escapeHtml(cfg.maxCategoryPages)}">
-          </div>
-          <div class="field">
-            <label for="prospectiveCategoryShardSize">Hidden category shard</label>
-            <input id="prospectiveCategoryShardSize" name="prospectiveCategoryShardSize" type="number" min="1" max="400" value="${escapeHtml(cfg.prospectiveCategoryShardSize)}">
-          </div>
-          <div class="field">
-            <label for="maxDirectProductUrls">Direct product URLs</label>
-            <input id="maxDirectProductUrls" name="maxDirectProductUrls" type="number" min="0" max="50" value="${escapeHtml(cfg.maxDirectProductUrls)}">
-          </div>
-          <div class="field">
-            <label for="maxStorefrontSubrequests">Storefront fetch budget</label>
-            <input id="maxStorefrontSubrequests" name="maxStorefrontSubrequests" type="number" min="10" max="400" value="${escapeHtml(cfg.maxStorefrontSubrequests)}">
-          </div>
-          <div class="field">
-            <label for="maxPages">Root pages</label>
-            <input id="maxPages" name="maxPages" type="number" min="1" max="20" value="${escapeHtml(cfg.maxPages)}">
-          </div>
-          <div class="field">
-            <label for="relistAfterAbsentRuns">Relist absent runs</label>
-            <input id="relistAfterAbsentRuns" name="relistAfterAbsentRuns" type="number" min="1" max="12" value="${escapeHtml(cfg.relistAfterAbsentRuns)}">
-          </div>
-          <div class="field">
-            <label for="extraCategoryIds">Extra categories</label>
-            <input id="extraCategoryIds" name="extraCategoryIds" type="text" value="${escapeHtml(extraCategoryIds)}" placeholder="hat, hoodie, jewelry">
-          </div>
-          <div class="field">
-            <label for="extraProductUrls">Extra product URLs</label>
-            <textarea id="extraProductUrls" name="extraProductUrls" placeholder="https://www.chromehearts.com/category/item/PID.html">${escapeHtml(extraProductUrls)}</textarea>
-          </div>
-        </div>
-        <div class="checks">
-          <label class="check"><input name="discoverSitemapCategories" type="checkbox"${checked(cfg.discoverSitemapCategories)}> Sitemap categories</label>
-          <label class="check"><input name="discoverHomepageCategories" type="checkbox"${checked(cfg.discoverHomepageCategories)}> Homepage categories</label>
-          <label class="check"><input name="discoverProductUrlCategories" type="checkbox"${checked(cfg.discoverProductUrlCategories)}> Product URL categories</label>
-          <label class="check"><input name="discoverRobotsProducts" type="checkbox"${checked(cfg.discoverRobotsProducts)}> Robots product URLs</label>
-          <label class="check"><input name="probeExactStock" type="checkbox"${checked(cfg.probeExactStock)}> Exact stock probe</label>
-        </div>
+        </fieldset>
       </form>
     </section>
     <section>
