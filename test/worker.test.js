@@ -1955,3 +1955,233 @@ test("extractGridPids is a faithful superset of parseProducts (coverage gate saf
   }
   assert.equal(extractGridPids('<div class="search-result-content"></div>').size, 0);
 });
+
+function fakeDoStorage(initial = {}) {
+  const values = new Map(Object.entries(initial));
+  let alarm = null;
+  return {
+    values,
+    alarmCalls: 0,
+    deleteAlarmCalls: 0,
+    async get(key) {
+      if (Array.isArray(key)) {
+        return new Map(key.filter((k) => values.has(k)).map((k) => [k, values.get(k)]));
+      }
+      return values.has(key) ? values.get(key) : undefined;
+    },
+    async put(keyOrEntries, value) {
+      if (keyOrEntries && typeof keyOrEntries === "object") {
+        for (const [k, v] of Object.entries(keyOrEntries)) values.set(k, v);
+        return;
+      }
+      values.set(keyOrEntries, value);
+    },
+    async delete(key) {
+      for (const k of Array.isArray(key) ? key : [key]) values.delete(k);
+    },
+    async list({ prefix = "", reverse = false, limit = 1000 } = {}) {
+      const keys = [...values.keys()].filter((k) => k.startsWith(prefix)).sort();
+      if (reverse) keys.reverse();
+      return new Map(keys.slice(0, limit).map((k) => [k, values.get(k)]));
+    },
+    async getAlarm() {
+      return alarm;
+    },
+    async setAlarm(time) {
+      alarm = time;
+      this.alarmCalls += 1;
+    },
+    async deleteAlarm() {
+      alarm = null;
+      this.deleteAlarmCalls += 1;
+    }
+  };
+}
+
+test("Watchdog resurrects a wedged loop left holding a past-due alarm", async () => {
+  const { MonitorController } = await import("../src/worker.js");
+  const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000;
+  const storage = fakeDoStorage({ lastTickAt: new Date(sixHoursAgo).toISOString() });
+  await storage.setAlarm(sixHoursAgo);
+  const controller = new MonitorController({ storage }, env({ FAST_POLL_ENABLED: "true" }));
+
+  const result = await controller.ensure();
+
+  assert.equal(result.armed, true);
+  assert.equal(result.rearmed, true, "a past-due alarm must be treated as dead, not as healthy");
+  const next = await storage.getAlarm();
+  assert.ok(next > Date.now(), "watchdog scheduled a fresh alarm in the future");
+});
+
+test("Watchdog re-arms on a stale heartbeat even when an alarm looks pending", async () => {
+  const { MonitorController } = await import("../src/worker.js");
+  const storage = fakeDoStorage({ lastTickAt: new Date(Date.now() - 30 * 60 * 1000).toISOString() });
+  await storage.setAlarm(Date.now() + 60 * 60 * 1000);
+  const controller = new MonitorController({ storage }, env({ FAST_POLL_ENABLED: "true" }));
+
+  const result = await controller.ensure();
+
+  assert.equal(result.rearmed, true, "heartbeat is the liveness signal, not the alarm timestamp");
+  assert.equal(result.reason, "stale-heartbeat");
+  assert.ok((await storage.getAlarm()) < Date.now() + 10000, "loop restarts immediately, not in an hour");
+});
+
+test("Watchdog leaves a healthy running loop alone", async () => {
+  const { MonitorController } = await import("../src/worker.js");
+  const storage = fakeDoStorage({ lastTickAt: new Date(Date.now() - 3000).toISOString() });
+  const scheduled = Date.now() + 9000;
+  await storage.setAlarm(scheduled);
+  const controller = new MonitorController({ storage }, env({ FAST_POLL_ENABLED: "true" }));
+  const before = storage.alarmCalls;
+
+  const result = await controller.ensure();
+
+  assert.equal(result.rearmed, undefined, "a live loop is not disturbed");
+  assert.equal(storage.alarmCalls, before, "no redundant setAlarm on a healthy loop");
+  assert.equal(await storage.getAlarm(), scheduled);
+});
+
+test("A failing config read cannot orphan the alarm loop", async () => {
+  const { MonitorController } = await import("../src/worker.js");
+  const storage = fakeDoStorage();
+  const kv = fakeKV();
+  kv.get = async () => {
+    throw new Error("KV unavailable");
+  };
+  const controller = new MonitorController({ storage }, env({ FAST_POLL_ENABLED: "true" }, kv));
+
+  await controller.alarm();
+
+  const alarm = await storage.getAlarm();
+  assert.ok(alarm && alarm > Date.now(), "alarm is armed before any fallible work, so a KV blip costs one tick");
+  assert.equal(storage.deleteAlarmCalls, 0, "a transient config failure must not stop the loop");
+});
+
+test("An explicit disable stops the loop, and only that", async () => {
+  const { MonitorController } = await import("../src/worker.js");
+  const storage = fakeDoStorage();
+  const controller = new MonitorController({ storage }, env({ FAST_POLL_ENABLED: "false" }));
+
+  await controller.alarm();
+
+  assert.equal(await storage.getAlarm(), null, "fast poll off means the loop parks");
+  assert.ok(storage.deleteAlarmCalls > 0);
+});
+
+test("A lost state key re-baselines LOUDLY instead of silently swallowing the catalog", async () => {
+  const live = productTile("LOST_STATE_PID", "SILENT MISS TEE", "shop", "Shop", "395.00");
+  const kv = fakeKV(withStagingBaseline({ seen: {}, active: {}, missing: {} }));
+  kv.values.set(`${STATE_KEY}:baselined`, JSON.stringify({ at: new Date().toISOString() }));
+  const mock = createChromeHeartsFetch({ root: live });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          ENUMERATION_ENABLED: "false"
+        },
+        kv
+      )
+    );
+    assert.equal(result.baseline, true, "still re-baselines rather than storming stale products");
+    const titles = mock.discordPayloads.map((payload) => payload.embeds?.[0]?.title).filter(Boolean);
+    assert.ok(
+      titles.some((title) => /state lost/i.test(title)),
+      `state loss must be announced; got titles ${JSON.stringify(titles)}`
+    );
+  });
+});
+
+test("A genuine first run baselines silently (no false state-loss alarm)", async () => {
+  const live = productTile("FIRST_RUN_PID", "FIRST RUN TEE", "shop", "Shop", "395.00");
+  const freshKey = "state-first-run";
+  const kv = fakeKV(withStagingBaseline({ seen: {}, active: {}, missing: {} }));
+  kv.values.set(freshKey, kv.values.get(STATE_KEY));
+  const mock = createChromeHeartsFetch({ root: live });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          STATE_KEY: freshKey,
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          ENUMERATION_ENABLED: "false"
+        },
+        kv
+      )
+    );
+    assert.equal(result.baseline, true);
+    const titles = mock.discordPayloads.map((payload) => payload.embeds?.[0]?.title).filter(Boolean);
+    assert.ok(!titles.some((title) => /state lost/i.test(title)), "first run must not cry state-loss");
+    assert.ok(kv.values.get(`${freshKey}:baselined`), "baseline marker persisted for future loss detection");
+  });
+});
+
+const MAIN_HOOK = "https://discord.com/api/webhooks/1111111111/main-token";
+const SECOND_HOOK = "https://discord.com/api/webhooks/2222222222/second-token";
+
+test("Item alerts fan out to EVERY webhook", async () => {
+  const keep = productTile("KEEP_ROUTE", "KEEP ROUTE ITEM", "shop", "Shop", "100.00");
+  const fresh = productTile("ROUTE_NEW", "ROUTED DROP", "shop", "Shop", "250.00");
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "KEEP_ROUTE", name: "KEEP ROUTE ITEM" }])));
+  const mock = createChromeHeartsFetch({
+    root: `${keep}${fresh}`,
+    productDetails: { ROUTE_NEW: { name: "ROUTED DROP", categoryName: "Shop", price: "250.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerOnce(
+      env(
+        {
+          DISCORD_WEBHOOK_URL: `${MAIN_HOOK} ${SECOND_HOOK}`,
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          ENUMERATION_ENABLED: "false"
+        },
+        kv
+      )
+    );
+    assert.equal(result.alerted, 1);
+    assert.ok(mock.discordUrls.some((url) => url.includes("main-token")), "main server got the drop");
+    assert.ok(mock.discordUrls.some((url) => url.includes("second-token")), "second server got the drop too");
+  });
+});
+
+test("Non-item pings go to the MAIN webhook only", async () => {
+  const live = productTile("ROUTE_LOST", "STATE LOSS ITEM", "shop", "Shop", "395.00");
+  const kv = fakeKV(withStagingBaseline({ seen: {}, active: {}, missing: {} }));
+  kv.values.set(`${STATE_KEY}:baselined`, JSON.stringify({ at: new Date().toISOString() }));
+  const mock = createChromeHeartsFetch({ root: live });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    await runWorkerOnce(
+      env(
+        {
+          DISCORD_WEBHOOK_URL: `${MAIN_HOOK} ${SECOND_HOOK}`,
+          DISCOVER_HOMEPAGE_CATEGORIES: "false",
+          DISCOVER_PRODUCT_URL_CATEGORIES: "false",
+          DISCOVER_SITEMAP_CATEGORIES: "false",
+          DISCOVER_ROBOTS_PRODUCTS: "false",
+          MAX_DIRECT_PRODUCT_URLS: "0",
+          ENUMERATION_ENABLED: "false"
+        },
+        kv
+      )
+    );
+    assert.ok(mock.discordUrls.length > 0, "state loss was announced");
+    assert.ok(mock.discordUrls.every((url) => url.includes("main-token")), `only main may be pinged, got ${JSON.stringify(mock.discordUrls)}`);
+    assert.ok(!mock.discordUrls.some((url) => url.includes("second-token")), "second server must not get plumbing pings");
+  });
+});

@@ -12,6 +12,7 @@ const DEFAULT_SETTINGS_KEY = "chrome-hearts:cloudflare:settings";
 const DEFAULT_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const DO_SINGLETON_NAME = "chrome-hearts-monitor";
+const DO_FLUSH_EVERY_TICKS = 20;
 const RESERVED_CATEGORY_IDS = new Set([
   "account",
   "cart",
@@ -1798,9 +1799,43 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
     }
   });
 
+  const retryIndexes = results.map((result, index) => (result ? -1 : index)).filter((index) => index >= 0);
+  if (retryIndexes.length && retryIndexes.length < slices.length) {
+    const retried = await mapWithConcurrency(retryIndexes, 10, async (index) => {
+      const slice = slices[index];
+      try {
+        spendSubrequest(cfg);
+        const response = await env.SELF.fetch("https://monitor.internal/internal/scan-grids", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${cfg.cronSecret}` },
+          body: JSON.stringify({
+            cgids: slice.filter((item) => item.kind === "c").map((item) => item.value),
+            queries: slice.filter((item) => item.kind === "q").map((item) => item.value)
+          })
+        });
+        if (!response.ok) return null;
+        const body = await response.json();
+        return body && body.ok ? body : null;
+      } catch {
+        return null;
+      }
+    });
+    retryIndexes.forEach((sliceIndex, position) => {
+      if (retried[position]) results[sliceIndex] = retried[position];
+    });
+  }
+
   const okResults = results.filter(Boolean);
   if (!okResults.length) return null;
-  const merged = { products: {}, activeCgids: [], failed: [], slices: slices.length, slicesOk: okResults.length, scanned: 0 };
+  const merged = {
+    products: {},
+    activeCgids: [],
+    failed: [],
+    slices: slices.length,
+    slicesOk: okResults.length,
+    slicesRetried: retryIndexes.length,
+    scanned: 0
+  };
   for (const result of okResults) {
     Object.assign(merged.products, result.products || {});
     merged.activeCgids.push(...(result.activeCgids || []));
@@ -1810,6 +1845,7 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
   results.forEach((result, index) => {
     if (!result) merged.failed.push(...slices[index].map((item) => (item.kind === "q" ? `q:${item.value}` : item.value)));
   });
+  merged.unscannedCgids = merged.failed.filter((value) => !String(value).startsWith("q:"));
   return merged;
 }
 
@@ -1928,8 +1964,14 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
   const shardHtmls = shard.length
     ? await mapWithConcurrency(shard, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg))
     : [];
-  const cgids = uniqueValues([...head, ...shard]);
-  const htmls = [...headHtmls, ...shardHtmls];
+  const rescueRoom = Math.max(0, Math.min(24, subrequestsLeft(cfg) - 12));
+  const rescueCgids = (fanout?.unscannedCgids || []).slice(0, rescueRoom);
+  const rescueHtmls = rescueCgids.length
+    ? await mapWithConcurrency(rescueCgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg))
+    : [];
+  const rescuedOk = rescueHtmls.filter(Boolean).length;
+  const cgids = uniqueValues([...head, ...shard, ...rescueCgids]);
+  const htmls = [...headHtmls, ...shardHtmls, ...rescueHtmls];
   const pidUniverse = new Set();
   for (const html of htmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
   for (const html of searchHtmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
@@ -1950,7 +1992,10 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
     shardSize: shard.length,
     fanoutSlices: fanout ? fanout.slices : null,
     fanoutSlicesOk: fanout ? fanout.slicesOk : null,
+    fanoutRetried: fanout ? fanout.slicesRetried ?? 0 : null,
     fanoutFailed: fanout ? fanout.failed.length : null,
+    unscanned: fanout ? Math.max(0, (fanout.unscannedCgids?.length || 0) - rescuedOk) : null,
+    rescued: rescuedOk,
     searchQueries: searchQueries.length,
     searchFetched: searchHtmls.filter(Boolean).length,
     fetched: htmls.filter(Boolean).length,
@@ -2658,6 +2703,74 @@ async function postToWebhook(cfg, webhookUrl, payload) {
   return false;
 }
 
+function mainWebhookUrl(cfg) {
+  return (cfg.discordWebhookUrls || []).filter(Boolean)[0] || null;
+}
+
+async function postToMainWebhook(cfg, payload) {
+  const webhookUrl = mainWebhookUrl(cfg);
+  if (!webhookUrl) return false;
+  try {
+    await postToWebhook(cfg, webhookUrl, payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const baselineMarkersEnsured = new Set();
+async function ensureBaselineMarker(env, cfg, seenCount) {
+  if (!seenCount || baselineMarkersEnsured.has(cfg.stateKey)) return;
+  baselineMarkersEnsured.add(cfg.stateKey);
+  try {
+    const key = `${cfg.stateKey}:baselined`;
+    if (!(await env.STATE.get(key))) await env.STATE.put(key, JSON.stringify({ at: nowIso() }));
+  } catch {
+    baselineMarkersEnsured.delete(cfg.stateKey);
+  }
+}
+
+async function notifyStateLoss(cfg, productCount) {
+  const payload = {
+    username: "Chrome Hearts Monitor",
+    content: "Monitor state was lost — re-baselined",
+    embeds: [
+      {
+        author: { name: "Chrome Hearts Drop Monitor", url: BASE_URL },
+        title: "State lost — products absorbed without alerting",
+        description:
+          `The stored catalog state was missing, so the monitor re-baselined and took in ` +
+          `**${productCount} currently-live products without alerting on any of them**.\n\n` +
+          `If a drop landed during this window it did NOT ping. Check the site manually.`,
+        color: 0xffffff,
+        footer: { text: "Chrome Hearts monitor - state loss" },
+        timestamp: nowIso()
+      }
+    ]
+  };
+  await postToMainWebhook(cfg, payload);
+}
+
+async function notifyMonitorDegraded(cfg, message, streak) {
+  const payload = {
+    username: "Chrome Hearts Monitor",
+    content: "Monitor is failing — not scanning reliably",
+    embeds: [
+      {
+        author: { name: "Chrome Hearts Drop Monitor", url: BASE_URL },
+        title: "Monitor degraded",
+        description:
+          `${streak} consecutive failed runs.\n\n\`\`\`${truncate(String(message || "unknown"), 500)}\`\`\`\n` +
+          `Drops may not be detected until this clears.`,
+        color: 0xffffff,
+        footer: { text: "Chrome Hearts monitor - health" },
+        timestamp: nowIso()
+      }
+    ]
+  };
+  await postToMainWebhook(cfg, payload);
+}
+
 async function sendDiscord(cfg, products) {
   const webhookUrls = (cfg.discordWebhookUrls || []).filter(Boolean);
   if (!webhookUrls.length) throw new MonitorError("No Discord webhook configured.", 500);
@@ -2703,7 +2816,7 @@ async function sendStagingPings(cfg, lines) {
   try {
     if (!lines.length) return;
     const payload = { username: "Chrome Hearts Monitor", content: lines.slice(0, 6).join("\n") };
-    await Promise.all((cfg.discordWebhookUrls || []).map((webhookUrl) => postToWebhook(cfg, webhookUrl, payload).catch(() => false)));
+    await postToMainWebhook(cfg, payload);
   } catch {
     // best-effort
   }
@@ -2790,7 +2903,9 @@ function runLogEntry(mode, result, ms, cfg) {
     newPids: result.newPids || [],
     categoriesScanned: sweep?.categoriesScanned ?? result.fast?.cgidCount ?? null,
     activeCategories: sweep ? sweep.activeCategoryIds?.length ?? null : result.fast?.activeCategoryCount ?? null,
-    failedCategories: sweep?.failedCategoryCount ?? 0,
+    failedCategories: sweep?.failedCategoryCount ?? result.fast?.fanoutFailed ?? 0,
+    unscanned: sweep ? 0 : result.fast?.unscanned ?? 0,
+    rescued: sweep ? 0 : result.fast?.rescued ?? 0,
     searches: sweep?.searchQueryCount ?? result.fast?.searchQueries ?? 0,
     newFromSearch: sweep?.newFromSearch ?? null,
     staging: result.staging || null,
@@ -2857,6 +2972,9 @@ async function runMonitor(env, cfg = null, opts = {}) {
     const previousMissing = state.missing || {};
     const firstRun = Object.keys(previousSeen).length === 0;
 
+    const baselineMarkerKey = `${cfg.stateKey}:baselined`;
+    const stateLost = firstRun ? Boolean(await env.STATE.get(baselineMarkerKey).catch(() => null)) : false;
+
     const stagingPromise =
       cfg.stagingLaneEnabled && !firstRun ? runStagingLane(env, cfg, state).catch(() => null) : Promise.resolve(null);
 
@@ -2912,6 +3030,9 @@ async function runMonitor(env, cfg = null, opts = {}) {
       (pid) => !previousSeen[pid] || relistEligible(pid, previousSeen, previousActive, previousMissing, cfg)
     );
     const baseline = mode === "full" && firstRun && !cfg.notifyInitial;
+    if (baseline && stateLost) {
+      await notifyStateLoss(cfg, Object.keys(products).length).catch(() => {});
+    }
     const candidates = baseline ? [] : newPids.map((pid) => products[pid]);
     const productsToAlert = candidates.slice(0, cfg.maxAlertsPerRun);
     const deferredProducts = candidates.slice(cfg.maxAlertsPerRun);
@@ -3052,10 +3173,14 @@ async function runMonitor(env, cfg = null, opts = {}) {
       catalogFingerprint(nextState) === catalogFingerprint(state);
     result.kvWrite = !quietFullSweep;
     if (!quietFullSweep) await saveState(env, cfg, nextState);
+    await ensureBaselineMarker(env, cfg, Object.keys(nextState.seen || {}).length);
 
     return done(result);
   } catch (error) {
     const backoff = computeBackoffUntil(state, cfg);
+    if (backoff.errorStreak === 3) {
+      await notifyMonitorDegraded(cfg, error.message, backoff.errorStreak).catch(() => {});
+    }
     await saveState(env, cfg, {
       ...state,
       ...backoff,
@@ -3473,7 +3598,9 @@ async function handleFetch(request, env) {
     };
     const payload = { username: "Chrome Hearts Monitor", content: "Monitor self-test", embeds: [buildProductEmbed(testProduct)] };
     const results = [];
-    for (const webhookUrl of cfg.discordWebhookUrls || []) {
+    const testAll = ["1", "true", "yes"].includes(String(url.searchParams.get("all") || "").toLowerCase());
+    const targets = testAll ? cfg.discordWebhookUrls || [] : [mainWebhookUrl(cfg)].filter(Boolean);
+    for (const webhookUrl of targets) {
       let ok = false;
       try {
         ok = await postToWebhook(cfg, webhookUrl, payload);
@@ -3488,6 +3615,9 @@ async function handleFetch(request, env) {
         ok: deliveredCount > 0,
         sent: deliveredCount,
         total: results.length,
+        scope: testAll ? "all-webhooks" : "main-webhook-only",
+        mainWebhook: maskWebhook(mainWebhookUrl(cfg) || ""),
+        configuredWebhooks: (cfg.discordWebhookUrls || []).length,
         source: Array.isArray(settings.discordWebhookUrls) ? "dashboard" : "worker-secret",
         results,
         at: nowIso()
@@ -3593,6 +3723,60 @@ class MonitorController {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.mem = null;
+    this.pendingLogs = [];
+    this.expiredLogKeys = [];
+  }
+
+  async hydrate() {
+    if (this.mem) return this.mem;
+    const stored = await this.state.storage.get([
+      "tick",
+      "lastTickAt",
+      "fastCursor",
+      "prospectiveCursor",
+      "fullCount",
+      "burstUntil"
+    ]);
+    const tick = Number(stored.get("tick")) || 0;
+    this.mem = {
+      tick,
+      lastTickAt: stored.get("lastTickAt") || null,
+      fastCursor: Number(stored.get("fastCursor")) || 0,
+      prospectiveCursor: Number(stored.get("prospectiveCursor")) || 0,
+      fullCount: Number(stored.get("fullCount")) || 0,
+      burstUntil: stored.get("burstUntil") || null,
+      lastResult: null,
+      lastFlushTick: tick,
+      dirty: false
+    };
+    return this.mem;
+  }
+
+  async flush(force = false) {
+    const mem = this.mem;
+    if (!mem || !mem.dirty) return;
+    if (!force && mem.tick - mem.lastFlushTick < DO_FLUSH_EVERY_TICKS) return;
+    const batch = {
+      tick: mem.tick,
+      lastTickAt: mem.lastTickAt,
+      fastCursor: mem.fastCursor,
+      prospectiveCursor: mem.prospectiveCursor,
+      fullCount: mem.fullCount,
+      lastResult: mem.lastResult || null
+    };
+    // Buffered tick logs ride along in the same write.
+    for (const [key, entry] of this.pendingLogs) batch[key] = entry;
+    if (mem.burstUntil) batch.burstUntil = mem.burstUntil;
+    await this.state.storage.put(batch);
+    if (!mem.burstUntil) await this.state.storage.delete("burstUntil").catch(() => {});
+    if (this.expiredLogKeys && this.expiredLogKeys.length) {
+      await this.state.storage.delete(this.expiredLogKeys).catch(() => {});
+      this.expiredLogKeys = [];
+    }
+    this.pendingLogs = [];
+    mem.dirty = false;
+    mem.lastFlushTick = mem.tick;
   }
 
   async ensure() {
@@ -3606,10 +3790,21 @@ class MonitorController {
       await this.state.storage.deleteAlarm().catch(() => {});
       return { armed: false, reason: cfg ? "disabled" : "config-error" };
     }
+    const now = Date.now();
+    const graceMs = Math.max(60000, (cfg.fastPollIntervalSeconds || 12) * 4000);
     const existing = await this.state.storage.getAlarm();
-    if (existing === null || existing === undefined) {
-      await this.state.storage.setAlarm(Date.now() + 1000);
-      return { armed: true, scheduledInMs: 1000 };
+    const lastTickMs = Date.parse((this.mem?.lastTickAt || (await this.state.storage.get("lastTickAt")) || "")) || 0;
+    const missing = existing === null || existing === undefined;
+    const overdue = !missing && existing < now - graceMs;
+    const flatlined = lastTickMs > 0 && now - lastTickMs > graceMs;
+    if (missing || overdue || flatlined) {
+      await this.state.storage.setAlarm(now + 1000);
+      return {
+        armed: true,
+        rearmed: true,
+        reason: missing ? "no-alarm" : overdue ? "overdue-alarm" : "stale-heartbeat",
+        staleForMs: lastTickMs ? now - lastTickMs : null
+      };
     }
     return { armed: true, nextAlarm: new Date(existing).toISOString() };
   }
@@ -3617,23 +3812,30 @@ class MonitorController {
   async status() {
     const alarm = await this.state.storage.getAlarm();
     const logs = await this.state.storage.list({ prefix: "log:", limit: 1000 });
+    const mem = await this.hydrate();
+    const lastTickMs = Date.parse(mem.lastTickAt || "") || 0;
     return {
-      tick: Number(await this.state.storage.get("tick")) || 0,
-      lastTickAt: (await this.state.storage.get("lastTickAt")) || null,
+      tick: mem.tick,
+      lastTickAt: mem.lastTickAt,
+      staleForMs: lastTickMs ? Date.now() - lastTickMs : null,
+      alive: lastTickMs ? Date.now() - lastTickMs < 120000 : false,
       nextAlarm: alarm ? new Date(alarm).toISOString() : null,
-      fastCursor: Number(await this.state.storage.get("fastCursor")) || 0,
-      prospectiveCursor: Number(await this.state.storage.get("prospectiveCursor")) || 0,
-      fullSweeps: Number(await this.state.storage.get("fullCount")) || 0,
+      alarmOverdueMs: alarm && alarm < Date.now() ? Date.now() - alarm : 0,
+      fastCursor: mem.fastCursor,
+      prospectiveCursor: mem.prospectiveCursor,
+      fullSweeps: mem.fullCount,
       categoryStatusesTracked: Object.keys((await this.state.storage.get("catStatus")) || {}).length,
-      logCount: logs.size,
-      lastResult: (await this.state.storage.get("lastResult")) || null
+      logCount: logs.size + this.pendingLogs.length,
+      unflushedTicks: this.pendingLogs.length,
+      lastResult: mem.lastResult || (await this.state.storage.get("lastResult")) || null
     };
   }
 
   async logs(limit = 100) {
     const capped = Math.max(1, Math.min(500, limit));
     const listed = await this.state.storage.list({ prefix: "log:", reverse: true, limit: capped });
-    const runs = [...listed.values()];
+    const buffered = this.pendingLogs.map(([, entry]) => entry).reverse();
+    const runs = [...buffered, ...listed.values()].slice(0, capped);
     if (runs.length) return { count: runs.length, runs };
     const legacy = (await this.state.storage.get("logs")) || [];
     return { count: legacy.length, runs: legacy.slice(-capped).reverse() };
@@ -3687,24 +3889,16 @@ class MonitorController {
         }
       ]
     };
-    for (const webhookUrl of cfg.discordWebhookUrls || []) {
-      try {
-        await postToWebhook(cfg, webhookUrl, payload);
-      } catch {
-        // never let a webhook failure break the loop
-      }
-    }
+    await postToMainWebhook(cfg, payload);
   }
 
   async record(entry, bufferSize) {
     const cap = Math.max(0, bufferSize || 0);
     if (!cap) return;
     const ordinal = Number.isFinite(entry?.tick) ? entry.tick : 0;
-    await this.state.storage.put(`log:${String(ordinal).padStart(10, "0")}`, entry);
+    this.pendingLogs.push([`log:${String(ordinal).padStart(10, "0")}`, entry]);
     const expired = ordinal - cap;
-    if (expired > 0) {
-      await this.state.storage.delete(`log:${String(expired).padStart(10, "0")}`).catch(() => {});
-    }
+    if (expired > 0) this.expiredLogKeys.push(`log:${String(expired).padStart(10, "0")}`);
   }
 
   async fetch(request) {
@@ -3726,53 +3920,66 @@ class MonitorController {
   }
 
   async alarm() {
+    const startedAt = Date.now();
+    const provisionalSeconds = Math.max(5, Number.parseInt(this.env.FAST_POLL_INTERVAL_SECONDS, 10) || 12);
+    await this.state.storage.setAlarm(startedAt + provisionalSeconds * 1000);
+
     let cfg = null;
     try {
       cfg = await getRuntimeConfig(this.env);
     } catch {
       cfg = null;
     }
-    if (!cfg || !cfg.fastPollEnabled) return;
+    if (!cfg) return;
+    if (!cfg.fastPollEnabled) {
+      await this.state.storage.deleteAlarm().catch(() => {});
+      return;
+    }
 
-    const tick = (Number(await this.state.storage.get("tick")) || 0) + 1;
+    const mem = await this.hydrate();
+    const tick = mem.tick + 1;
     const everyTicks = Math.max(1, cfg.fullSweepEveryTicks);
     const mode = tick % everyTicks === 0 ? "full" : "fast";
-    const startedAt = Date.now();
-    const burstUntilMs = Date.parse((await this.state.storage.get("burstUntil")) || "") || 0;
+    const burstUntilMs = Date.parse(mem.burstUntil || "") || 0;
     const bursting = cfg.burstWindowSeconds > 0 && burstUntilMs > startedAt;
     const effectiveIntervalSeconds = bursting ? Math.max(3, cfg.burstIntervalSeconds) : Math.max(5, cfg.fastPollIntervalSeconds);
     const intervalMs = effectiveIntervalSeconds * 1000;
-    const jitterMs = Math.floor(Math.random() * 400);
-    await this.state.storage.setAlarm(startedAt + intervalMs + jitterMs);
-    const previousTickAt = Date.parse((await this.state.storage.get("lastTickAt")) || "") || null;
+    if (effectiveIntervalSeconds !== provisionalSeconds) {
+      await this.state.storage.setAlarm(startedAt + intervalMs + Math.floor(Math.random() * 400));
+    }
+    const previousTickAt = Date.parse(mem.lastTickAt || "") || null;
     const tickGapMs = previousTickAt ? startedAt - previousTickAt : null;
 
     let result;
-    const nextKeys = { tick, lastTickAt: nowIso() };
+    const fullCount = mem.fullCount + (mode === "full" ? 1 : 0);
     try {
-      const fastCursor = Number(await this.state.storage.get("fastCursor")) || 0;
-      const prospectiveCursor = Number(await this.state.storage.get("prospectiveCursor")) || 0;
-      const fullCount = (Number(await this.state.storage.get("fullCount")) || 0) + (mode === "full" ? 1 : 0);
       const lightDiscovery = mode === "full" && fullCount % Math.max(1, cfg.discoveryEveryFullSweeps) !== 0;
-      result = await runMonitor(this.env, cfg, { mode, skipLock: true, fastCursor, prospectiveCursor, lightDiscovery });
+      result = await runMonitor(this.env, cfg, {
+        mode,
+        skipLock: true,
+        fastCursor: mem.fastCursor,
+        prospectiveCursor: mem.prospectiveCursor,
+        lightDiscovery
+      });
       if (mode === "fast" && Number.isInteger(result?.nextFastCursor)) {
-        nextKeys.fastCursor = result.nextFastCursor;
+        mem.fastCursor = result.nextFastCursor;
       }
       if (mode === "full") {
-        nextKeys.fullCount = fullCount;
-        if (Number.isInteger(result?.nextProspectiveCursor)) nextKeys.prospectiveCursor = result.nextProspectiveCursor;
+        mem.fullCount = fullCount;
+        if (Number.isInteger(result?.nextProspectiveCursor)) mem.prospectiveCursor = result.nextProspectiveCursor;
       }
     } catch (error) {
       result = { ok: false, mode, error: String(error?.message || error) };
     }
 
     if (result && Object.prototype.hasOwnProperty.call(result, "burstUntil")) {
-      if (result.burstUntil) nextKeys.burstUntil = result.burstUntil;
-      else await this.state.storage.delete("burstUntil").catch(() => {});
+      mem.burstUntil = result.burstUntil || null;
     }
 
-    nextKeys.lastResult = result;
-    await this.state.storage.put(nextKeys);
+    mem.tick = tick;
+    mem.lastTickAt = nowIso();
+    mem.lastResult = result;
+    mem.dirty = true;
 
     if (cfg.categoryStatusEveryTicks > 0 && tick % cfg.categoryStatusEveryTicks === 0) {
       try {
@@ -3795,7 +4002,9 @@ class MonitorController {
         alerted: result.alerted ?? 0,
         newPids: result.newPids || [],
         activeCategories: result.sweep?.activeCategoryIds?.length ?? result.fast?.activeCategoryCount ?? null,
-        failedCategories: result.sweep?.failedCategoryCount ?? 0,
+        failedCategories: result.sweep?.failedCategoryCount ?? result.fast?.fanoutFailed ?? 0,
+        // >0 means the tick did not see the whole universe.
+        unscanned: result.sweep ? 0 : result.fast?.unscanned ?? 0,
         staged: result.staging?.discoveries ?? 0,
         hotWatch: result.staging?.hotWatch ?? null,
         enumPool: result.staging?.enumPool ?? 0,
@@ -3823,10 +4032,12 @@ class MonitorController {
         tickGapMs
       });
       await this.state.storage.put("alertLog", alerts.slice(-300));
+      await this.flush(true);
+    } else {
+      await this.flush();
     }
 
-    const pending = await this.state.storage.getAlarm();
-    if (pending === null || pending === undefined || pending < Date.now()) {
+    if (Date.now() > startedAt + intervalMs) {
       await this.state.storage.setAlarm(Date.now() + 100);
     }
   }
@@ -3844,7 +4055,14 @@ export default {
           cfg = null;
         }
         if (cfg && cfg.fastPollEnabled && monitorStub(env)) {
-          await ensureFastPollLoop(env).catch((error) => console.error(error));
+          const armed = await ensureFastPollLoop(env).catch((error) => {
+            console.error(error);
+            return { armed: false, reason: "ensure-failed" };
+          });
+          if (armed?.rearmed) console.log(`chmon watchdog recovered loop: ${JSON.stringify(armed)}`);
+          if (!armed || armed.armed === false) {
+            await runMonitor(env, cfg).catch((error) => console.error(error));
+          }
         } else {
           await runMonitor(env, cfg || undefined).catch((error) => console.error(error));
         }
