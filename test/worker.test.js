@@ -177,6 +177,7 @@ function basicAuthHeaders(password = "secret") {
 
 function createChromeHeartsFetch({
   root = "",
+  rootPages = null,
   categories = {},
   searches = {},
   sitemapCategories = [],
@@ -255,6 +256,17 @@ function createChromeHeartsFetch({
       }
       const cgid = url.searchParams.get("cgid");
       gridCategoryCalls.push(cgid);
+      if (cgid === "root" && Array.isArray(rootPages)) {
+        const sz = Number(url.searchParams.get("sz")) || 200;
+        const start = Number(url.searchParams.get("start")) || 0;
+        const index = Math.floor(start / Math.max(1, sz));
+        const page = rootPages[index] || "";
+        const hasNext = index + 1 < rootPages.length;
+        const showMore = hasNext
+          ? `<div class="show-more"><button data-url="https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Search-UpdateGrid?cgid=root&amp;start=${(index + 1) * sz}&amp;sz=${sz}">More</button></div>`
+          : "";
+        return new Response(page + showMore, { status: 200, headers: { "content-type": "text/html" } });
+      }
       return new Response(cgid === "root" ? root : categories[cgid] || "", {
         status: 200,
         headers: { "content-type": "text/html" }
@@ -2283,4 +2295,74 @@ test("An env-configured MAIN webhook can be removed from the dashboard", async (
   assert.match(after.mainWebhook, /888/, "MAIN falls back to the remaining webhook");
   const saved = JSON.parse(kv.values.get(SETTINGS_KEY));
   assert.deepEqual(saved.discordWebhookUrls, [added]);
+});
+
+test("The root lane follows the show-more chain across pages", async () => {
+  const p1 = productTile("ROOTPAGE_1", "ROOT PAGE ONE", "shop", "Shop", "100.00");
+  const p2 = productTile("ROOTPAGE_2", "ROOT PAGE TWO", "shop", "Shop", "200.00");
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "ROOTPAGE_1", name: "ROOT PAGE ONE" }])));
+  const mock = createChromeHeartsFetch({
+    rootPages: [p1, p2],
+    productDetails: { ROOTPAGE_2: { name: "ROOT PAGE TWO", categoryName: "Shop", price: "200.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runMonitor(
+      env({ DISCOVER_HOMEPAGE_CATEGORIES: "false", DISCOVER_SITEMAP_CATEGORIES: "false", DISCOVER_ROBOTS_PRODUCTS: "false", DISCOVER_PRODUCT_URL_CATEGORIES: "false", MAX_DIRECT_PRODUCT_URLS: "0", ENUMERATION_ENABLED: "false" }, kv),
+      null,
+      { mode: "fast", skipLock: true, tickNumber: 1 }
+    );
+    assert.equal(result.alerted, 1, "page-2 product was found");
+    assert.deepEqual(result.newPids, ["ROOTPAGE_2"]);
+    assert.equal(result.fast.root.pages, 2, "walked both pages");
+    assert.equal(result.fast.root.complete, true, "chain terminated cleanly");
+  });
+});
+
+test("The root lane finds a product in a category nobody guessed", async () => {
+  const hidden = productTile("STEALTH_PID", "STEALTH DROP", "totally-unguessed-cgid", "Secret", "1200.00");
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "BASELINE_PID", name: "BASELINE" }])));
+  const mock = createChromeHeartsFetch({
+    rootPages: [hidden],
+    productDetails: { STEALTH_PID: { name: "STEALTH DROP", categoryName: "Secret", price: "1200.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runMonitor(
+      env({ DISCOVER_HOMEPAGE_CATEGORIES: "false", DISCOVER_SITEMAP_CATEGORIES: "false", DISCOVER_ROBOTS_PRODUCTS: "false", DISCOVER_PRODUCT_URL_CATEGORIES: "false", MAX_DIRECT_PRODUCT_URLS: "0", ENUMERATION_ENABLED: "false" }, kv),
+      null,
+      { mode: "fast", skipLock: true, tickNumber: 1 }
+    );
+    assert.equal(result.alerted, 1, "a product in an unguessed category still alerts");
+    assert.deepEqual(result.newPids, ["STEALTH_PID"]);
+    assert.ok(
+      !mock.gridCategoryCalls.includes("totally-unguessed-cgid"),
+      "the category was never polled directly"
+    );
+  });
+});
+
+test("A failed page marks the root sweep incomplete rather than reporting a short catalog", async () => {
+  const kv = fakeKV(withStagingBaseline(stateWithActive([{ pid: "BASELINE_PID", name: "BASELINE" }])));
+  const good = productTile("PARTIAL_1", "PARTIAL ONE", "shop", "Shop", "100.00");
+  // Page 1 promises a page 2; the fetch for page 2 fails.
+  let calls = 0;
+  const base = createChromeHeartsFetch({ rootPages: [good, good] });
+  const flaky = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname.includes("/Search-UpdateGrid") && url.searchParams.get("cgid") === "root") {
+      calls += 1;
+      if (calls > 1) throw new Error("network reset");
+    }
+    return base.fetchMock(input, init);
+  };
+
+  await withMockedFetch(flaky, async () => {
+    const result = await runMonitor(
+      env({ DISCOVER_HOMEPAGE_CATEGORIES: "false", DISCOVER_SITEMAP_CATEGORIES: "false", DISCOVER_ROBOTS_PRODUCTS: "false", DISCOVER_PRODUCT_URL_CATEGORIES: "false", MAX_DIRECT_PRODUCT_URLS: "0", ENUMERATION_ENABLED: "false" }, kv),
+      null,
+      { mode: "fast", skipLock: true, tickNumber: 1 }
+    );
+    assert.equal(result.fast.root.complete, false, "an interrupted chain is never reported as complete");
+  });
 });

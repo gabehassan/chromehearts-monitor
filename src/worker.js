@@ -539,6 +539,11 @@ function getConfig(env) {
     discoveryEveryFullSweeps: intSetting(env, "DISCOVERY_EVERY_FULL_SWEEPS", 10, 1),
     fanoutEnabled: boolSetting(env, "FANOUT_ENABLED", true),
     fanoutSliceSize: intSetting(env, "FANOUT_SLICE_SIZE", 30, 5),
+    rootLaneEnabled: boolSetting(env, "ROOT_LANE_ENABLED", true),
+    rootCatalogCgid: env.ROOT_CATALOG_CGID || "root",
+    rootCatalogPageSize: intSetting(env, "ROOT_CATALOG_PAGE_SIZE", 200, 1),
+    rootCatalogMaxPages: intSetting(env, "ROOT_CATALOG_MAX_PAGES", 12, 1),
+    rootAuditEveryTicks: intSetting(env, "ROOT_AUDIT_EVERY_TICKS", 20, 0),
     categoryStatusEveryTicks: intSetting(env, "CATEGORY_STATUS_EVERY_TICKS", 20, 0),
     searchQueries: uniqueValues(
       String(env.SEARCH_QUERIES === undefined ? "chrome,hearts" : env.SEARCH_QUERIES)
@@ -1825,6 +1830,51 @@ function extractGridPids(html) {
   return pids;
 }
 
+function extractShowMoreUrl(html) {
+  if (!html) return null;
+  const matches = String(html).matchAll(/data-url="([^"]*Search-UpdateGrid[^"]*)"/gi);
+  for (const match of matches) {
+    const url = match[1].replaceAll("&amp;", "&");
+    if (/[?&]start=\d+/.test(url) && /[?&]sz=\d+/.test(url)) return url;
+  }
+  return null;
+}
+
+async function fetchRootCatalog(cfg) {
+  const products = {};
+  const pids = new Set();
+  let url = productGridUrl(cfg.rootCatalogCgid, 0, cfg.rootCatalogPageSize);
+  let pages = 0;
+  let truncated = false;
+
+  while (url && pages < cfg.rootCatalogMaxPages) {
+    if (subrequestsLeft(cfg) <= 6) {
+      truncated = true;
+      break;
+    }
+    let html = "";
+    try {
+      html = await fetchHtml(url, cfg);
+    } catch {
+      truncated = true;
+      break;
+    }
+    pages += 1;
+    for (const pid of extractGridPids(html)) pids.add(pid);
+    if (extractGridPids(html).size) Object.assign(products, parseProducts(html));
+    const next = extractShowMoreUrl(html);
+    if (!next) {
+      url = null;
+      break;
+    }
+    url = next;
+  }
+  // Ran out of page budget with the chain still going.
+  if (url && pages >= cfg.rootCatalogMaxPages) truncated = true;
+
+  return { products, pids, pages, truncated, complete: !truncated };
+}
+
 async function fetchGridHtmlSafe(cgid, cfg) {
   try {
     return await fetchHtml(productGridUrl(cgid, 0, cfg.pageSize), cfg);
@@ -1998,7 +2048,7 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
   return { ok: true, products, activeCgids, failed, scanned: cgids.length + queries.length };
 }
 
-async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
+async function fastFetchProducts(env, cfg, state, fastCursor = 0, tickNumber = 0) {
   const pool = uniqueValues([
     ...cfg.extraCategoryIds,
     ...cfg.prospectiveCategoryIds,
@@ -2017,8 +2067,12 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
   const remainder = pool.filter((cgid) => !head.includes(cgid));
   const queryPool = (cfg.searchQueryTerms || []).filter((term) => !searchQueries.includes(term));
 
-  const [fanout, headHtmls, searchHtmls] = await Promise.all([
-    selfScanGrids(env, cfg, remainder, queryPool),
+  const auditThisTick =
+    !cfg.rootLaneEnabled || cfg.rootAuditEveryTicks <= 0 || tickNumber % cfg.rootAuditEveryTicks === 0;
+
+  const [rootCatalog, fanout, headHtmls, searchHtmls] = await Promise.all([
+    cfg.rootLaneEnabled ? fetchRootCatalog(cfg) : Promise.resolve(null),
+    auditThisTick ? selfScanGrids(env, cfg, remainder, queryPool) : Promise.resolve(null),
     mapWithConcurrency(head, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg)),
     mapWithConcurrency(searchQueries, cfg.categoryFetchConcurrency, (query) => fetchSearchHtmlSafe(query, cfg))
   ]);
@@ -2040,6 +2094,14 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
   for (const html of htmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
   for (const html of searchHtmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
   for (const pid of Object.keys(fanout?.products || {})) pidUniverse.add(pid);
+  for (const pid of rootCatalog?.pids || []) pidUniverse.add(pid);
+
+  let auditMissedPids = [];
+  if (rootCatalog && rootCatalog.complete && fanout) {
+    const fanoutPids = new Set([...Object.keys(fanout.products || {})]);
+    for (const html of headHtmls) if (html) for (const pid of extractGridPids(html)) fanoutPids.add(pid);
+    auditMissedPids = [...fanoutPids].filter((pid) => !rootCatalog.pids.has(pid));
+  }
 
   const previousSeen = state.seen || {};
   const previousActive = state.active || previousSeen;
@@ -2054,6 +2116,12 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
     cgidCount: cgids.length + (fanout?.scanned || 0),
     activeCategoryCount: knownCategoryIds.length,
     shardSize: shard.length,
+    root: rootCatalog
+      ? { pages: rootCatalog.pages, complete: rootCatalog.complete, pids: rootCatalog.pids.size }
+      : null,
+    audited: Boolean(fanout && rootCatalog),
+    auditMissed: auditMissedPids.length,
+    auditMissedPids: auditMissedPids.slice(0, 10),
     fanoutSlices: fanout ? fanout.slices : null,
     fanoutSlicesOk: fanout ? fanout.slicesOk : null,
     fanoutRetried: fanout ? fanout.slicesRetried ?? 0 : null,
@@ -2074,7 +2142,12 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0) {
   }
 
   const combinedHtml = [...htmls, ...searchHtmls].filter(Boolean).join("\n");
-  return { products: { ...parseProducts(combinedHtml), ...(fanout?.products || {}) }, meta, nextFastCursor, empty: false };
+  return {
+    products: { ...parseProducts(combinedHtml), ...(fanout?.products || {}), ...(rootCatalog?.products || {}) },
+    meta,
+    nextFastCursor,
+    empty: false
+  };
 }
 
 function collectProductImages($) {
@@ -2855,6 +2928,28 @@ async function notifyMonitorDegraded(cfg, message, streak) {
   await postToMainWebhook(cfg, payload);
 }
 
+async function notifyCoverageRegression(cfg, missedPids) {
+  const payload = {
+    username: "Chrome Hearts Monitor",
+    content: "Coverage regression — cgid=root is no longer complete",
+    embeds: [
+      {
+        author: { name: "Chrome Hearts Drop Monitor", url: BASE_URL },
+        title: "Root catalog missed live products",
+        description:
+          `The category fan-out found **${missedPids.length}** live product(s) that the ` +
+          `root-catalog lane did not return:\n\`\`\`${missedPids.slice(0, 15).join("\n")}\`\`\`\n` +
+          `The guessed-slug lanes are load-bearing again. Nothing was missed — the ` +
+          `auditor caught these — but the fast lane needs re-tuning.`,
+        color: 0xffffff,
+        footer: { text: "Chrome Hearts monitor - coverage audit" },
+        timestamp: nowIso()
+      }
+    ]
+  };
+  await postToMainWebhook(cfg, payload);
+}
+
 async function sendDiscord(cfg, products) {
   const webhookUrls = (cfg.discordWebhookUrls || []).filter(Boolean);
   if (!webhookUrls.length) throw new MonitorError("No Discord webhook configured.", 500);
@@ -3035,6 +3130,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
   const skipLock = opts.skipLock === true;
   const fastCursor = mode === "fast" ? finiteInteger(opts.fastCursor, 0) : 0;
   const externalProspectiveCursor = Number.isInteger(opts.prospectiveCursor) ? opts.prospectiveCursor : null;
+  const tickNumber = finiteInteger(opts.tickNumber, 0);
   const startedAt = Date.now();
   cfg.sweepStats = null;
   cfg.subrequestsUsed = 0;
@@ -3080,7 +3176,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
         await stagingPromise;
         return done({ ok: true, skipped: true, reason: "awaiting-baseline", mode, nextFastCursor: fastCursor, storage: "cloudflare-kv" });
       }
-      const [fast, stagingResult] = await Promise.all([fastFetchProducts(env, cfg, state, fastCursor), stagingPromise]);
+      const [fast, stagingResult] = await Promise.all([fastFetchProducts(env, cfg, state, fastCursor, tickNumber), stagingPromise]);
       staging = stagingResult;
       products = fast.products;
       nextFastCursor = fast.nextFastCursor;
@@ -3146,6 +3242,10 @@ async function runMonitor(env, cfg = null, opts = {}) {
     const sendStartedAt = Date.now();
     if (enriched.length) await sendDiscord(cfg, enriched);
     const sendMs = enriched.length ? Date.now() - sendStartedAt : 0;
+
+    if (fastMeta?.auditMissed) {
+      await notifyCoverageRegression(cfg, fastMeta.auditMissedPids || []).catch(() => {});
+    }
 
     const sweep = cfg.sweepStats || null;
     const result = {
@@ -4282,6 +4382,7 @@ class MonitorController {
         skipLock: true,
         fastCursor: mem.fastCursor,
         prospectiveCursor: mem.prospectiveCursor,
+        tickNumber: mem.tick,
         lightDiscovery
       });
       if (mode === "fast" && Number.isInteger(result?.nextFastCursor)) {
