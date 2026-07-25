@@ -2406,3 +2406,93 @@ test("Index lag is measured when the oracle sees a product before the index does
     assert.ok((saved.lagLog || []).some((s) => s.pid === "LAGGY_PID"), "sample appended to lagLog");
   });
 });
+
+test("A colourway that appears on a known style is reported as pre-release intel", async () => {
+  const pid = "158552BLKXXXXXX";
+  const base = withStagingBaseline(stateWithActive([{ pid: "KEEP_RC", name: "KEEP ROLLCALL" }]));
+  const kv = fakeKV({
+    ...base,
+    styleColors: { [pid]: { codes: ["BLK", "NVY"], at: new Date(Date.now() - 86400000).toISOString() } },
+    hotWatch: { [pid]: { pid, source: "mined", firstStagedAt: new Date(Date.now() - 3600000).toISOString() } }
+  });
+  const mock = createChromeHeartsFetch({
+    rootPages: [productTile("KEEP_RC", "KEEP ROLLCALL", "shop", "Shop", "100.00")],
+    productVariations: {
+      [pid]: {
+        product: {
+          id: pid,
+          productName: "BOXER BRIEF - SHORTS",
+          online: true,
+          price: { sales: { value: 210 } },
+          variationAttributes: [
+            { attributeId: "size", values: [{ id: "MED", displayValue: "M", selectable: true }] },
+            {
+              attributeId: "colorVal",
+              values: [
+                { id: "BLK", displayValue: "Black", selectable: true },
+                { id: "NVY", displayValue: "Navy", selectable: true },
+                { id: "WNB", displayValue: "Black / White", selectable: false }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runMonitor(
+      env({ DISCOVER_HOMEPAGE_CATEGORIES: "false", DISCOVER_SITEMAP_CATEGORIES: "false", DISCOVER_ROBOTS_PRODUCTS: "false", DISCOVER_PRODUCT_URL_CATEGORIES: "false", MAX_DIRECT_PRODUCT_URLS: "0" }, kv),
+      null,
+      { mode: "fast", skipLock: true, tickNumber: 1 }
+    );
+    const found = (result.newColorways || []).find((c) => c.code === "WNB");
+    assert.ok(found, `WNB must be reported as new; got ${JSON.stringify(result.newColorways)}`);
+    assert.equal(found.selectable, false, "staged, not yet buyable");
+    assert.equal(found.master, pid);
+    // Known colours must NOT be re-reported every tick.
+    assert.ok(!(result.newColorways || []).some((c) => c.code === "BLK"), "known colours stay quiet");
+    const titles = mock.discordPayloads.map((p) => p.content || "").join(" ");
+    assert.match(titles, /NEW COLORWAY/, "posted the intel line");
+    const saved = JSON.parse(kv.values.get(STATE_KEY));
+    assert.ok(saved.styleColors[pid].codes.includes("WNB"), "registry updated");
+  });
+});
+
+test("The first sighting of a style is a baseline, not a drop signal", async () => {
+  const pid = "999001BLKXXXXXX";
+  const base = withStagingBaseline(stateWithActive([{ pid: "KEEP_RC2", name: "KEEP" }]));
+  // No styleColors entry at all => first sighting.
+  const kv = fakeKV({
+    ...base,
+    hotWatch: { [pid]: { pid, source: "mined", firstStagedAt: new Date(Date.now() - 3600000).toISOString() } }
+  });
+  const mock = createChromeHeartsFetch({
+    rootPages: [productTile("KEEP_RC2", "KEEP", "shop", "Shop", "100.00")],
+    productVariations: {
+      [pid]: {
+        product: {
+          id: pid,
+          productName: "BRAND NEW STYLE",
+          online: true,
+          price: { sales: { value: 300 } },
+          variationAttributes: [
+            { attributeId: "size", values: [{ id: "MED", displayValue: "M", selectable: true }] },
+            { attributeId: "color", values: [{ id: "AAA", displayValue: "Alpha", selectable: true }] }
+          ]
+        }
+      }
+    }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runMonitor(
+      env({ DISCOVER_HOMEPAGE_CATEGORIES: "false", DISCOVER_SITEMAP_CATEGORIES: "false", DISCOVER_ROBOTS_PRODUCTS: "false", DISCOVER_PRODUCT_URL_CATEGORIES: "false", MAX_DIRECT_PRODUCT_URLS: "0" }, kv),
+      null,
+      { mode: "fast", skipLock: true, tickNumber: 1 }
+    );
+    assert.deepEqual(result.newColorways || [], [], "a first sighting must not cry new-colourway");
+    const saved = JSON.parse(kv.values.get(STATE_KEY));
+    assert.deepEqual(saved.styleColors[pid].codes, ["AAA"], "but it IS recorded as the baseline");
+  });
+});

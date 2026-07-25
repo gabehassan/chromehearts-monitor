@@ -1215,12 +1215,28 @@ function enumerationCandidates(cfg, state) {
     registrySiblings.push(...siblingsFrom({ style: entry.style, color: null, size: entry.size, suffix: entry.suffix }, entry.colors));
   }
 
+  const frontier = [];
+  for (const seedPid of hotSeeds.slice(0, 12)) {
+    const parts = parsePidParts(seedPid);
+    if (!parts || !/^\d{6}$/.test(parts.style)) continue;
+    const styleNumber = Number.parseInt(parts.style, 10);
+    for (const delta of [1, -1, 2, -2]) {
+      const neighbour = styleNumber + delta;
+      if (neighbour < 0 || neighbour > 999999) continue;
+      frontier.push(`${String(neighbour).padStart(6, "0")}${parts.color}${parts.size}${parts.suffix}`);
+    }
+  }
+
   const siblingsOut = uniqueValues(siblings).filter((pid) => !excluded(pid));
   const siblingSet = new Set(siblingsOut);
+  const frontierOut = uniqueValues(frontier).filter((pid) => !excluded(pid) && !siblingSet.has(pid));
   return {
     mined: uniqueValues(mined).filter((pid) => !excluded(pid)),
     siblings: siblingsOut,
-    registrySiblings: uniqueValues(registrySiblings).filter((pid) => !excluded(pid) && !siblingSet.has(pid))
+    frontier: frontierOut,
+    registrySiblings: uniqueValues(registrySiblings).filter(
+      (pid) => !excluded(pid) && !siblingSet.has(pid) && !frontierOut.includes(pid)
+    )
   };
 }
 
@@ -1315,7 +1331,10 @@ function parseHotWatchProbe(body, pid) {
     purchasable,
     sizes: variation.sizes,
     inStockSizeCount: variation.inStockSizeCount,
-    availabilityMessages: variation.availabilityMessages
+    availabilityMessages: variation.availabilityMessages,
+    // The style's full colour set, for the master roll-call.
+    colors: variation.colors,
+    colorAttributeId: variation.colorAttributeId
   };
 }
 
@@ -1426,7 +1445,7 @@ function activeHotWatchCount(map) {
   return Object.values(map).filter((entry) => entry && !entry.dormant).length;
 }
 
-const HOT_WATCH_PRIORITY = { "robots.txt": 3, sitemap: 3, homepage: 2, mined: 1, enumeration: 0 };
+const HOT_WATCH_PRIORITY = { "robots.new": 4, "robots.txt": 3, sitemap: 3, homepage: 2, mined: 1, enumeration: 0 };
 function hotWatchPriority(entry) {
   if (entry?.dormant) return -1;
   return HOT_WATCH_PRIORITY[entry?.source] ?? 0;
@@ -1503,10 +1522,13 @@ async function runStagingLane(env, cfg, state) {
   const rotor = Math.floor(startedAt / rotorMs);
   const siblingRoom = Math.min(Math.max(0, enumRoom - minedSlice.length), bursting ? 40 : 12);
   const siblingSlice = rotatingSlice(siblingQueue, rotor * Math.max(1, siblingRoom), siblingRoom);
-  const registryRoom = Math.max(0, enumRoom - minedSlice.length - siblingSlice.length);
+  const frontierQueue = candidates.frontier || [];
+  const frontierRoom = Math.min(bursting ? 10 : 4, Math.max(0, enumRoom - minedSlice.length - siblingSlice.length));
+  const frontierSlice = rotatingSlice(frontierQueue, rotor * Math.max(1, frontierRoom), frontierRoom);
+  const registryRoom = Math.max(0, enumRoom - minedSlice.length - siblingSlice.length - frontierSlice.length);
   const registrySlice = rotatingSlice(registryQueue, rotor * Math.max(1, registryRoom), registryRoom);
-  const enumSlice = [...minedSlice, ...siblingSlice, ...registrySlice];
-  const enumPoolSize = minedQueue.length + siblingQueue.length + registryQueue.length;
+  const enumSlice = [...minedSlice, ...siblingSlice, ...frontierSlice, ...registrySlice];
+  const enumPoolSize = minedQueue.length + siblingQueue.length + frontierQueue.length + registryQueue.length;
 
   const signals = await collectStagingSignals(env, cfg, {
     probePids: uniqueValues([...activePids, ...restockPids, ...enumSlice]),
@@ -1619,7 +1641,36 @@ async function runStagingLane(env, cfg, state) {
     if (lines.length) await sendStagingPings(cfg, lines);
   }
 
-  const dropSignal = discoveries.length > 0 || addedCategories.length > 0;
+  const previousStyleColors =
+    state.styleColors && typeof state.styleColors === "object" && !Array.isArray(state.styleColors)
+      ? state.styleColors
+      : {};
+  const styleColors = { ...previousStyleColors };
+  const newColorways = [];
+  for (const [pid, probe] of Object.entries(signals.probes || {})) {
+    const colors = probe?.colors;
+    if (!Array.isArray(colors) || !colors.length) continue;
+    const master = probe.masterPid || pid;
+    const known = new Set(previousStyleColors[master]?.codes || []);
+    const codes = colors.map((color) => color.code);
+    if (known.size) {
+      for (const color of colors) {
+        if (!known.has(color.code)) {
+          newColorways.push({
+            master,
+            code: color.code,
+            label: color.label,
+            selectable: color.selectable,
+            name: probe.name || null
+          });
+        }
+      }
+    }
+    styleColors[master] = { codes: uniqueValues([...known, ...codes]), at: nowIso() };
+  }
+  const styleColorsDirty = newColorways.length > 0 || Object.keys(styleColors).length !== Object.keys(previousStyleColors).length;
+
+  const dropSignal = discoveries.length > 0 || addedCategories.length > 0 || newColorways.length > 0;
 
   return {
     hotWatch,
@@ -1629,8 +1680,10 @@ async function runStagingLane(env, cfg, state) {
     enumPoolSize,
     bursting,
     dropSignal,
-    dirty,
+    dirty: dirty || styleColorsDirty,
     baselined,
+    styleColors,
+    newColorways,
     ms: Date.now() - startedAt,
     sitemapIndexLastmod: sitemapLastmod,
     sitemapCategoryIds
@@ -2417,10 +2470,23 @@ function parseProductVariationJson(body, pageUrl = "") {
     ];
   }
 
+  const colorAttribute = (product.variationAttributes || []).find((attribute) =>
+    /^colou?r(val)?$/i.test(String(attribute?.attributeId || attribute?.id || ""))
+  );
+  const colors = (colorAttribute?.values || [])
+    .filter((value) => value?.id)
+    .map((value) => ({
+      code: String(value.id),
+      label: String(value.displayValue || value.value || value.id).trim(),
+      selectable: Boolean(value.selectable)
+    }));
+
   const inStockSizeCount = sizes.filter((size) => size.inStock).length;
   return {
     masterPid,
     selectedVariantPid,
+    colors,
+    colorAttributeId: colorAttribute ? String(colorAttribute.attributeId || colorAttribute.id) : null,
     maxOrderQuantity,
     productAvailable: Boolean(product.available),
     readyToOrder: Boolean(product.readyToOrder),
@@ -2950,6 +3016,18 @@ async function notifyCoverageRegression(cfg, missedPids) {
   await postToMainWebhook(cfg, payload);
 }
 
+async function notifyNewColorways(cfg, colorways) {
+  const lines = colorways
+    .slice(0, 8)
+    .map(
+      (entry) =>
+        `\u{1f195} **NEW COLORWAY** \`${entry.code}\` ${entry.label ? `(${entry.label}) ` : ""}on style \`${entry.master}\`` +
+        `${entry.name ? ` — ${entry.name}` : ""} — ${entry.selectable ? "**purchasable now**" : "staged, not yet buyable"}`
+    );
+  if (!lines.length) return;
+  await postToMainWebhook(cfg, { username: "Chrome Hearts Monitor", content: lines.join("\n") });
+}
+
 async function sendDiscord(cfg, products) {
   const webhookUrls = (cfg.discordWebhookUrls || []).filter(Boolean);
   if (!webhookUrls.length) throw new MonitorError("No Discord webhook configured.", 500);
@@ -3100,6 +3178,8 @@ function runLogEntry(mode, result, ms, cfg) {
     audited: result.fast?.audited ?? null,
     auditMissed: result.fast?.auditMissed ?? null,
     oracleAhead: result.oracleAhead ?? null,
+    newColorways: (result.newColorways || []).length,
+    stylesTracked: result.staging?.stylesTracked ?? null,
     lagSec: (result.lagSamples || []).map((sample) => sample.lagSec).filter((v) => v !== null && v !== undefined),
     searches: sweep?.searchQueryCount ?? result.fast?.searchQueries ?? 0,
     newFromSearch: sweep?.newFromSearch ?? null,
@@ -3250,6 +3330,10 @@ async function runMonitor(env, cfg = null, opts = {}) {
     if (enriched.length) await sendDiscord(cfg, enriched);
     const sendMs = enriched.length ? Date.now() - sendStartedAt : 0;
 
+    if (staging?.newColorways?.length) {
+      await notifyNewColorways(cfg, staging.newColorways).catch(() => {});
+    }
+
     if (fastMeta?.auditMissed) {
       await notifyCoverageRegression(cfg, fastMeta.auditMissedPids || []).catch(() => {});
     }
@@ -3303,6 +3387,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
             live: Object.keys(staging.liveProducts || {}).length,
             hotWatch: Object.keys(staging.hotWatch).length,
             enumPool: staging.enumPoolSize ?? 0,
+            stylesTracked: Object.keys(staging.styleColors || {}).length,
+            newColorways: (staging.newColorways || []).length,
             bursting: Boolean(staging.bursting),
             ms: staging.ms ?? 0
           }
@@ -3315,6 +3401,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
       sendMs,
       oracleAhead: Object.keys(lagWatch).length,
       lagSamples,
+      newColorways: staging?.newColorways || [],
       storage: "cloudflare-kv",
       checkedAt: nowIso()
     };
@@ -3359,6 +3446,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
       nextState.hotWatch = nextHotWatch;
       if (staging.sitemapIndexLastmod !== undefined) nextState.sitemapIndexLastmod = staging.sitemapIndexLastmod;
       if (staging.sitemapCategoryIds) nextState.sitemapCategoryIds = staging.sitemapCategoryIds;
+      if (staging.styleColors) nextState.styleColors = staging.styleColors;
       if (!state.stagingBaselinedAt) nextState.stagingBaselinedAt = nowIso();
     }
     if (nextState.enumTried) delete nextState.enumTried;
@@ -4365,7 +4453,11 @@ class MonitorController {
         }
       ]
     };
-    await postToMainWebhook(cfg, payload);
+    logRun(cfg, {
+      at: nowIso(),
+      mode: "catdiscovery",
+      discovered: discovered.map((entry) => `${entry.cgid}:${entry.status}`)
+    });
   }
 
   async record(entry, bufferSize) {
