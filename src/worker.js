@@ -3099,6 +3099,8 @@ function runLogEntry(mode, result, ms, cfg) {
     rootComplete: result.fast?.root?.complete ?? null,
     audited: result.fast?.audited ?? null,
     auditMissed: result.fast?.auditMissed ?? null,
+    oracleAhead: result.oracleAhead ?? null,
+    lagSec: (result.lagSamples || []).map((sample) => sample.lagSec).filter((v) => v !== null && v !== undefined),
     searches: sweep?.searchQueryCount ?? result.fast?.searchQueries ?? 0,
     newFromSearch: sweep?.newFromSearch ?? null,
     staging: result.staging || null,
@@ -3252,6 +3254,35 @@ async function runMonitor(env, cfg = null, opts = {}) {
       await notifyCoverageRegression(cfg, fastMeta.auditMissedPids || []).catch(() => {});
     }
 
+    const indexedPids = new Set(Object.keys(products));
+    const lagWatch = { ...(state.lagWatch || {}) };
+    const lagSamples = [];
+    for (const pid of Object.keys(staging?.liveProducts || {})) {
+      if (!lagWatch[pid] && !indexedPids.has(pid)) {
+        lagWatch[pid] = { at: nowIso(), name: staging.liveProducts[pid]?.name || null };
+      }
+    }
+    for (const [pid, entry] of Object.entries(lagWatch)) {
+      const openedMs = Date.parse(entry?.at || "") || 0;
+      if (!openedMs) {
+        delete lagWatch[pid];
+        continue;
+      }
+      if (indexedPids.has(pid)) {
+        lagSamples.push({
+          pid,
+          name: entry.name || null,
+          lagSec: Math.round((Date.now() - openedMs) / 1000),
+          at: nowIso()
+        });
+        delete lagWatch[pid];
+      } else if (Date.now() - openedMs > 2 * 3600 * 1000) {
+        lagSamples.push({ pid, name: entry.name || null, lagSec: null, censored: true, at: nowIso() });
+        delete lagWatch[pid];
+      }
+    }
+    const lagLog = [...(state.lagLog || []), ...lagSamples].slice(-200);
+
     const sweep = cfg.sweepStats || null;
     const result = {
       ok: true,
@@ -3282,6 +3313,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
       subrequestsUsed: cfg.subrequestsUsed || 0,
       enrichMs,
       sendMs,
+      oracleAhead: Object.keys(lagWatch).length,
+      lagSamples,
       storage: "cloudflare-kv",
       checkedAt: nowIso()
     };
@@ -3294,6 +3327,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
       }),
       lastRunAt: nowIso(),
       lastResult: result,
+      lagWatch,
+      lagLog,
       errorStreak: 0,
       backoffUntil: null,
       lastError: null,
@@ -3486,12 +3521,21 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
   const missingCount = Object.keys(state.missing || {}).length;
   const cadenceSeconds = cfg.fastPollEnabled ? cfg.fastPollIntervalSeconds : 60;
   const controller = flags.controller || null;
-  const heartbeatIso = controller?.lastTickAt || state.lastRunAt || "";
+  const heartbeatIso = controller?.lastTickAt || "";
+  const heartbeatReadable = Boolean(heartbeatIso);
   const lastRunMs = Date.parse(heartbeatIso) || 0;
   const staleMs = lastRunMs ? Math.max(0, Date.now() - lastRunMs) : null;
   const staleLimitMs = Math.max(150000, cadenceSeconds * 1000 * (DO_FLUSH_EVERY_TICKS + 6));
   const loopStalled = staleMs !== null && staleMs > staleLimitMs;
-  const status = !state.lastRunAt ? "Ready" : loopStalled ? "STALLED" : last.ok === false ? "Issue" : "Online";
+  const status = !heartbeatReadable
+    ? state.lastRunAt
+      ? "UNKNOWN"
+      : "Ready"
+    : loopStalled
+    ? "STALLED"
+    : last.ok === false
+    ? "Issue"
+    : "Online";
   const lastRun = state.lastRunAt || "Never";
   const durationText = (ms) => {
     const seconds = Math.round(ms / 1000);
@@ -3677,11 +3721,13 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
       <div class="pill${loopStalled ? " stalled" : ""}">${escapeHtml(status)}</div>
     </header>
     <div class="grid">
-      <div class="card${loopStalled ? " alarm" : ""}">
+      <div class="card${loopStalled || !heartbeatReadable ? " alarm" : ""}">
         <div class="label">Last check</div>
-        <div class="value">${escapeHtml(agoText(staleMs))}</div>
+        <div class="value">${heartbeatReadable ? escapeHtml(agoText(staleMs)) : "unknown"}</div>
         <div class="sub">${
-          loopStalled
+          !heartbeatReadable
+            ? "HEARTBEAT UNREADABLE — cannot confirm the loop is running"
+            : loopStalled
             ? `NOT SCANNING — expected every ~${escapeHtml(cadenceSeconds)}s`
             : `scanning every ~${escapeHtml(cadenceSeconds)}s`
         }</div>
@@ -3700,6 +3746,8 @@ function dashboard(state, cfg, settings = {}, flags = {}) {
         ? `<p class="banner">The monitor has not completed a check for ${escapeHtml(
             durationText(staleMs)
           )}. Drops are NOT being detected right now. The 1-minute watchdog retries automatically — if this does not clear within a few minutes, redeploy.</p>`
+        : !heartbeatReadable && state.lastRunAt
+        ? `<p class="banner">The Durable Object heartbeat could not be read, so whether the loop is scanning is UNKNOWN. This page deliberately does not fall back to the catalog timestamp — that is what reported a healthy monitor throughout the 7-day 2026-07-17 outage. Check /health and \`wrangler tail\` for chmon.hb lines.</p>`
         : ""
     }
 
@@ -4351,6 +4399,19 @@ class MonitorController {
     const startedAt = Date.now();
     const provisionalSeconds = Math.max(5, Number.parseInt(this.env.FAST_POLL_INTERVAL_SECONDS, 10) || 12);
     await this.state.storage.setAlarm(startedAt + provisionalSeconds * 1000);
+
+    try {
+      const previousTickAt = this.mem?.lastTickAt ? Date.parse(this.mem.lastTickAt) : 0;
+      console.log(
+        "chmon.hb " +
+          JSON.stringify({
+            t: new Date(startedAt).toISOString(),
+            tick: (this.mem?.tick ?? 0) + 1,
+            gapMs: previousTickAt ? startedAt - previousTickAt : null
+          })
+      );
+    } catch {
+    }
 
     let cfg = null;
     try {

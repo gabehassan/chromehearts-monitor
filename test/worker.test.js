@@ -2366,3 +2366,43 @@ test("A failed page marks the root sweep incomplete rather than reporting a shor
     assert.equal(result.fast.root.complete, false, "an interrupted chain is never reported as complete");
   });
 });
+
+test("An unreadable heartbeat renders UNKNOWN, never Online", async () => {
+  const kv = fakeKV({ ...stateWithSeen([{ pid: "HB_PID", name: "HEARTBEAT ITEM" }]), lastRunAt: new Date().toISOString() });
+  const testEnv = env({}, kv);
+  delete testEnv.MONITOR;
+  const response = await worker.fetch(new Request("https://monitor.test/", { headers: basicAuthHeaders() }), testEnv);
+  const html = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(html, /UNKNOWN/, "status must say UNKNOWN");
+  assert.ok(!/>Online</.test(html), "must never claim Online without a real heartbeat");
+  assert.match(html, /HEARTBEAT UNREADABLE/, "the card explains why");
+});
+
+test("Index lag is measured when the oracle sees a product before the index does", async () => {
+  const openedAt = new Date(Date.now() - 90_000).toISOString();
+  const base = withStagingBaseline(stateWithActive([{ pid: "KEEP_LAG", name: "KEEP LAG" }]));
+  const kv = fakeKV({ ...base, lagWatch: { LAGGY_PID: { at: openedAt, name: "LAGGY DROP" } }, lagLog: [] });
+  const live =
+    productTile("KEEP_LAG", "KEEP LAG", "shop", "Shop", "100.00") +
+    productTile("LAGGY_PID", "LAGGY DROP", "shop", "Shop", "900.00");
+  const mock = createChromeHeartsFetch({
+    rootPages: [live],
+    productDetails: { LAGGY_PID: { name: "LAGGY DROP", categoryName: "Shop", price: "900.00" } }
+  });
+
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runMonitor(
+      env({ DISCOVER_HOMEPAGE_CATEGORIES: "false", DISCOVER_SITEMAP_CATEGORIES: "false", DISCOVER_ROBOTS_PRODUCTS: "false", DISCOVER_PRODUCT_URL_CATEGORIES: "false", MAX_DIRECT_PRODUCT_URLS: "0", ENUMERATION_ENABLED: "false" }, kv),
+      null,
+      { mode: "fast", skipLock: true, tickNumber: 1 }
+    );
+    const sample = (result.lagSamples || []).find((s) => s.pid === "LAGGY_PID");
+    assert.ok(sample, `a lag sample must close; got ${JSON.stringify(result.lagSamples)}`);
+    assert.ok(sample.lagSec >= 89 && sample.lagSec <= 120, `~90s measured, got ${sample.lagSec}`);
+    // ...and it is persisted so the history survives restarts.
+    const saved = JSON.parse(kv.values.get(STATE_KEY));
+    assert.equal(saved.lagWatch.LAGGY_PID, undefined, "closed watches are cleared");
+    assert.ok((saved.lagLog || []).some((s) => s.pid === "LAGGY_PID"), "sample appended to lagLog");
+  });
+});
