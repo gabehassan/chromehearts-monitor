@@ -1188,11 +1188,14 @@ function enumerationCandidates(cfg, state) {
   const seen = state.seen || {};
   const hotWatch = state.hotWatch || {};
   const registry = state.styleRegistry && typeof state.styleRegistry === "object" ? state.styleRegistry : {};
-  const mined = minePidCandidates(
-    Object.values(seen)
-      .map((record) => `${record?.image || ""} ${record?.url || ""}`)
-      .join("\n")
-  );
+  const mined = uniqueValues([
+    ...(Array.isArray(state.gridMinedPids) ? state.gridMinedPids : []),
+    ...minePidCandidates(
+      Object.values(seen)
+        .map((record) => `${record?.image || ""} ${record?.url || ""}`)
+        .join("\n")
+    )
+  ]);
 
   const colorVocab = uniqueValues([
     ...DEFAULT_COLOR_CODES,
@@ -2022,6 +2025,7 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
     products: {},
     activeCgids: [],
     failed: [],
+    mined: [],
     slices: slices.length,
     slicesOk: okResults.length,
     slicesRetried: retryIndexes.length,
@@ -2031,8 +2035,10 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
     Object.assign(merged.products, result.products || {});
     merged.activeCgids.push(...(result.activeCgids || []));
     merged.failed.push(...(result.failed || []));
+    merged.mined.push(...(result.mined || []));
     merged.scanned += result.scanned || 0;
   }
+  merged.mined = uniqueValues(merged.mined).slice(0, 60);
   results.forEach((result, index) => {
     if (!result) merged.failed.push(...slices[index].map((item) => (item.kind === "q" ? `q:${item.value}` : item.value)));
   });
@@ -2100,6 +2106,11 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
   const products = {};
   const activeCgids = [];
   const failed = [];
+  const mined = new Set();
+  const minePage = (html) => {
+    const gridPids = extractGridPids(html);
+    for (const pid of minePidCandidates(html)) if (!gridPids.has(pid)) mined.add(pid);
+  };
   const parseIfAny = (html) => (extractGridPids(html).size ? parseProducts(html) : null);
   const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg, "tail"));
   htmls.forEach((html, index) => {
@@ -2107,6 +2118,7 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
       failed.push(cgids[index]);
       return;
     }
+    minePage(html);
     const found = parseIfAny(html);
     if (found) {
       activeCgids.push(cgids[index]);
@@ -2119,10 +2131,11 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
       failed.push(`q:${queries[index]}`);
       return;
     }
+    minePage(html);
     const found = parseIfAny(html);
     if (found) Object.assign(products, found);
   });
-  return { ok: true, products, activeCgids, failed, scanned: cgids.length + queries.length };
+  return { ok: true, products, activeCgids, failed, scanned: cgids.length + queries.length, mined: [...mined].slice(0, 20) };
 }
 
 async function fastFetchProducts(env, cfg, state, fastCursor = 0, tickNumber = 0) {
@@ -2168,10 +2181,27 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0, tickNumber = 0
   const cgids = uniqueValues([...head, ...shard, ...rescueCgids]);
   const htmls = [...headHtmls, ...shardHtmls, ...rescueHtmls];
   const pidUniverse = new Set();
-  for (const html of htmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
-  for (const html of searchHtmls) if (html) for (const pid of extractGridPids(html)) pidUniverse.add(pid);
-  for (const pid of Object.keys(fanout?.products || {})) pidUniverse.add(pid);
-  for (const pid of rootCatalog?.pids || []) pidUniverse.add(pid);
+  const pidSources = {};
+  const noteSource = (pid, source) => {
+    pidUniverse.add(pid);
+    const list = (pidSources[pid] ||= []);
+    if (list.length < 5 && !list.includes(source)) list.push(source);
+  };
+  htmls.forEach((html, index) => {
+    if (html) for (const pid of extractGridPids(html)) noteSource(pid, `grid:${cgids[index]}`);
+  });
+  searchHtmls.forEach((html, index) => {
+    if (html) for (const pid of extractGridPids(html)) noteSource(pid, `q:${searchQueries[index]}`);
+  });
+  for (const pid of Object.keys(fanout?.products || {})) noteSource(pid, "fanout");
+  for (const pid of rootCatalog?.pids || []) noteSource(pid, "root");
+
+  const minedPids = new Set();
+  for (const pid of fanout?.mined || []) if (!pidUniverse.has(pid)) minedPids.add(pid);
+  for (const html of [...htmls, ...searchHtmls]) {
+    if (!html) continue;
+    for (const pid of minePidCandidates(html)) if (!pidUniverse.has(pid)) minedPids.add(pid);
+  }
 
   let auditMissedPids = [];
   if (rootCatalog && rootCatalog.complete && fanout) {
@@ -2210,12 +2240,13 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0, tickNumber = 0
     fetched: htmls.filter(Boolean).length,
     pidUniverse: pidUniverse.size,
     candidates: candidatePids.length,
+    mined: minedPids.size,
     fastCursor,
     nextFastCursor
   };
 
   if (candidatePids.length === 0) {
-    return { products: {}, meta, nextFastCursor, empty: true };
+    return { products: {}, meta, nextFastCursor, empty: true, pidSources, minedPids: [...minedPids].slice(0, 80) };
   }
 
   const combinedHtml = [...htmls, ...searchHtmls].filter(Boolean).join("\n");
@@ -2223,7 +2254,9 @@ async function fastFetchProducts(env, cfg, state, fastCursor = 0, tickNumber = 0
     products: { ...parseProducts(combinedHtml), ...(fanout?.products || {}), ...(rootCatalog?.products || {}) },
     meta,
     nextFastCursor,
-    empty: false
+    empty: false,
+    pidSources,
+    minedPids: [...minedPids].slice(0, 80)
   };
 }
 
@@ -3283,6 +3316,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
     let staging = null;
     let nextFastCursor = fastCursor;
     let fastMeta = null;
+    let pidSources = null;
+    let gridMinedNext = null;
     if (mode === "fast") {
       if (firstRun) {
         await stagingPromise;
@@ -3293,9 +3328,19 @@ async function runMonitor(env, cfg = null, opts = {}) {
       products = fast.products;
       nextFastCursor = fast.nextFastCursor;
       fastMeta = fast.meta;
+      pidSources = fast.pidSources || null;
+
+      const gridMined = uniqueValues(
+        (fast.minedPids || []).filter((pid) => !previousSeen[pid] && !(state.hotWatch || {})[pid])
+      )
+        .sort()
+        .slice(0, 80);
+      const previousMined = Array.isArray(state.gridMinedPids) ? state.gridMinedPids : [];
+      const minedChanged = gridMined.join(",") !== previousMined.join(",");
+      if (minedChanged) gridMinedNext = gridMined;
 
       const stagingLiveCount = staging ? Object.keys(staging.liveProducts || {}).length : 0;
-      if (fast.empty && !stagingLiveCount && !staging?.dirty) {
+      if (fast.empty && !stagingLiveCount && !staging?.dirty && !minedChanged) {
         return done({
           ok: true,
           mode,
@@ -3428,6 +3473,22 @@ async function runMonitor(env, cfg = null, opts = {}) {
           }
         : null,
       alertLanes: enriched.length ? Object.fromEntries(enriched.map((product) => [product.pid, product.productType || "grid"])) : null,
+      alertSources: enriched.length
+        ? Object.fromEntries(
+            enriched.map((product) => [
+              product.pid,
+              pidSources?.[product.pid] ||
+                (product.productType && !["master", "set", "bundle", "standard", "variant"].includes(product.productType)
+                  ? [product.productType]
+                  : [mode === "full" ? "sweep" : "grid"])
+            ])
+          )
+        : null,
+      staticVersion: staging?.staticVersion || state.staticVersion || null,
+      sinceReplicationMs:
+        enriched.length && Number.isFinite(Number(staging?.staticVersion || state.staticVersion))
+          ? Math.max(0, Date.now() - Number(staging?.staticVersion || state.staticVersion))
+          : null,
       nextFastCursor,
       nextProspectiveCursor: mode === "full" ? cfg.discoveryRun?.nextProspectiveCategoryCursor ?? null : null,
       subrequestsUsed: cfg.subrequestsUsed || 0,
@@ -3470,6 +3531,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
       ]).filter((cgid) => cgid && cgid !== "root" && cgid !== "shop");
       nextState.knownCategoryIds = learned.slice(-120);
     }
+
+    if (gridMinedNext !== null) nextState.gridMinedPids = gridMinedNext;
 
     if (staging) {
       const nextHotWatch = { ...staging.hotWatch };
@@ -4176,7 +4239,8 @@ async function handleFetch(request, env) {
     const stub = monitorStub(env);
     if (!stub) return jsonResponse({ ok: false, error: "MONITOR Durable Object binding is not configured." }, 501);
     const limit = Math.min(500, Math.max(1, Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100));
-    const type = url.searchParams.get("type") === "alerts" ? "&type=alerts" : "";
+    const requestedType = url.searchParams.get("type");
+    const type = ["alerts", "replications"].includes(requestedType) ? `&type=${requestedType}` : "";
     const doResponse = await stub.fetch(`https://monitor.internal/logs?limit=${limit}${type}`);
     return jsonResponse({ ok: true, ...(await doResponse.json()) });
   }
@@ -4515,6 +4579,10 @@ class MonitorController {
         const alerts = (await this.state.storage.get("alertLog")) || [];
         return Response.json({ count: alerts.length, alerts: alerts.slice().reverse() });
       }
+      if (url.searchParams.get("type") === "replications") {
+        const replications = (await this.state.storage.get("replicationLog")) || [];
+        return Response.json({ count: replications.length, replications: replications.slice().reverse() });
+      }
       return Response.json(await this.logs(Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100));
     }
     if (url.pathname === "/stop") {
@@ -4628,6 +4696,7 @@ class MonitorController {
         hotWatch: result.staging?.hotWatch ?? null,
         enumPool: result.staging?.enumPool ?? 0,
         burst: result.staging?.bursting ? 1 : 0,
+        versionBump: result.staging?.versionBump ? 1 : 0,
         stagingMs: result.staging?.ms ?? 0,
         enrichMs: result.enrichMs || 0,
         sendMs: result.sendMs || 0,
@@ -4635,6 +4704,13 @@ class MonitorController {
       },
       cfg.logBufferSize
     );
+
+    if (result.staging?.versionBump) {
+      const replications = (await this.state.storage.get("replicationLog")) || [];
+      replications.push({ at: nowIso(), tick, version: result.staging.version || null });
+      await this.state.storage.put("replicationLog", replications.slice(-100));
+      console.log(`REPLICATION BUMP v=${result.staging.version} tick=${tick} — burst window opened`);
+    }
 
     if ((result.alerted || 0) > 0) {
       const alerts = (await this.state.storage.get("alertLog")) || [];
@@ -4644,6 +4720,9 @@ class MonitorController {
         mode: result.mode || mode,
         pids: result.newPids || [],
         lanes: result.alertLanes || null,
+        sources: result.alertSources || null,
+        staticVersion: result.staticVersion || null,
+        sinceReplicationMs: result.sinceReplicationMs ?? null,
         totalMs: Date.now() - startedAt,
         stagingMs: result.staging?.ms ?? 0,
         enrichMs: result.enrichMs || 0,
@@ -4651,6 +4730,11 @@ class MonitorController {
         tickGapMs
       });
       await this.state.storage.put("alertLog", alerts.slice(-300));
+      console.log(
+        `ALERT tick=${tick} pids=${(result.newPids || []).join(",")} sources=${JSON.stringify(result.alertSources || {})} sinceReplication=${
+          result.sinceReplicationMs != null ? `${Math.round(result.sinceReplicationMs / 1000)}s` : "unknown"
+        } tickGap=${tickGapMs}ms`
+      );
       await this.flush(true);
     } else {
       await this.flush();

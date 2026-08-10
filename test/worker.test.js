@@ -2588,3 +2588,52 @@ test("A static-version bump (content replication) opens a burst window without p
     assert.equal(state.staticVersion, "1786125060006", "bumped version becomes the new baseline");
   });
 });
+
+test("Alert forensics: sources per PID and distance-from-replication ride into the result", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const hiddenDrop = productTile("FORENSIC_DROP1", "FORENSIC DROP", "mystery-category", "Mystery", "450.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const version = String(Date.now() - 90_000);
+
+  // Tick 1 (full): baseline the version stamp, nothing new.
+  const baselineMock = createChromeHeartsFetch({ root: keep, homepageStaticVersion: version });
+  await withMockedFetch(baselineMock.fetchMock, async () => {
+    await runWorkerOnce(env({}, kv));
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const dropMock = createChromeHeartsFetch({
+    root: keep,
+    searches: { hearts: hiddenDrop },
+    homepageStaticVersion: version,
+    productDetails: { FORENSIC_DROP1: { name: "FORENSIC DROP", categoryName: "Mystery", price: "450.00" } }
+  });
+  await withMockedFetch(dropMock.fetchMock, async () => {
+    const result = await runWorkerFastOnce(fastEnv({}, kv));
+    assert.equal(result.alerted, 1);
+    assert.deepEqual(result.alertSources.FORENSIC_DROP1, ["q:hearts"], "the winning surface is recorded");
+    assert.equal(result.staticVersion, version);
+    assert.ok(
+      Number.isFinite(result.sinceReplicationMs) && result.sinceReplicationMs >= 90_000,
+      `sinceReplicationMs measures the publish->alert race (got ${result.sinceReplicationMs})`
+    );
+  });
+});
+
+test("Tile-asset PID mining: a leaked sibling colorway reaches state and the probe queue", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const leakyTile = keep.replace(
+    "/dw/image/v2/BFBV_PRD/KEEP_SHOP.png",
+    "/dw/image/v2/BFBV_PRD/img_products/hi-res/315218126ABCXXX00D_0010.png"
+  );
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const mock = createChromeHeartsFetch({ root: leakyTile });
+  await withMockedFetch(mock.fetchMock, async () => {
+    const result = await runWorkerFastOnce(fastEnv({}, kv));
+    assert.equal(result.alerted, 0, "a mined PID is a probe candidate, not an alert");
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.deepEqual(state.gridMinedPids, ["218126ABCXXX00D"], "leaked sibling PID persists for the staging lane");
+    const candidates = enumerationCandidates(applyPlanPreset({ enumerationEnabled: true }), state);
+    assert.ok(candidates.mined.includes("218126ABCXXX00D"), "and feeds the Product-Variation probe queue");
+  });
+});
