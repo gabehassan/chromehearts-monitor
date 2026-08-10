@@ -11,6 +11,7 @@ import worker, {
   stagedNameFromUrl,
   parseHotWatchProbe,
   applyPlanPreset,
+  bustedUrl,
   buildCatalogState,
   parsePidParts,
   minePidCandidates,
@@ -188,6 +189,7 @@ function createChromeHeartsFetch({
   robotsExtraLines = [],
   productDetails = {},
   productVariations = {},
+  homepageStaticVersion = "",
   unknownPidsReturn500 = false
 }) {
   const discordPayloads = [];
@@ -217,7 +219,10 @@ function createChromeHeartsFetch({
         ...homepageCategories.map((category) => `<a href="/${category}/">${category}</a>`),
         ...homepageProductUrls.map((productUrl) => `<a href="${productUrl}">${productUrl}</a>`)
       ].join("");
-      return new Response(`<!doctype html><nav>${links}</nav>`, {
+      const versionedAsset = homepageStaticVersion
+        ? `<link rel="stylesheet" href="/on/demandware.static/Sites-ChromeHearts-Site/-/en_US/v${homepageStaticVersion}/css/global.css">`
+        : "";
+      return new Response(`<!doctype html>${versionedAsset}<nav>${links}</nav>`, {
         status: 200,
         headers: { "content-type": "text/html" }
       });
@@ -2494,5 +2499,92 @@ test("The first sighting of a style is a baseline, not a drop signal", async () 
     assert.deepEqual(result.newColorways || [], [], "a first sighting must not cry new-colourway");
     const saved = JSON.parse(kv.values.get(STATE_KEY));
     assert.deepEqual(saved.styleColors[pid].codes, ["AAA"], "but it IS recorded as the baseline");
+  });
+});
+
+test("bustedUrl defeats the SFCC page cache: unique per hot request, bucketed for the tail, never off-site", () => {
+  const grid = "https://www.chromehearts.com/on/demandware.store/Sites-ChromeHearts-Site/en_US/Search-UpdateGrid?cgid=scarf&start=0&sz=200";
+  const hot1 = bustedUrl(grid, {}, "hot");
+  const hot2 = bustedUrl(grid, {}, "hot");
+  assert.ok(hot1.includes("&chb="), "existing query string gets &chb appended");
+  assert.notEqual(hot1, hot2, "hot requests are unique per call — every poll is a fresh render");
+
+  const originalNow = Date.now;
+  Date.now = () => 1786125060006; // the DOUBLE PEONY replication moment
+  try {
+    const tail1 = bustedUrl(grid, {}, "tail");
+    const tail2 = bustedUrl(grid, {}, "tail");
+    assert.equal(tail1, tail2, "tail requests share a 60s bucket so origin load stays bounded");
+    const burst1 = bustedUrl(grid, { bursting: true }, "tail");
+    const burst2 = bustedUrl(grid, { bursting: true }, "tail");
+    assert.notEqual(burst1, burst2, "a burst window promotes the tail to per-request freshness");
+  } finally {
+    Date.now = originalNow;
+  }
+
+  const bare = bustedUrl("https://www.chromehearts.com/robots.txt", {}, "hot");
+  assert.ok(bare.includes("?chb="), "bare paths get ?chb");
+  assert.equal(
+    bustedUrl("https://discord.com/api/webhooks/1/abc", {}, "hot"),
+    "https://discord.com/api/webhooks/1/abc",
+    "non-storefront URLs are never rewritten"
+  );
+});
+
+test("Every storefront grid/search fetch carries a cache-bust param", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const inner = createChromeHeartsFetch({ root: keep });
+  let gridTotal = 0;
+  let gridBusted = 0;
+  const fetchMock = async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname.includes("Search-UpdateGrid")) {
+      gridTotal += 1;
+      if (url.searchParams.get("chb")) gridBusted += 1;
+    }
+    return inner.fetchMock(input, init);
+  };
+  await withMockedFetch(fetchMock, async () => {
+    await runWorkerOnce(env({}, kv));
+  });
+  assert.ok(gridTotal > 0, "the sweep fetched grids at all");
+  assert.equal(gridBusted, gridTotal, "a fixed URL would be served the stale page-cached render");
+});
+
+test("A static-version bump (content replication) opens a burst window without pinging", async () => {
+  const keep = productTile("KEEP_SHOP", "KEEP SHOP ITEM", "shop", "Shop", "100.00");
+  const kv = fakeKV(stateWithActive([{ pid: "KEEP_SHOP", name: "KEEP SHOP ITEM" }]));
+  const quiet = { ENUMERATION_ENABLED: "false" };
+
+  // Run 1: first sighting is a baseline, never a signal.
+  const baselineMock = createChromeHeartsFetch({ root: keep, homepageStaticVersion: "1786118654329" });
+  await withMockedFetch(baselineMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(quiet, kv));
+    assert.equal(result.staging.versionBump, false);
+    assert.ok(!result.burstUntil, "baseline must not burst");
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.equal(state.staticVersion, "1786118654329", "baseline version persists");
+  });
+  kv.values.delete(LOCK_KEY);
+
+  // Run 2: same version — quiet.
+  const sameMock = createChromeHeartsFetch({ root: keep, homepageStaticVersion: "1786118654329" });
+  await withMockedFetch(sameMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(quiet, kv));
+    assert.equal(result.staging.versionBump, false);
+    assert.ok(!result.burstUntil);
+  });
+  kv.values.delete(LOCK_KEY);
+
+  const bumpMock = createChromeHeartsFetch({ root: keep, homepageStaticVersion: "1786125060006" });
+  await withMockedFetch(bumpMock.fetchMock, async () => {
+    const result = await runWorkerOnce(env(quiet, kv));
+    assert.equal(result.staging.versionBump, true);
+    assert.equal(result.staging.version, "1786125060006");
+    assert.ok(result.burstUntil, "a replication opens the burst window");
+    assert.equal(bumpMock.discordPayloads.length, 0, "no ping for a speculative signal");
+    const state = JSON.parse(kv.values.get(STATE_KEY));
+    assert.equal(state.staticVersion, "1786125060006", "bumped version becomes the new baseline");
   });
 });

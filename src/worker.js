@@ -934,6 +934,18 @@ function fetchOptions(cfg, accept) {
   };
 }
 
+let bustSequence = 0;
+function bustedUrl(url, cfg, kind = "hot") {
+  const value = String(url || "");
+  if (!value.startsWith(BASE_URL)) return value;
+  bustSequence = (bustSequence + 1) % 1296;
+  const salt =
+    kind === "tail" && !cfg?.bursting
+      ? Math.floor(Date.now() / 60000).toString(36)
+      : Date.now().toString(36) + bustSequence.toString(36).padStart(2, "0");
+  return `${value}${value.includes("?") ? "&" : "?"}chb=${salt}`;
+}
+
 function spendSubrequest(cfg) {
   if (cfg && typeof cfg === "object") cfg.subrequestsUsed = (cfg.subrequestsUsed || 0) + 1;
 }
@@ -965,10 +977,10 @@ function productSearchUrl(query, pageSize) {
   return url.toString();
 }
 
-async function fetchSearchHtmlSafe(query, cfg) {
+async function fetchSearchHtmlSafe(query, cfg, bustKind = "hot") {
   try {
     if (subrequestsLeft(cfg) <= 4) return "";
-    return await fetchHtml(productSearchUrl(query, cfg.pageSize), cfg);
+    return await fetchHtml(productSearchUrl(query, cfg.pageSize), cfg, bustKind);
   } catch {
     return "";
   }
@@ -983,9 +995,9 @@ function categoryFromUrl(url) {
   }
 }
 
-async function fetchHtml(url, cfg) {
+async function fetchHtml(url, cfg, bustKind = "hot") {
   const response = await fetchWithTimeout(
-    url,
+    bustedUrl(url, cfg, bustKind),
     fetchOptions(cfg, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
     cfg.requestTimeoutMs,
     cfg
@@ -1069,7 +1081,7 @@ async function fetchSitemapSignals(cfg) {
   if (!cfg.discoverSitemapCategories) return empty;
   try {
     const indexResponse = await fetchWithTimeout(
-      cfg.sitemapIndexUrl,
+      bustedUrl(cfg.sitemapIndexUrl, cfg, "hot"),
       fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"),
       cfg.requestTimeoutMs,
       cfg
@@ -1080,7 +1092,7 @@ async function fetchSitemapSignals(cfg) {
     const categoryIds = [];
     const productUrls = [];
     for (const sitemapUrl of sitemapUrls.slice(0, 5)) {
-      const response = await fetchWithTimeout(sitemapUrl, fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs, cfg);
+      const response = await fetchWithTimeout(bustedUrl(sitemapUrl, cfg, "hot"), fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs, cfg);
       if (!response.ok) continue;
       for (const loc of extractXmlLocations(await response.text())) {
         const categoryId = categoryIdFromUrl(loc);
@@ -1267,7 +1279,7 @@ async function fetchSitemapDelta(cfg, previousLastmod = "") {
   if (!cfg.discoverSitemapCategories) return unchanged;
   try {
     const indexResponse = await fetchWithTimeout(
-      cfg.sitemapIndexUrl,
+      bustedUrl(cfg.sitemapIndexUrl, cfg, "hot"),
       fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"),
       cfg.requestTimeoutMs,
       cfg
@@ -1284,7 +1296,7 @@ async function fetchSitemapDelta(cfg, previousLastmod = "") {
     for (const sitemapUrl of extractXmlLocations(indexXml)
       .filter((url) => url.endsWith(".xml"))
       .slice(0, 3)) {
-      const response = await fetchWithTimeout(sitemapUrl, fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs, cfg);
+      const response = await fetchWithTimeout(bustedUrl(sitemapUrl, cfg, "hot"), fetchOptions(cfg, "application/xml,text/xml,*/*;q=0.8"), cfg.requestTimeoutMs, cfg);
       if (!response.ok) continue;
       fetchedAny = true;
       for (const loc of extractXmlLocations(await response.text())) {
@@ -1345,7 +1357,7 @@ async function probeHotWatchPids(cfg, pids) {
     if (subrequestsLeft(cfg) <= 4) return;
     try {
       const response = await fetchWithTimeout(
-        productVariationUrl(pid, 1),
+        bustedUrl(productVariationUrl(pid, 1), cfg, "hot"),
         {
           headers: {
             accept: "application/json, text/javascript, */*; q=0.01",
@@ -1406,11 +1418,14 @@ async function stagingScan(cfg, opts = {}) {
   const probeList = uniqueValues([...freshPids.slice(0, 6), ...plannedPids, ...minedPids.slice(0, 6)]).slice(0, budget + 12);
   const probes = await probeHotWatchPids(cfg, probeList);
 
+  const staticVersion = (homepage.html || "").match(/\/v(1\d{12})\//)?.[1] || null;
+
   return {
     stagedUrls,
     minedPids: minedPids.slice(0, 12),
     sitemap: { lastmod: sitemap.lastmod, changed: sitemap.changed, categoryIds: sitemap.categoryIds },
-    probes
+    probes,
+    staticVersion
   };
 }
 
@@ -1534,7 +1549,8 @@ async function runStagingLane(env, cfg, state) {
     probePids: uniqueValues([...activePids, ...restockPids, ...enumSlice]),
     knownPids: [...Object.keys(seen), ...Object.keys(previousHotWatch)],
     sitemapLastmod: state.sitemapIndexLastmod || "",
-    probeBudget
+    probeBudget,
+    bursting
   });
   if (!signals) return null;
   for (const pid of signals.minedPids || []) minedSet.add(pid);
@@ -1670,9 +1686,15 @@ async function runStagingLane(env, cfg, state) {
   }
   const styleColorsDirty = newColorways.length > 0 || Object.keys(styleColors).length !== Object.keys(previousStyleColors).length;
 
-  const dropSignal = discoveries.length > 0 || addedCategories.length > 0 || newColorways.length > 0;
+  const staticVersion = signals.staticVersion || null;
+  const versionBumped = Boolean(staticVersion && state.staticVersion && staticVersion !== state.staticVersion);
+  if (staticVersion && staticVersion !== (state.staticVersion || null)) dirty = true;
+
+  const dropSignal = discoveries.length > 0 || addedCategories.length > 0 || newColorways.length > 0 || versionBumped;
 
   return {
+    staticVersion,
+    versionBumped,
     hotWatch,
     liveProducts,
     discoveries,
@@ -1928,9 +1950,9 @@ async function fetchRootCatalog(cfg) {
   return { products, pids, pages, truncated, complete: !truncated };
 }
 
-async function fetchGridHtmlSafe(cgid, cfg) {
+async function fetchGridHtmlSafe(cgid, cfg, bustKind = "hot") {
   try {
-    return await fetchHtml(productGridUrl(cgid, 0, cfg.pageSize), cfg);
+    return await fetchHtml(productGridUrl(cgid, 0, cfg.pageSize), cfg, bustKind);
   } catch {
     return "";
   }
@@ -1955,7 +1977,8 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
         headers: { "content-type": "application/json", authorization: `Bearer ${cfg.cronSecret}` },
         body: JSON.stringify({
           cgids: slice.filter((item) => item.kind === "c").map((item) => item.value),
-          queries: slice.filter((item) => item.kind === "q").map((item) => item.value)
+          queries: slice.filter((item) => item.kind === "q").map((item) => item.value),
+          bursting: Boolean(cfg.bursting)
         })
       });
       if (!response.ok) return null;
@@ -1977,7 +2000,8 @@ async function selfScanGrids(env, cfg, cgids, queries = []) {
           headers: { "content-type": "application/json", authorization: `Bearer ${cfg.cronSecret}` },
           body: JSON.stringify({
             cgids: slice.filter((item) => item.kind === "c").map((item) => item.value),
-            queries: slice.filter((item) => item.kind === "q").map((item) => item.value)
+            queries: slice.filter((item) => item.kind === "q").map((item) => item.value),
+            bursting: Boolean(cfg.bursting)
           })
         });
         if (!response.ok) return null;
@@ -2077,7 +2101,7 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
   const activeCgids = [];
   const failed = [];
   const parseIfAny = (html) => (extractGridPids(html).size ? parseProducts(html) : null);
-  const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg));
+  const htmls = await mapWithConcurrency(cgids, cfg.categoryFetchConcurrency, (cgid) => fetchGridHtmlSafe(cgid, cfg, "tail"));
   htmls.forEach((html, index) => {
     if (!html) {
       failed.push(cgids[index]);
@@ -2089,7 +2113,7 @@ async function scanGridsSlice(env, cfg, cgids, queries = []) {
       Object.assign(products, found);
     }
   });
-  const queryHtmls = await mapWithConcurrency(queries, cfg.categoryFetchConcurrency, (query) => fetchSearchHtmlSafe(query, cfg));
+  const queryHtmls = await mapWithConcurrency(queries, cfg.categoryFetchConcurrency, (query) => fetchSearchHtmlSafe(query, cfg, "tail"));
   queryHtmls.forEach((html, index) => {
     if (!html) {
       failed.push(`q:${queries[index]}`);
@@ -3235,6 +3259,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
   }
 
   let state = await loadState(env, cfg);
+  cfg.bursting = Boolean(state.burstUntil && Date.parse(state.burstUntil) > Date.now());
   try {
     if (!skipLock && state.backoffUntil && Date.parse(state.backoffUntil) > Date.now()) {
       return done({ ok: true, skipped: true, reason: "backoff", mode, backoffUntil: state.backoffUntil, storage: "cloudflare-kv" });
@@ -3280,7 +3305,14 @@ async function runMonitor(env, cfg = null, opts = {}) {
           productCount: fast.meta.pidUniverse,
           fast: fast.meta,
           staging: staging
-            ? { probed: staging.probedCount, hotWatch: Object.keys(staging.hotWatch).length, enumPool: staging.enumPoolSize ?? 0, ms: staging.ms ?? 0 }
+            ? {
+                probed: staging.probedCount,
+                hotWatch: Object.keys(staging.hotWatch).length,
+                enumPool: staging.enumPoolSize ?? 0,
+                version: staging.staticVersion || null,
+                versionBump: Boolean(staging.versionBumped),
+                ms: staging.ms ?? 0
+              }
             : null,
           nextFastCursor,
           storage: "cloudflare-kv",
@@ -3390,6 +3422,8 @@ async function runMonitor(env, cfg = null, opts = {}) {
             stylesTracked: Object.keys(staging.styleColors || {}).length,
             newColorways: (staging.newColorways || []).length,
             bursting: Boolean(staging.bursting),
+            version: staging.staticVersion || null,
+            versionBump: Boolean(staging.versionBumped),
             ms: staging.ms ?? 0
           }
         : null,
@@ -3446,6 +3480,7 @@ async function runMonitor(env, cfg = null, opts = {}) {
       nextState.hotWatch = nextHotWatch;
       if (staging.sitemapIndexLastmod !== undefined) nextState.sitemapIndexLastmod = staging.sitemapIndexLastmod;
       if (staging.sitemapCategoryIds) nextState.sitemapCategoryIds = staging.sitemapCategoryIds;
+      if (staging.staticVersion) nextState.staticVersion = staging.staticVersion;
       if (staging.styleColors) nextState.styleColors = staging.styleColors;
       if (!state.stagingBaselinedAt) nextState.stagingBaselinedAt = nowIso();
     }
@@ -4106,7 +4141,8 @@ async function handleFetch(request, env) {
         burstActive: Boolean(state.burstUntil && Date.parse(state.burstUntil) > Date.now()),
         burstUntil: state.burstUntil || null,
         sitemapIndexLastmod: state.sitemapIndexLastmod || null,
-        sitemapCategories: Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : []
+        sitemapCategories: Array.isArray(state.sitemapCategoryIds) ? state.sitemapCategoryIds : [],
+        staticVersion: state.staticVersion || null
       },
       fastPoll: {
         enabled: cfg.fastPollEnabled,
@@ -4203,6 +4239,7 @@ async function handleFetch(request, env) {
     const cfg = applyPlanPreset(baseCfg);
     cfg.subrequestsUsed = 0;
     const body = await request.json().catch(() => ({}));
+    cfg.bursting = Boolean(body?.bursting || body?.staging?.bursting);
     if (body && body.staging && typeof body.staging === "object") {
       const cleanPidList = (values, cap) =>
         (Array.isArray(values) ? values : [])
@@ -4229,7 +4266,7 @@ async function handleFetch(request, env) {
       await mapWithConcurrency(statusCgids, cfg.categoryFetchConcurrency, async (cgid) => {
         try {
           const response = await fetchWithTimeout(
-            `${BASE_URL}/${cgid}`,
+            bustedUrl(`${BASE_URL}/${cgid}`, cfg, "tail"),
             { ...fetchOptions(cfg, "text/html,*/*;q=0.8"), redirect: "manual" },
             cfg.requestTimeoutMs,
             cfg
@@ -4673,6 +4710,7 @@ export {
   applyPlanPreset,
   runStagingLane,
   stagingScan,
+  bustedUrl,
   parsePidParts,
   minePidCandidates,
   enumerationCandidates,
